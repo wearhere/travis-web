@@ -14,9 +14,11 @@
       {{#view Travis.BuildsItemView contextBinding="build"}}
         <tr {{bindAttr class="view.color"}}>
           <td class="number">
-            <a {{bindAttr href="view.urlBuild"}} {{action route}}>
-              {{number}}
-            </a>
+            {{#if id}}
+              <a {{action showBuild this href=true}}>
+                {{number}}
+              </a>
+            {{/if}}
           </td>
           <td class="commit">
             <a {{bindAttr href="view.urlGithubCommit"}}>

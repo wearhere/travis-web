@@ -3,14 +3,16 @@
   {{#each group in controller.groups}}
     {{#view Travis.WorkersView contextBinding="repository"}}
       <li class="group">
-        <h5 {{action toggle}}>
+        <h5 {{action toggle target="view"}}>
           {{group.firstObject.host}}
         </h5>
         <ul>
         {{#each worker in group}}
           <li class="worker">
             <div class="icon"></div>
-            <a {{bindAttr href="worker.urlJob"}} {{bindAttr title="worker.lastSeenAt"}} {{action route}}>{{worker.display}}</a>
+            {{#if worker.job.id}}
+              <a {{bindAttr title="worker.lastSeenAt"}} {{action showJob worker.job href=true}}>{{worker.display}}</a>
+            {{/if}}
           </li>
         {{/each}}
         </ul>

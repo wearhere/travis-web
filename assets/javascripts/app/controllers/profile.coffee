@@ -4,10 +4,9 @@ Travis.ProfileController = Travis.Controller.extend
 
   init: ->
     @_super('top', 'owners')
-    @connectTop()
-    @connectOutlet outletName: 'left', controller: @ownersController, viewClass: Travis.OwnersView
-    @connectOutlet(outletName: 'main', controller: this, viewClass: Travis.ProfileView)
-    @owners = @ownersController.get('content')
+    #@connectOutlet outletName: 'left', controller: @ownersController, viewClass: Travis.OwnersView
+    #@connectOutlet(outletName: 'main', controller: this, viewClass: Travis.ProfileView)
+    #@owners = @ownersController.get('content')
 
   owner: (->
     login = @get('params.login') || Travis.app.get('currentUser.login')

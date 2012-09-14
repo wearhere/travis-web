@@ -1,16 +1,14 @@
 require 'ext/ember/namespace'
 
 @Travis.reopen
-  View: Em.View.extend
-    route: (event) ->
-      Travis.app.routes.route(event)
+  View: Em.View.extend()
 
 @Travis.reopen
-  HomeLayout:    Travis.View.extend(templateName: 'layouts/home')
-  ProfileLayout: Travis.View.extend(templateName: 'layouts/profile')
-  StatsLayout:   Travis.View.extend(templateName: 'layouts/simple')
-  AuthLayout:    Travis.View.extend(templateName: 'layouts/simple')
-  AuthView:      Travis.View.extend(templateName: 'auth/show')
+  ProfileLayout:   Travis.View.extend(templateName: 'layouts/profile')
+  StatsLayout:     Travis.View.extend(templateName: 'layouts/simple')
+  AuthLayout:      Travis.View.extend(templateName: 'layouts/simple')
+  AuthView:        Travis.View.extend(templateName: 'auth/show')
+  ApplicationView: Travis.View.extend(templateName: 'layouts/home')
 
 require 'views/build'
 require 'views/job'

@@ -7,8 +7,12 @@
 <div class="tab">
   {{#collection Travis.RepositoriesListView contentBinding="controller"}}
     {{#with view.repository}}
-      <a {{bindAttr href="view.urlRepository"}} {{action route}} class="current">{{slug}}</a>
-      <a {{bindAttr href="view.urlLastBuild"}} {{action route}} class="last_build">#{{lastBuildNumber}}</a>
+      {{#if slug}}
+        <a {{action showRepository view.repository href=true}} class="current">{{slug}}</a>
+      {{/if}}
+      {{#if lastBuild.id}}
+        <a {{action showBuild this lastBuild href=true}} class="last_build">#{{lastBuildNumber}}</a>
+      {{/if}}
 
       <p class="summary">
         <span class="duration_label">{{t repositories.duration}}:</span>

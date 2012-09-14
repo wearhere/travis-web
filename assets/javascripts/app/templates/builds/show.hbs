@@ -3,7 +3,10 @@
     <dl id="summary">
       <div class="left">
         <dt>{{t builds.name}}</dt>
-        <dd class="number"><a {{bindAttr href="view.urlBuild"}} {{action route}}>{{build.number}}</a></dd>
+        <dd class="number">
+          {{#if build.id}}
+            <a {{action showBuild build href=true}}>{{build.number}}</a></dd>
+          {{/if}}
         <dt class="finished_at_label">{{t builds.finished_at}}</dt>
         <dt>{{t builds.duration}}</dt>
         <dd class="duration" {{bindAttr title="build.startedAt"}}>{{formatDuration build.duration}}</dd>

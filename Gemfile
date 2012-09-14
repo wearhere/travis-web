@@ -22,3 +22,8 @@ group :assets do
   gem 'tilt'
   gem 'guard'
 end
+
+group :development do
+  gem 'foreman'
+  gem 'rb-fsevent', '~> 0.9.1'
+end

@@ -18,14 +18,15 @@ Pusher.log = -> console.log(arguments)
 
 Travis.reopen
   App: Em.Application.extend
+    initialize: ->
+      @_super()
+
     init: ->
       @_super()
-      @connect()
 
       @store = Travis.Store.create()
       @store.loadMany(Travis.Sponsor, Travis.SPONSORS)
 
-      @routes = new Travis.Routes()
       @pusher = new Travis.Pusher()
 
       @setCurrentUser(JSON.parse($.cookie('user')))
@@ -51,21 +52,6 @@ Travis.reopen
 
     receive: ->
       @store.receive.apply(@store, arguments)
-
-    connectLayout: (name) ->
-      unless @get('layout.name') == name
-        name = $.camelize(name)
-        viewClass = Travis["#{name}Layout"]
-        @layout = Travis["#{name}Controller"].create(parent: @controller)
-        @controller.connectOutlet(outletName: 'layout', controller: @layout, viewClass: viewClass)
-      @layout
-
-    connect: ->
-      @controller = Em.Controller.create()
-      view = Em.View.create
-        template: Em.Handlebars.compile('{{outlet layout}}')
-        controller: @controller
-      view.appendTo(@get('rootElement') || 'body')
 
     toggleSidebar: ->
       $('body').toggleClass('maximized')
