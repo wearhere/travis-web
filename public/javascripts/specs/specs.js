@@ -1041,18 +1041,3 @@
   };
 
 }).call(this);
-(function() {
-
-  this.after = function(time, func) {
-    waits(time);
-    return jasmine.getEnv().currentSpec.runs(func);
-  };
-
-  this.once = function(condition, func) {
-    waitsFor(condition);
-    return jasmine.getEnv().currentSpec.runs(func);
-  };
-
-  this.waitFor = waitsFor;
-
-}).call(this);

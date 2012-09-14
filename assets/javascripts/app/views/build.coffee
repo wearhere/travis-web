@@ -30,7 +30,7 @@
 
     repositoryBinding: 'controller.repository'
     buildBinding: 'controller.build'
-    commitBinding: 'build.commit'
+    commitBinding: 'controller.build.commit'
 
     color: (->
       Travis.Helpers.colorForResult(@get('build.result'))
