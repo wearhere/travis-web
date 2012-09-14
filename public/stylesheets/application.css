@@ -6339,3 +6339,327 @@ table.list .red .number a {
 #profile #main .tab {
   margin: 30px 0 0 12px;
 }
+/* line 3, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bold {
+  font-weight: bold;
+}
+/* line 5, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .italic {
+  font-style: italic;
+}
+/* line 9, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .black {
+  color: black;
+}
+/* line 11, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .red {
+  color: red;
+}
+/* line 13, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .green {
+  color: lime;
+}
+/* line 15, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .yellow {
+  color: yellow;
+}
+/* line 17, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .blue {
+  color: blue;
+}
+/* line 19, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .magenta {
+  color: magenta;
+}
+/* line 21, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .cyan {
+  color: cyan;
+}
+/* line 23, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .white {
+  color: white;
+}
+/* line 25, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .black.bright {
+  color: #999999;
+}
+/* line 27, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-black {
+  background-color: black;
+}
+/* line 29, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-red {
+  background-color: red;
+}
+/* line 31, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-green {
+  background-color: lime;
+}
+/* line 33, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-yellow {
+  background-color: yellow;
+}
+/* line 35, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-blue {
+  background-color: blue;
+}
+/* line 37, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-magenta {
+  background-color: magenta;
+}
+/* line 39, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-cyan {
+  background-color: cyan;
+}
+/* line 41, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/ansi.sass */
+.ansi .bg-white {
+  background-color: white;
+}
+
+/* line 106, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .black {
+  background-color: black;
+}
+/* line 108, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .white {
+  background-color: white;
+}
+/* line 111, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .green {
+  background-color: #108100;
+}
+/* line 113, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .green-light-1 {
+  background-color: #dcffdc;
+}
+/* line 115, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .green-light-3 {
+  background-color: #fafffa;
+}
+/* line 117, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .red {
+  background-color: #cc0000;
+}
+/* line 119, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .red-medium-1 {
+  background-color: #c7371a;
+}
+/* line 121, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .red-light-1 {
+  background-color: #ffdcdc;
+}
+/* line 123, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .red-light-3 {
+  background-color: snow;
+}
+/* line 125, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .yellow-light-1 {
+  background-color: #ffffe1;
+}
+/* line 127, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .yellow-light-2 {
+  background-color: #fffcf4;
+}
+/* line 130, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-dark-1 {
+  background-color: #333333;
+}
+/* line 132, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-dark-2 {
+  background-color: #444444;
+}
+/* line 134, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-dark-3 {
+  background-color: #666666;
+}
+/* line 136, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-medium-1 {
+  background-color: #999999;
+}
+/* line 138, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-medium-2 {
+  background-color: #aaaaaa;
+}
+/* line 140, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-medium-3 {
+  background-color: #cccccc;
+}
+/* line 142, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-light-1 {
+  background-color: #dddddd;
+}
+/* line 144, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-light-2 {
+  background-color: #efefef;
+}
+/* line 146, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .gray-light-3 {
+  background-color: #f6f6f6;
+}
+/* line 149, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .slate-blue-1 {
+  background-color: #e1e2e6;
+}
+/* line 151, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .slate-blue-2 {
+  background-color: #e5e8ee;
+}
+/* line 153, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .slate-blue-3 {
+  background-color: #f2f4f9;
+}
+/* line 155, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .slate-blue-4 {
+  background-color: #fafbfc;
+}
+/* line 157, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .slate-yellow-1 {
+  background-color: #7f7f75;
+}
+/* line 159, /Users/drogus/code/travis/travis-ember/assets/stylesheets/_mixins/colors.sass */
+#colors .slate-yellow-2 {
+  background-color: #bab9a7;
+}
+
+/* line 3, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top {
+  line-height: 40px;
+  background: -webkit-gradient(linear, 50% 0%, 50% 100%, color-stop(0%, #444444), color-stop(100%, #111111));
+  background: -webkit-linear-gradient(#444444, #111111);
+  background: -moz-linear-gradient(#444444, #111111);
+  background: -o-linear-gradient(#444444, #111111);
+  background: linear-gradient(#444444, #111111);
+  font-size: 13px;
+}
+/* line 8, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top h1 {
+  float: left;
+  width: 73px;
+  height: 30px;
+  margin: 4px 40px 0 22px;
+  text-indent: -9999px;
+  background: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEkAAAAeCAMAAABXJsOhAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAyJpVFh0WE1MOmNvbS5hZG9iZS54bXAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+IDx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1wdGs9IkFkb2JlIFhNUCBDb3JlIDUuMC1jMDYwIDYxLjEzNDc3NywgMjAxMC8wMi8xMi0xNzozMjowMCAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIiB4bWxuczp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIgeG1sbnM6c3RSZWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZVJlZiMiIHhtcDpDcmVhdG9yVG9vbD0iQWRvYmUgUGhvdG9zaG9wIENTNSBNYWNpbnRvc2giIHhtcE1NOkluc3RhbmNlSUQ9InhtcC5paWQ6OUZGRkVGNjVGQTE0MTFFMUEzNzhDNjZGM0QyMzVGNUIiIHhtcE1NOkRvY3VtZW50SUQ9InhtcC5kaWQ6OUZGRkVGNjZGQTE0MTFFMUEzNzhDNjZGM0QyMzVGNUIiPiA8eG1wTU06RGVyaXZlZEZyb20gc3RSZWY6aW5zdGFuY2VJRD0ieG1wLmlpZDo5RkZGRUY2M0ZBMTQxMUUxQTM3OEM2NkYzRDIzNUY1QiIgc3RSZWY6ZG9jdW1lbnRJRD0ieG1wLmRpZDo5RkZGRUY2NEZBMTQxMUUxQTM3OEM2NkYzRDIzNUY1QiIvPiA8L3JkZjpEZXNjcmlwdGlvbj4gPC9yZGY6UkRGPiA8L3g6eG1wbWV0YT4gPD94cGFja2V0IGVuZD0iciI/PqH5DXgAAAMAUExURSQkJOrq6qqqqrs7OXJycnx8fM/Pz6Ojo8NCPLIYF7s3NPLy8oY1LiwsLM7Ozvjy8r80LkJCQtJfVbskHFQdH8k5K785MrlNPeOvrME4MbouLMA0LrwyLuWzsrMnKslmZfT09M5zcoGBgWJiYrIoK/r6+vf392VlZbYqK7YuLc5OPTExMcdjZO7OzcExKN3d3fXm5cAmG8E2MLUoK8U1KfDMybgtLOXl5bgnI7swLsbGxv39/ZKSksA+OtJzb5iYmPHg4F5eXsU6MJSUlFhYWMEtItTU1DU1NcM4MO/v725ubnkkJElJSfDRz81vb7otKcLCwu7IxcIwJVJSUtiGg+m+vbW1tUo6Nfj4+GhoaIk7MsEtLTk5OcQxL+Li4tuJhPnv796TjtCBg/78/DAeHL4tLLsmK5ycnMRDNb8yLvTj49JgVcI9M8o/Mrm5ucdIQLYhHrQiIcc8Ms5WTNWDgn0rKKysrIyMjHUjI+Dg4MU2K89NPLovLdF+fr0oIa4bHszMzNJBM7YwLoqKivbo6L4qLNaEgrgnJlZWVrIgIOvDwtE+M74xK9BNPOGrqbgrK8g/M8ErILIsLLEeILQqK+/JxjspJj4sKbosLMo+MsAzLdFwa85uak5OTtBgWHsoJ889M8o+MDgmJDYjIbwxLs07Mco2MLo1L1YdH70zLr0nK7MkJ0IwLck9MoEvK8IuJEAuK7wqJDMgH/////7+/rcsK+3t7fv4+dfX174zLr6+voWFhbUpK7snLD8/P/Tb2P7///rx8DkxLh0dHbYwMd6PicMyKNlCNO3Dv7syLnlCOdWEhM9va/z6+sA5M8g2L8+BgslhXee+veOtq+SurK0NDMlGPcs4Mfjp5/fu7u/Pzb4xLtycnPXg3q4oKtB1c9d7dbCwsMpra8trbLtAQc1rabclI9jY2MI0Kr8oLMtJPLIjJ8xvcOvOzu/LyPjx8fr29sRRUcJZWc9bUvDU0/PY1kI4NLkoI9eIiLwvKr4tJrgzL/jr6tRzbsg8Mf///5ksZz8AAAEAdFJOU////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////wBT9wclAAAEF0lEQVR42pTWC1xTVRwH8IswRIjYENdgQ+bGYDYEHZbx0liTyVwmoOSSh0IxQ4YOK4oyIynEUrClFcZ6YbGslv6Hgg6iLHoZWdHL3mWlvd/vPP3PuRtCLz73d++5957/Z/f72Tm757PLEfLThf8VIiQcee7MLVePzqneljMESU+sarTbp/xL7rHbn75IiPTQKrvdvm41TTTdov2Xqz+ztzUKk2ruaJvyTBb8PZU7Z7c1niZMeriuoWAg/hXZ8LBsWCajJ5ls6w+wc3bdTYKkR2tO1jVs35/jmb8NMzjooafCWU8Jl26rOWlAaU3DOpfL9X2dYY0r2uV6zbMSDg8a7h5H6kgeI0kNhuMoeQpwcprC5pfTSZo7i0m7xpGugJKx0oLjBfvDPGdVbv3jTSq9XDAwd/JK752phl2P/L+UnWcaJe1AKXU7vPNY5dfir6LCtpXDS+/DGz+ugMOFC8aTxs7TDqlenzpc3dRU/WXO0aica8sHPv6zembTzOqEwtjXqZSrJjqrmRCTaJ5N1U/IphD2RXTmTaTIHEk4Tp1t22ihUrher4+VDg1JY28+H6Ul8N5vQ1IMlpkU+ml/PhQTaxJoloEyl4hgI5XMXhXOk4noMiFLCZBNuHsf0Mv18nZ5e3t7QNqD11iRy+9nUllPqMiiS4owEs7sPUB0mjwqFWt0TFKBLZJI8kCCklzMp5dKk5fAtD3+gvjFy6kEBzhCjHPq6f1lZWiAhJBIZS0hE1CaCLlYNxYbqdTbK+7F5v6VSjeixPdHpKLApParvHMISabDs4KVl9SQX9/BZvy+3y9VuBVut1uhQCmYSj/TvkLhFpdS6XQv+1zJvNAk2KdEiQvC4X2Qz1FJR7iQIABlrZFKb3UqOnFXdF5wNCp4LUrn8H3Fs7yUTyWLMuI8tYTrQYnYcFKUE4lfOkQ6Di72QghKnRkYPMS1UukymPZJhj+ld1FpH2E3GenpKipZoF7NhkylIjZ2NYRye6/PuIYlo3ntDCZ9OCnOXxolLQb6FBmBSiSvZ0Ia8Uu1+BviiDXXcXunx/Fp/iX+8RXhKM2I/7aZL5UuHJGyIdNqtSmDltFFq4Kk+oCUDGmiXHMmqKh0NotjM7xwbrhz/TcACQ6+tPyUxBV7AdKKRBBBn2+NtyQgHQopwyUfdJBwF99yezeLY2nWd8ema8OD34YUB19iUiA6SSQeTZH/XHEmC3VRatW2dmND6clJLQ7nq8+j1KrVdndrl18pZAVTiaVlqXf9R4u+WJQQDyktfOkSgZLPp/Vpb/U5N4/8GyQ4fSw3CJMSfbjhvjulouJIBc2RY7uRSU8XKr2bPpUl0bkhkM8T+dIJQRJZeKKKT19V1airvr6qB6cKey8gMTExXV2sdbGwPusIesP4S4ABALuzx/Q14rYaAAAAAElFTkSuQmCC') no-repeat;
+}
+/* line 16, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top ul {
+  list-style-type: none;
+}
+/* line 19, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top a, #top span {
+  color: #cccccc;
+  text-decoration: none;
+}
+/* line 23, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top li {
+  display: inline-block;
+}
+/* line 26, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top li.active {
+  background-color: black;
+}
+/* line 28, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top li.active a {
+  color: white;
+}
+/* line 31, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top li a, #top li span {
+  display: block;
+  padding: 0 15px;
+}
+/* line 34, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top li a:hover, #top li span:hover {
+  color: white;
+}
+/* line 37, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile {
+  position: relative;
+  float: right;
+}
+/* line 41, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile .handle {
+  margin: 0;
+}
+/* line 44, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile .signed-out, #top .profile .signing-in, #top .profile .signed-in {
+  display: none;
+  padding: 0 15px 0 45px;
+}
+/* line 47, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile .signed-out, #top .profile .signing-in {
+  min-width: 110px;
+}
+/* line 49, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile.signed-out .signed-out {
+  display: block;
+}
+/* line 51, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile.signing-in .signing-in {
+  display: inline-block;
+}
+/* line 53, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile.signed-in .signed-in {
+  display: block;
+}
+/* line 56, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile .signing-in {
+  background: url('data:image/gif;base64,R0lGODlhEAAIAPMHAP///+vr66CgoN7e3rW1tYuLi/X19Wtra3t7e87OzsbGxqGhodfX142NjZaWlqurqyH/C05FVFNDQVBFMi4wAwEAAAAh/hoiQ3JlYXRlZCB3aXRoIENoaW1wbHkuY29tIgAh+QQACgD/ACwAAAAAEAAIAAADKXiq0P7glHmglRSMPUDgBlZUQ/B5ZhBOo2Z2qSqSL2qumaEbwK7PFkgCACH5BAAKAP8ALAAAAAAQAAgAAAQwsKCJwLkH6F2Er0dRZJvWfZaYBUNrnAKoAkEdvF6cjrSNoyGe7QaT8QxIpISyI5UiACH5BAAKAP8ALAAAAAAQAAgAAAQvcIkpALoInL0F+Y41ZUdhHh4oCqRZoB8RIqPmwirN2mcqr61ebFYrnSQUC4b3igAAIfkEAAoA/wAsAAAAABAACAAABDAQyCmqACijQpYnQEMQDWZxSgqKpFmhajiWyEmkyjq7ApzLrdqr8wHSThOKBaMpRAAAIfkEAAoA/wAsAAAAABAACAAABDMQyEmBuGKxxBl4y/IADmEKzKAmwMItpEmg6sC6CVye6dq+MV7tBtzNNp1PaGQUVJ6YTAQAIfkEAAoA/wAsAAAAABAACAAABC8QyEmrBSknQJYnxiAGgCIqnKKCQUuaA0qoCuuWZ7oa7pvPO4PQgNFwPAvCZQmIAAAh+QQACgD/ACwAAAAAEAAIAAAEKRDISau1LGlmhg+A5wGJyAUoOKADaRqpyrremYZzWRs8D/QGQGZzKQIiACH5BAAKAP8ALAAAAAAQAAgAAAMhCLrc/iyMGcCcQNLAueVD1o3eAIpk90koZ7wvABvyDEEJADs=') no-repeat 110px 16px;
+}
+/* line 59, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile img {
+  position: absolute;
+  top: 7px;
+  left: 15px;
+  width: 22px;
+  height: 22px;
+  -webkit-border-radius: 3px;
+  -moz-border-radius: 3px;
+  -ms-border-radius: 3px;
+  -o-border-radius: 3px;
+  border-radius: 3px;
+}
+/* line 67, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile.signed-in:hover > ul {
+  display: block;
+}
+/* line 70, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile ul {
+  display: none;
+  position: absolute;
+  z-index: 300;
+  top: 40px;
+  width: 100%;
+  background-color: #444444;
+  -moz-border-radius-bottomleft: 6px;
+  -webkit-border-bottom-left-radius: 6px;
+  border-bottom-left-radius: 6px;
+  -moz-border-radius-bottomright: 6px;
+  -webkit-border-bottom-right-radius: 6px;
+  border-bottom-right-radius: 6px;
+  -webkit-box-shadow: 2px 2px 10px rgba(0, 0, 0, 0.3);
+  -moz-box-shadow: 2px 2px 10px rgba(0, 0, 0, 0.3);
+  box-shadow: 2px 2px 10px rgba(0, 0, 0, 0.3);
+}
+/* line 80, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile ul li {
+  display: block;
+}
+/* line 82, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile ul li:last-child a:hover {
+  -moz-border-radius-bottomleft: 4px;
+  -webkit-border-bottom-left-radius: 4px;
+  border-bottom-left-radius: 4px;
+  -moz-border-radius-bottomright: 4px;
+  -webkit-border-bottom-right-radius: 4px;
+  border-bottom-right-radius: 4px;
+}
+/* line 85, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile ul a {
+  display: block;
+  padding: 5px 25px 5px 45px;
+  line-height: 24px;
+  white-space: nowrap;
+}
+/* line 90, /Users/drogus/code/travis/travis-ember/assets/stylesheets/top.sass */
+#top .profile ul a:hover {
+  background-color: #666666;
+}

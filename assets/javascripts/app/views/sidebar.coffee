@@ -15,6 +15,7 @@
       $(event.target).closest('li').toggleClass('open')
 
   WorkersItemView: Travis.View.extend
+    jobBinding: 'worker.job'
     display: (->
       name = (@get('worker.name') || '').replace('travis-', '')
       state = @get('worker.state')

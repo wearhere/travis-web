@@ -1,9 +1,7 @@
 require 'ext/ember/namespace'
 
 @Travis.reopen
-  View: Em.View.extend
-    route: (event) ->
-      Travis.app.routes.route(event)
+  View: Em.View.extend()
 
     popup: (event) ->
       $("##{event.target.name}").remove().appendTo('body').toggle()
