@@ -18,8 +18,8 @@ Travis.RepositoryController = Travis.Controller.extend
 
   activate: (action, params) ->
     @_unbind()
-    @setParams(params)
     this["view#{$.camelize(action)}"]()
+    @setParams(params)
 
   viewIndex: ->
     @_bind('repository', 'controllers.repositoriesController.firstObject')
