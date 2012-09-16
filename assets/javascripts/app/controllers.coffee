@@ -21,10 +21,10 @@ Travis.reopen
 
   ApplicationController: Em.Controller.extend()
 
+require 'controllers/accounts'
 require 'controllers/auth'
 require 'controllers/builds'
 require 'controllers/home'
-require 'controllers/owners'
 require 'controllers/profile'
 require 'controllers/repositories'
 require 'controllers/repository'

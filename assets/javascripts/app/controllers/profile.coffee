@@ -3,15 +3,15 @@ Travis.ProfileController = Travis.Controller.extend
   userBinding: 'Travis.app.currentUser'
 
   init: ->
-    @_super('top', 'owners')
+    @_super('top', 'top')
     #@connectOutlet outletName: 'left', controller: @ownersController, viewClass: Travis.OwnersView
     #@connectOutlet(outletName: 'main', controller: this, viewClass: Travis.ProfileView)
     #@owners = @ownersController.get('content')
 
-  owner: (->
+  account: (->
     login = @get('params.login') || Travis.app.get('currentUser.login')
-    @owners.toArray().filter((owner) -> owner if owner.get('login') == login)[0]
-  ).property('owners.length', 'params.login')
+    @accounts.toArray().filter((account) -> account if account.get('login') == login)[0]
+  ).property('accounts.length', 'params.login')
 
   activate: (action, params) ->
     @setParams(params || @get('params'))
@@ -19,7 +19,7 @@ Travis.ProfileController = Travis.Controller.extend
 
   viewHooks: ->
     @connectTab('hooks')
-    @set('hooks', Travis.Hook.find(login: @get('params.login') || Travis.app.get('currentUser.login')))
+    @set('hooks', Travis.Hook.find(owner_name: @get('params.login') || Travis.app.get('currentUser.login')))
 
   viewUser: ->
     @connectTab('user')

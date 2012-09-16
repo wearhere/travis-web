@@ -22,7 +22,8 @@ GIT
 
 GIT
   remote: git://github.com/travis-ci/travis-api.git
-  revision: f05f841a46dbd9601e57676f8c4a356b21234cf2
+  revision: 957e9ee37896034237ad5e32abae9b432df9c228
+  branch: sf-use-services
   specs:
     travis-api (0.0.1)
       backports (~> 2.5)
@@ -39,7 +40,8 @@ GIT
 
 GIT
   remote: git://github.com/travis-ci/travis-core.git
-  revision: ae522712754eb9d0ad575719680c8fe2a9c5dab6
+  revision: ea7a1678a0388e586ac4778a9b6ee56a11dfb0aa
+  branch: sf-more-services
   specs:
     travis-core (0.0.1)
       actionmailer (~> 3.2.3)

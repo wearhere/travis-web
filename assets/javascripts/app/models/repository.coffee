@@ -12,15 +12,11 @@ require 'travis/model'
   lastBuild: DS.belongsTo('Travis.Build')
 
   builds: (->
-    id = @get('id')
-    Travis.Build.byRepositoryId id, event_type: 'push'
-    Travis.Build.filter (data) -> parseInt(data.get('repository_id')) == id && !data.get('pull_request')
+    Travis.Build.byRepositoryId @get('id'), event_type: 'push'
   ).property()
 
   pullRequests: (->
-    id = @get('id')
-    Travis.Build.byRepositoryId id, event_type: 'pull_request'
-    Travis.Build.filter (data) -> parseInt(data.get('repository_id')) == id && data.get('pull_request')
+    Travis.Build.byRepositoryId @get('id'), event_type: 'pull_request'
   ).property()
 
   branches: (->
@@ -57,7 +53,7 @@ require 'travis/model'
   ).property()
 
   select: ->
-    Travis.Repository.select(self.get('id'))
+    Travis.Repository.select(@get('id'))
 
   updateTimes: ->
     @notifyPropertyChange 'lastBuildDuration'
@@ -67,17 +63,18 @@ require 'travis/model'
     @find()
 
   ownedBy: (login) ->
-    @find(owner: login, orderBy: 'name')
+    @find(owner_name: login, orderBy: 'name')
 
   search: (query) ->
     @find(search: query, orderBy: 'name')
 
   bySlug: (slug) ->
-    @find(slug: slug)
+    repo = $.select(@find().toArray(), (repo) -> repo.get('slug') == slug)
+    if repo.length > 0 then repo else @find(slug: slug)
 
   select: (id) ->
     @find().forEach (repository) ->
-      repository.set 'selected', repository.get('id') is id
+      repository.set('selected', repository.get('id') == id)
 
   # buildURL: (slug) ->
   #   if slug then slug else 'repositories'

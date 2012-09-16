@@ -2,7 +2,7 @@
   StatsView: Travis.View.extend
     templateName: 'stats/show'
     didInsertElement: ->
-      @renderChart(config) for name, config of @CHARTS
+      # @renderChart(config) for name, config of @CHARTS
 
     renderChart: (config) ->
       chart = new Highcharts.Chart(config)
@@ -19,9 +19,10 @@
 
     CHARTS:
       repos:
-        source: '/stats/repos'
+        source: '/api/stats/repos'
+        total: 0
         map: (data) ->
-          [Date.parse(data.date), data.total_growth]
+          [Date.parse(data.date), @total += parseInt(data.count)]
         chart:
           renderTo: "repos_stats"
         title:
@@ -44,9 +45,9 @@
         ]
 
       builds:
-        source: '/stats/tests'
+        source: '/api/stats/tests'
         map: (data) ->
-          [Date.parse(data.date), data.run_on_date]
+          [Date.parse(data.date), parseInt(data.count)]
         chart:
           renderTo: "tests_stats"
           type: "column"
