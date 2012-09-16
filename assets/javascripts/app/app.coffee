@@ -27,7 +27,6 @@ Travis.reopen
 
     init: ->
       @_super()
-      @connect()
 
       @store = Travis.Store.create()
       @store.loadMany(Travis.Sponsor, Travis.SPONSORS)
