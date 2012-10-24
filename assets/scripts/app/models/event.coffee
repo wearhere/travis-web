@@ -2,10 +2,10 @@ require 'travis/model'
 
 @Travis.Event = Travis.Model.extend
   event:     DS.attr('string')
-  repoId:    DS.attr('number', key: 'repository_id')
-  sourceId:  DS.attr('number', key: 'source_id')
-  sourceType:  DS.attr('string', key: 'source_type')
-  createdAt: DS.attr('string', key: 'created_at')
+  repoId:    DS.attr('number')
+  sourceId:  DS.attr('number')
+  sourceType:  DS.attr('string')
+  createdAt: DS.attr('string')
 
   event_: (->
     @get('event')

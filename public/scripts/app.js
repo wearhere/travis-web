@@ -25367,7 +25367,7 @@ if (typeof module == "object" && typeof window == "undefined") {
 
 ;(function() {
 window.DS = Ember.Namespace.create({
-  CURRENT_API_REVISION: 4
+  CURRENT_API_REVISION: 6
 });
 
 })();
@@ -25385,8 +25385,7 @@ var get = Ember.get, set = Ember.set;
   in response to queries.
 */
 
-DS.RecordArray = Ember.ArrayProxy.extend({
-
+DS.RecordArray = Ember.ArrayProxy.extend(Ember.Evented, {
   /**
     The model type contained by this record array.
 
@@ -25400,6 +25399,9 @@ DS.RecordArray = Ember.ArrayProxy.extend({
   // necessary, by the store.
   content: null,
 
+  isLoaded: false,
+  isUpdating: false,
+
   // The store that created this record array.
   store: null,
 
@@ -25411,6 +25413,24 @@ DS.RecordArray = Ember.ArrayProxy.extend({
     if (clientId !== undefined) {
       return store.findByClientId(get(this, 'type'), clientId);
     }
+  },
+
+  materializedObjectAt: function(index) {
+    var clientId = get(this, 'content').objectAt(index);
+    if (!clientId) { return; }
+
+    if (get(this, 'store').recordIsMaterialized(clientId)) {
+      return this.objectAt(index);
+    }
+  },
+
+  update: function() {
+    if (get(this, 'isUpdating')) { return; }
+
+    var store = get(this, 'store'),
+        type = get(this, 'type');
+
+    store.fetchAll(type, this);
   }
 });
 
@@ -25423,6 +25443,7 @@ var get = Ember.get;
 
 DS.FilteredRecordArray = DS.RecordArray.extend({
   filterFunction: null,
+  isLoaded: true,
 
   replace: function() {
     var type = get(this, 'type').toString();
@@ -25444,7 +25465,6 @@ var get = Ember.get, set = Ember.set;
 
 DS.AdapterPopulatedRecordArray = DS.RecordArray.extend({
   query: null,
-  isLoaded: false,
 
   replace: function() {
     var type = get(this, 'type').toString();
@@ -25460,9 +25480,10 @@ DS.AdapterPopulatedRecordArray = DS.RecordArray.extend({
     set(this, 'content', Ember.A(clientIds));
     set(this, 'isLoaded', true);
     this.endPropertyChanges();
+
+    this.trigger('didLoad');
   }
 });
-
 
 })();
 
@@ -25617,25 +25638,65 @@ DS.ManyArrayStateManager = Ember.StateManager.extend({
 (function() {
 var get = Ember.get, set = Ember.set;
 
+/**
+  A ManyArray is a RecordArray that represents the contents of a has-many
+  association.
+
+  The ManyArray is instantiated lazily the first time the association is
+  requested.
+
+  ### Inverses
+
+  Often, the associations in Ember Data applications will have
+  an inverse. For example, imagine the following models are
+  defined:
+
+      App.Post = DS.Model.extend({
+        comments: DS.hasMany('App.Comment')
+      });
+
+      App.Comment = DS.Model.extend({
+        post: DS.belongsTo('App.Post')
+      });
+
+  If you created a new instance of `App.Post` and added
+  a `App.Comment` record to its `comments` has-many
+  association, you would expect the comment's `post`
+  property to be set to the post that contained
+  the has-many.
+
+  We call the record to which an association belongs the
+  association's _owner_.
+*/
 DS.ManyArray = DS.RecordArray.extend({
   init: function() {
-    set(this, 'stateManager', DS.ManyArrayStateManager.create({ manyArray: this }));
-
-    return this._super();
+    this._super.apply(this, arguments);
+    this._changesToSync = Ember.OrderedSet.create();
   },
 
-  parentRecord: null,
+  /**
+    @private
 
-  isDirty: Ember.computed(function() {
-    return get(this, 'stateManager.currentState.isDirty');
-  }).property('stateManager.currentState').cacheable(),
+    The record to which this association belongs.
 
-  isLoaded: Ember.computed(function() {
-    return get(this, 'stateManager.currentState.isLoaded');
-  }).property('stateManager.currentState').cacheable(),
+    @property {DS.Model}
+  */
+  owner: null,
 
-  send: function(event, context) {
-    this.get('stateManager').send(event, context);
+  // LOADING STATE
+
+  isLoaded: false,
+
+  loadingRecordsCount: function(count) {
+    this.loadingRecordsCount = count;
+  },
+
+  loadedRecord: function() {
+    this.loadingRecordsCount--;
+    if (this.loadingRecordsCount === 0) {
+      set(this, 'isLoaded', true);
+      this.trigger('didLoad');
+    }
   },
 
   fetch: function() {
@@ -25648,92 +25709,163 @@ DS.ManyArray = DS.RecordArray.extend({
 
   // Overrides Ember.Array's replace method to implement
   replaceContent: function(index, removed, added) {
-    var parentRecord = get(this, 'parentRecord');
-    var pendingParent = parentRecord && !get(parentRecord, 'id');
-    var stateManager = get(this, 'stateManager');
-
     // Map the array of record objects into an array of  client ids.
     added = added.map(function(record) {
       Ember.assert("You can only add records of " + (get(this, 'type') && get(this, 'type').toString()) + " to this association.", !get(this, 'type') || (get(this, 'type') === record.constructor));
-
-      // If the record to which this many array belongs does not yet
-      // have an id, notify the newly-added record that it must wait
-      // for the parent to receive an id before the child can be
-      // saved.
-      if (pendingParent) {
-        record.send('waitingOn', parentRecord);
-      }
-
-      var oldParent = this.assignInverse(record, parentRecord);
-
-      record.get('transaction')
-        .relationshipBecameDirty(record, oldParent, parentRecord);
-
-      stateManager.send('recordWasAdded', record);
-
       return record.get('clientId');
     }, this);
-
-    var store = this.store;
-
-    var len = index+removed, record;
-    for (var i = index; i < len; i++) {
-      // TODO: null out inverse FK
-      record = this.objectAt(i);
-      var oldParent = this.assignInverse(record, parentRecord, true);
-
-      record.get('transaction')
-        .relationshipBecameDirty(record, parentRecord, null);
-
-      // If we put the child record into a pending state because
-      // we were waiting on the parent record to get an id, we
-      // can tell the child it no longer needs to wait.
-      if (pendingParent) {
-        record.send('doneWaitingOn', parentRecord);
-      }
-
-      stateManager.send('recordWasAdded', record);
-    }
 
     this._super(index, removed, added);
   },
 
-  assignInverse: function(record, parentRecord, remove) {
-    var associationMap = get(record.constructor, 'associations'),
-        possibleAssociations = associationMap.get(parentRecord.constructor),
-        possible, actual, oldParent;
+  arrangedContentDidChange: function() {
+    this.fetch();
+  },
 
-    if (!possibleAssociations) { return; }
+  arrayContentWillChange: function(index, removed, added) {
+    var owner = get(this, 'owner'),
+        name = get(this, 'name');
 
-    for (var i = 0, l = possibleAssociations.length; i < l; i++) {
-      possible = possibleAssociations[i];
+    if (!owner._suspendedAssociations) {
+      // This code is the first half of code that continues inside
+      // of arrayContentDidChange. It gets or creates a change from
+      // the child object, adds the current owner as the old
+      // parent if this is the first time the object was removed
+      // from a ManyArray, and sets `newParent` to null.
+      //
+      // Later, if the object is added to another ManyArray,
+      // the `arrayContentDidChange` will set `newParent` on
+      // the change.
+      for (var i=index; i<index+removed; i++) {
+        var clientId = get(this, 'content').objectAt(i);
+        //var record = this.objectAt(i);
+        //if (!record) { continue; }
 
-      if (possible.kind === 'belongsTo') {
-        actual = possible;
-        break;
+        var change = DS.OneToManyChange.forChildAndParent(clientId, get(this, 'store'), { parentType: owner.constructor });
+        change.hasManyName = name;
+
+        if (change.oldParent === undefined) { change.oldParent = get(owner, 'clientId'); }
+        change.newParent = null;
+        this._changesToSync.add(change);
       }
     }
 
-    if (actual) {
-      oldParent = get(record, actual.name);
-      set(record, actual.name, remove ? null : parentRecord);
-      return oldParent;
+    return this._super.apply(this, arguments);
+  },
+
+  arrayContentDidChange: function(index, removed, added) {
+    this._super.apply(this, arguments);
+
+    var owner = get(this, 'owner'),
+        name = get(this, 'name');
+
+    if (!owner._suspendedAssociations) {
+      // This code is the second half of code that started in
+      // `arrayContentWillChange`. It gets or creates a change
+      // from the child object, and adds the current owner as
+      // the new parent.
+      for (var i=index; i<index+added; i++) {
+        var clientId = get(this, 'content').objectAt(i);
+
+        var change = DS.OneToManyChange.forChildAndParent(clientId, get(this, 'store'), { parentType: owner.constructor });
+        change.hasManyName = name;
+
+        // The oldParent will be looked up in `sync` if it
+        // was not set by `belongsToWillChange`.
+        change.newParent = get(owner, 'clientId');
+        this._changesToSync.add(change);
+      }
+
+      // We wait until the array has finished being
+      // mutated before syncing the OneToManyChanges created
+      // in arrayContentWillChange, so that the array
+      // membership test in the sync() logic operates
+      // on the final results.
+      this._changesToSync.forEach(function(change) {
+        change.sync();
+      });
+      this._changesToSync.clear();
     }
   },
 
-  // Create a child record within the parentRecord
+  /**
+    @private
+  */
+  assignInverse: function(record) {
+    var inverseName = DS.inverseNameFor(record.constructor, get(this, 'owner.constructor'), 'belongsTo'),
+        owner = get(this, 'owner'),
+        currentInverse;
+
+    if (inverseName) {
+      currentInverse = get(record, inverseName);
+      if (currentInverse !== owner) {
+        set(record, inverseName, owner);
+      }
+    }
+
+    return currentInverse;
+  },
+
+  /**
+    @private
+  */
+  removeInverse: function(record) {
+    var inverseName = DS.inverseNameFor(record.constructor, get(this, 'owner.constructor'), 'belongsTo');
+
+    if (inverseName) {
+      var currentInverse = get(record, inverseName);
+      if (currentInverse === get(this, 'owner')) {
+        set(record, inverseName, null);
+      }
+    }
+  },
+
+  // Create a child record within the owner
   createRecord: function(hash, transaction) {
-    var parentRecord = get(this, 'parentRecord'),
-        store = get(parentRecord, 'store'),
+    var owner = get(this, 'owner'),
+        store = get(owner, 'store'),
         type = get(this, 'type'),
         record;
 
-    transaction = transaction || get(parentRecord, 'transaction');
+    transaction = transaction || get(owner, 'transaction');
 
     record = store.createRecord.call(store, type, hash, transaction);
     this.pushObject(record);
 
     return record;
+  },
+
+  /**
+    METHODS FOR USE BY INVERSE RELATIONSHIPS
+    ========================================
+
+    These methods exists so that belongsTo relationships can
+    set their inverses without causing an infinite loop.
+
+    This creates two APIs:
+
+    * the normal enumerable API, which is used by clients
+      of the `ManyArray` and triggers a change to inverse
+      `belongsTo` relationships.
+    * `removeFromContent` and `addToContent`, which are
+      used by inverse relationships and do not trigger a
+      change to `belongsTo` relationships.
+
+    Unlike the normal `addObject` and `removeObject` APIs,
+    these APIs manipulate the `content` array without
+    triggering side-effects.
+  */
+
+  /** @private */
+  removeFromContent: function(record) {
+    var clientId = get(record, 'clientId');
+    get(this, 'content').removeObject(clientId);
+  },
+
+  /** @private */
+  addToContent: function(record) {
+    var clientId = get(record, 'clientId');
+    get(this, 'content').addObject(clientId);
   }
 });
 
@@ -25749,7 +25881,14 @@ DS.ManyArray = DS.RecordArray.extend({
 
 (function() {
 var get = Ember.get, set = Ember.set, fmt = Ember.String.fmt,
-    removeObject = Ember.EnumerableUtils.removeObject;
+    removeObject = Ember.EnumerableUtils.removeObject, forEach = Ember.EnumerableUtils.forEach;
+
+var RelationshipLink = function(parent, child) {
+  this.oldParent = parent;
+  this.child = child;
+};
+
+
 
 /**
   A transaction allows you to collect multiple records into a unit of work
@@ -25788,7 +25927,7 @@ var get = Ember.get, set = Ember.set, fmt = Ember.String.fmt,
 
   Add records to a transaction using the `add()` method:
 
-      record = App.store.find(Person, 1);
+      record = App.store.find(App.Person, 1);
       transaction.add(record);
 
   Note that only records whose `isDirty` flag is `false` may be added
@@ -25805,7 +25944,7 @@ var get = Ember.get, set = Ember.set, fmt = Ember.String.fmt,
   For example, instead of this:
 
     var transaction = store.transaction();
-    var person = Person.createRecord({ name: "Steve" });
+    var person = App.Person.createRecord({ name: "Steve" });
 
     // won't work because person is dirty
     transaction.add(person);
@@ -25813,7 +25952,7 @@ var get = Ember.get, set = Ember.set, fmt = Ember.String.fmt,
   Call `createRecord()` on the transaction directly:
 
     var transaction = store.transaction();
-    transaction.createRecord(Person, { name: "Steve" });
+    transaction.createRecord(App.Person, { name: "Steve" });
 
   ### Asynchronous Commits
 
@@ -25829,6 +25968,8 @@ var get = Ember.get, set = Ember.set, fmt = Ember.String.fmt,
   calling commit.
 */
 
+var arrayDefault = function() { return []; };
+
 DS.Transaction = Ember.Object.extend({
   /**
     @private
@@ -25838,18 +25979,14 @@ DS.Transaction = Ember.Object.extend({
   */
   init: function() {
     set(this, 'buckets', {
-      clean:    Ember.Map.create(),
-      created:  Ember.Map.create(),
-      updated:  Ember.Map.create(),
-      deleted:  Ember.Map.create(),
-      inflight: Ember.Map.create()
+      clean:    Ember.OrderedSet.create(),
+      created:  Ember.OrderedSet.create(),
+      updated:  Ember.OrderedSet.create(),
+      deleted:  Ember.OrderedSet.create(),
+      inflight: Ember.OrderedSet.create()
     });
 
-    this.dirtyRelationships = {
-      byChild: Ember.Map.create(),
-      byNewParent: Ember.Map.create(),
-      byOldParent: Ember.Map.create()
-    };
+    set(this, 'relationships', Ember.OrderedSet.create());
   },
 
   /**
@@ -25868,6 +26005,16 @@ DS.Transaction = Ember.Object.extend({
     return store.createRecord(type, hash, this);
   },
 
+  isEqualOrDefault: function(other) {
+    if (this === other || other === get(this, 'store.defaultTransaction')) {
+      return true;
+    }
+  },
+
+  isDefault: Ember.computed(function() {
+    return this === get(this, 'store.defaultTransaction');
+  }),
+
   /**
     Adds an existing record to this transaction. Only records without
     modficiations (i.e., records whose `isDirty` property is `false`)
@@ -25876,15 +26023,30 @@ DS.Transaction = Ember.Object.extend({
     @param {DS.Model} record the record to add to the transaction
   */
   add: function(record) {
-    // we could probably make this work if someone has a valid use case. Do you?
-    Ember.assert("Once a record has changed, you cannot move it into a different transaction", !get(record, 'isDirty'));
+    Ember.assert("You must pass a record into transaction.add()", record instanceof DS.Model);
 
     var recordTransaction = get(record, 'transaction'),
         defaultTransaction = get(this, 'store.defaultTransaction');
 
+    // Make `add` idempotent
+    if (recordTransaction === this) { return; }
+
+    // XXX it should be possible to move a dirty transaction from the default transaction
+
+    // we could probably make this work if someone has a valid use case. Do you?
+    Ember.assert("Once a record has changed, you cannot move it into a different transaction", !get(record, 'isDirty'));
+
     Ember.assert("Models cannot belong to more than one transaction at a time.", recordTransaction === defaultTransaction);
 
     this.adoptRecord(record);
+  },
+
+  relationshipBecameDirty: function(relationship) {
+    get(this, 'relationships').add(relationship);
+  },
+
+  relationshipBecameClean: function(relationship) {
+    get(this, 'relationships').remove(relationship);
   },
 
   /**
@@ -25897,50 +26059,37 @@ DS.Transaction = Ember.Object.extend({
     moved back to the store's default transaction.
   */
   commit: function() {
-    var self = this,
-        iterate;
-
-    iterate = function(bucketType, fn, binding) {
-      var dirty = self.bucketForType(bucketType);
-
-      dirty.forEach(function(type, records) {
-        if (records.isEmpty()) { return; }
-
-        var array = [];
-
-        records.forEach(function(record) {
-          record.send('willCommit');
-
-          if (get(record, 'isPending') === false) {
-            array.push(record);
-          }
-        });
-
-        fn.call(binding, type, array);
-      });
-    };
-
-    var commitDetails = {
-      updated: {
-        eachType: function(fn, binding) { iterate('updated', fn, binding); }
-      },
-
-      created: {
-        eachType: function(fn, binding) { iterate('created', fn, binding); }
-      },
-
-      deleted: {
-        eachType: function(fn, binding) { iterate('deleted', fn, binding); }
-      }
-    };
-
     var store = get(this, 'store');
     var adapter = get(store, '_adapter');
+    var defaultTransaction = get(store, 'defaultTransaction');
+
+    var iterate = function(records) {
+      var set = records.copy();
+      set.forEach(function (record) {
+        record.send('willCommit');
+      });
+      return set;
+    };
+
+    var relationships = get(this, 'relationships');
+
+    var commitDetails = {
+      created: iterate(this.bucketForType('created')),
+      updated: iterate(this.bucketForType('updated')),
+      deleted: iterate(this.bucketForType('deleted')),
+      relationships: relationships
+    };
+
+    if (this === defaultTransaction) {
+      set(store, 'defaultTransaction', store.transaction());
+    }
 
     this.removeCleanRecords();
 
-    if (adapter && adapter.commit) { adapter.commit(store, commitDetails); }
-    else { throw fmt("Adapter is either null or does not implement `commit` method", this); }
+    if (!commitDetails.created.isEmpty() || !commitDetails.updated.isEmpty() || !commitDetails.deleted.isEmpty() || !relationships.isEmpty()) {
+      if (adapter && adapter.commit) { adapter.commit(store, commitDetails); }
+      else { throw fmt("Adapter is either null or does not implement `commit` method", this); }
+    }
   },
 
   /**
@@ -25957,21 +26106,16 @@ DS.Transaction = Ember.Object.extend({
     current transaction should not be used again.
   */
   rollback: function() {
-    var store = get(this, 'store'),
-        dirty;
-
     // Loop through all of the records in each of the dirty states
     // and initiate a rollback on them. As a side effect of telling
     // the record to roll back, it should also move itself out of
     // the dirty bucket and into the clean bucket.
     ['created', 'updated', 'deleted', 'inflight'].forEach(function(bucketType) {
-      dirty = this.bucketForType(bucketType);
-
-      dirty.forEach(function(type, records) {
-        records.forEach(function(record) {
-          record.send('rollback');
-        });
+      var records = this.bucketForType(bucketType);
+      forEach(records, function(record) {
+        record.send('rollback');
       });
+      records.clear();
     }, this);
 
     // Now that all records in the transaction are guaranteed to be
@@ -26002,14 +26146,11 @@ DS.Transaction = Ember.Object.extend({
     Removes all of the records in the transaction's clean bucket.
   */
   removeCleanRecords: function() {
-    var clean = this.bucketForType('clean'),
-        self = this;
-
-    clean.forEach(function(type, records) {
-      records.forEach(function(record) {
-        self.remove(record);
-      });
-    });
+    var clean = this.bucketForType('clean');
+    clean.forEach(function(record) {
+      this.remove(record);
+    }, this);
+    clean.clear();
   },
 
   /**
@@ -26061,17 +26202,7 @@ DS.Transaction = Ember.Object.extend({
     @param {String} bucketType one of `clean`, `created`, `updated`, or `deleted`
   */
   addToBucket: function(bucketType, record) {
-    var bucket = this.bucketForType(bucketType),
-        type = record.constructor;
-
-    var records = bucket.get(type);
-
-    if (!records) {
-      records = Ember.OrderedSet.create();
-      bucket.set(type, records);
-    }
-
-    records.add(record);
+    this.bucketForType(bucketType).add(record);
   },
 
   /**
@@ -26082,118 +26213,7 @@ DS.Transaction = Ember.Object.extend({
     @param {String} bucketType one of `clean`, `created`, `updated`, or `deleted`
   */
   removeFromBucket: function(bucketType, record) {
-    var bucket = this.bucketForType(bucketType),
-        type = record.constructor;
-
-    var records = bucket.get(type);
-    records.remove(record);
-  },
-
-  /**
-    @private
-
-    Called by a ManyArray when a new record is added to it. This
-    method will index a relationship description by the child
-    record, its old parent, and its new parent.
-
-    The store will provide this description to the adapter's
-    shouldCommit method, so it can determine whether any of
-    the records is pending another record. The store will also
-    provide a list of these descriptions to the adapter's commit
-    method.
-
-    @param {DS.Model} record the new child record
-    @param {DS.Model} oldParent the parent that the child is
-      moving from, or null
-    @param {DS.Model} newParent the parent that the child is
-      moving to, or null
-  */
-  relationshipBecameDirty: function(child, oldParent, newParent) {
-    var relationships = this.dirtyRelationships, relationship;
-
-    var relationshipsForChild = relationships.byChild.get(child),
-        possibleRelationship,
-        needsNewEntries = true;
-
-    // If the child has any existing dirty relationships in this
-    // transaction, we need to collapse the old relationship
-    // into the new one. For example, if we change the parent of
-    // a child record before saving, there is no need to save the
-    // record that was its parent temporarily.
-    if (relationshipsForChild) {
-
-      // Loop through all of the relationships we know about that
-      // contain the same child as the new relationship.
-      for (var i=0, l=relationshipsForChild.length; i<l; i++) {
-        relationship = relationshipsForChild[i];
-
-        // If the parent of the child record has changed, there is
-        // no need to update the old parent that had not yet been saved.
-        //
-        // This case is two changes in a record's parent:
-        //
-        //   A -> B
-        //   B -> C
-        //
-        // In this case, there is no need to remember the A->B
-        // change. We can collapse both changes into:
-        //
-        //   A -> C
-        //
-        // Another possible case is:
-        //
-        //   A -> B
-        //   B -> A
-        //
-        // In this case, we don't need to do anything. We can
-        // simply remove the original A->B change and call it
-        // a day.
-        if (relationship.newParent === oldParent) {
-          oldParent = relationship.oldParent;
-          this.removeRelationship(relationship);
-
-          // This is the case of A->B followed by B->A.
-          if (relationship.oldParent === newParent) {
-            needsNewEntries = false;
-          }
-        }
-      }
-    }
-
-    relationship = {
-      child: child,
-      oldParent: oldParent,
-      newParent: newParent
-    };
-
-    // If we didn't go A->B and then B->A, add new dirty relationship
-    // entries.
-    if (needsNewEntries) {
-      this.addRelationshipTo('byChild', child, relationship);
-      this.addRelationshipTo('byOldParent', oldParent, relationship);
-      this.addRelationshipTo('byNewParent', newParent, relationship);
-    }
-  },
-
-  removeRelationship: function(relationship) {
-    var relationships = this.dirtyRelationships;
-
-    removeObject(relationships.byOldParent.get(relationship.oldParent), relationship);
-    removeObject(relationships.byNewParent.get(relationship.newParent), relationship);
-    removeObject(relationships.byChild.get(relationship.child), relationship);
-  },
-
-  addRelationshipTo: function(type, record, description) {
-    var map = this.dirtyRelationships[type];
-
-    var relationships = map.get(record);
-
-    if (!relationships) {
-      relationships = [ description ];
-      map.set(record, relationships);
-    } else {
-      relationships.push(description);
-    }
+    this.bucketForType(bucketType).remove(record);
   },
 
   /**
@@ -26224,6 +26244,11 @@ DS.Transaction = Ember.Object.extend({
     this.addToBucket('inflight', record);
   },
 
+  recordIsMoving: function(kind, record) {
+    this.removeFromBucket(kind, record);
+    this.addToBucket('clean', record);
+  },
+
   /**
     @private
 
@@ -26235,7 +26260,6 @@ DS.Transaction = Ember.Object.extend({
   */
   recordBecameClean: function(kind, record) {
     this.removeFromBucket(kind, record);
-
     this.remove(record);
   }
 });
@@ -26248,29 +26272,37 @@ DS.Transaction = Ember.Object.extend({
 /*globals Ember*/
 var get = Ember.get, set = Ember.set, fmt = Ember.String.fmt;
 
-var DATA_PROXY = {
-  get: function(name) {
-    return this.savedData[name];
-  }
-};
-
 // These values are used in the data cache when clientIds are
 // needed but the underlying data has not yet been loaded by
 // the server.
 var UNLOADED = 'unloaded';
 var LOADING = 'loading';
+var MATERIALIZED = { materialized: true };
+var CREATED = { created: true };
 
 // Implementors Note:
 //
 //   The variables in this file are consistently named according to the following
 //   scheme:
 //
-//   * +id+ means an identifier managed by an external source, provided inside the
-//     data hash provided by that source.
+//   * +id+ means an identifier managed by an external source, provided inside
+//     the data hash provided by that source.
 //   * +clientId+ means a transient numerical identifier generated at runtime by
 //     the data store. It is important primarily because newly created objects may
 //     not yet have an externally generated id.
 //   * +type+ means a subclass of DS.Model.
+
+// Used by the store to normalize IDs entering the store.  Despite the fact
+// that developers may provide IDs as numbers (e.g., `store.find(Person, 1)`),
+// it is important that internally we use strings, since IDs may be serialized
+// and lose type information.  For example, Ember's router may put a record's
+// ID into the URL, and if we later try to deserialize that URL and find the
+// corresponding record, we will not know if it is a string or a number.
+var coerceId = function(id) {
+  return id+'';
+};
+
+var map = Ember.EnumerableUtils.map;
 
 /**
   The store contains all of the hashes for records loaded from the server.
@@ -26322,7 +26354,10 @@ DS.Store = Ember.Object.extend({
     this.typeMaps = {};
     this.recordCache = [];
     this.clientIdToId = {};
+    this.clientIdToType = {};
+    this.clientIdToHash = {};
     this.recordArraysByClientId = {};
+    this.relationshipChanges = {};
 
     // Internally, we maintain a map of all unloaded IDs requested by
     // a ManyArray. As the adapter loads hashes into the store, the
@@ -26332,12 +26367,21 @@ DS.Store = Ember.Object.extend({
     this.loadingRecordArrays = {};
 
     set(this, 'defaultTransaction', this.transaction());
-
-    return this._super();
   },
 
   /**
-    Returns a new transaction scoped to this store.
+    Returns a new transaction scoped to this store. This delegates
+    responsibility for invoking the adapter's commit mechanism to
+    a transaction.
+
+    Transaction are responsible for tracking changes to records
+    added to them, and supporting `commit` and `rollback`
+    functionality. Committing a transaction invokes the store's
+    adapter, while rolling back a transaction reverses all
+    changes made to records added to the transaction.
+
+    A store has an implicit (default) transaction, which tracks changes
+    made to records not explicitly added to a transaction.
 
     @see {DS.Transaction}
     @returns DS.Transaction
@@ -26349,14 +26393,58 @@ DS.Store = Ember.Object.extend({
   /**
     @private
 
-    This is used only by the record's DataProxy. Do not use this directly.
-  */
-  dataForRecord: function(record) {
-    var type = record.constructor,
-        clientId = get(record, 'clientId'),
-        typeMap = this.typeMapFor(type);
+    Instructs the store to materialize the data for a given record.
 
-    return typeMap.cidToHash[clientId];
+    To materialize a record, the store first retrieves the opaque hash that was
+    passed to either `load()` or `loadMany()`. Then, the hash and the record
+    are passed to the adapter's `materialize()` method, which allows the adapter
+    to translate arbitrary hash data structures into the normalized form
+    the record expects.
+
+    The adapter's `materialize()` method will invoke `materializeAttribute()`,
+    `materializeHasMany()` and `materializeBelongsTo()` on the record to
+    populate it with normalized values.
+
+    @param {DS.Model} record
+  */
+  materializeData: function(record) {
+    var clientId = get(record, 'clientId'),
+        cidToHash = this.clientIdToHash,
+        adapter = get(this, '_adapter'),
+        hash = cidToHash[clientId];
+
+    cidToHash[clientId] = MATERIALIZED;
+
+    // Ensures the record's data structures are setup
+    // before being populated by the adapter.
+    record.setupData();
+
+    if (hash !== CREATED) {
+      // Instructs the adapter to extract information from the
+      // opaque hash and materialize the record's attributes and
+      // relationships.
+      adapter.materialize(record, hash);
+    }
+  },
+
+  /**
+    @private
+
+    Returns true if there is already a record for this clientId.
+
+    This is used to determine whether cleanup is required, so that
+    "changes" to unmaterialized records do not trigger mass
+    materialization.
+
+    For example, if a parent record in an association with a large
+    number of children is deleted, we want to avoid materializing
+    those children.
+
+    @param {String|Number} clientId
+    @return {Boolean}
+  */
+  recordIsMaterialized: function(clientId) {
+    return !!this.recordCache[clientId];
   },
 
   /**
@@ -26367,25 +26455,66 @@ DS.Store = Ember.Object.extend({
 
     @property {DS.Adapter|String}
   */
-  adapter: null,
+  adapter: 'DS.Adapter',
 
   /**
     @private
 
-    This property returns the adapter, after resolving a possible String.
+    Returns a JSON representation of the record using the adapter's
+    serialization strategy. This method exists primarily to enable
+    a record, which has access to its store (but not the store's
+    adapter) to provide a `toJSON()` convenience.
+
+    The available options are:
+
+    * `includeId`: `true` if the record's ID should be included in
+      the JSON representation
+
+    @param {DS.Model} record the record to serialize
+    @param {Object} options an options hash
+  */
+  toJSON: function(record, options) {
+    return get(this, '_adapter').toJSON(record, options);
+  },
+
+  /**
+    @private
+
+    This property returns the adapter, after resolving a possible
+    property path.
+
+    If the supplied `adapter` was a class, or a String property
+    path resolved to a class, this property will instantiate the
+    class.
+
+    This property is cacheable, so the same instance of a specified
+    adapter class should be used for the lifetime of the store.
 
     @returns DS.Adapter
   */
   _adapter: Ember.computed(function() {
     var adapter = get(this, 'adapter');
     if (typeof adapter === 'string') {
-      return get(this, adapter, false) || get(window, adapter);
+      adapter = get(this, adapter, false) || get(window, adapter);
     }
-    return adapter;
-  }).property('adapter').cacheable(),
 
-  // A monotonically increasing number to be used to uniquely identify
-  // data hashes and records.
+    if (DS.Adapter.detect(adapter)) {
+      adapter = adapter.create();
+    }
+
+    return adapter;
+  }).property('adapter'),
+
+  /**
+    @private
+
+    A monotonically increasing number to be used to uniquely identify
+    data hashes and records.
+
+    It starts at 1 so other parts of the code can test for truthiness
+    when provided a `clientId` instead of having to explicitly test
+    for undefined.
+  */
   clientIdCounter: 1,
 
   // .....................
@@ -26395,6 +26524,10 @@ DS.Store = Ember.Object.extend({
   /**
     Create a new record in the current store. The properties passed
     to this method are set on the newly created record.
+
+    Note: The third `transaction` property is for internal use only.
+    If you want to create a record inside of a given transaction,
+    use `transaction.createRecord()` instead of `store.createRecord()`.
 
     @param {subclass of DS.Model} type
     @param {Object} properties a hash of properties to set on the
@@ -26407,54 +26540,60 @@ DS.Store = Ember.Object.extend({
     // Create a new instance of the model `type` and put it
     // into the specified `transaction`. If no transaction is
     // specified, the default transaction will be used.
-    //
-    // NOTE: A `transaction` is specified when the
-    // `transaction.createRecord` API is used.
     var record = type._create({
       store: this
     });
 
     transaction = transaction || get(this, 'defaultTransaction');
+
+    // adoptRecord is an internal API that allows records to move
+    // into a transaction without assertions designed for app
+    // code. It is used here to ensure that regardless of new
+    // restrictions on the use of the public `transaction.add()`
+    // API, we will always be able to insert new records into
+    // their transaction.
     transaction.adoptRecord(record);
 
-    // Extract the primary key from the `properties` hash,
-    // based on the `primaryKey` for the model type.
-    var primaryKey = get(record, 'primaryKey'),
-        id = properties[primaryKey] || null;
+    // `id` is a special property that may not be a `DS.attr`
+    var id = properties.id;
 
     // If the passed properties do not include a primary key,
-    // give the adapter an opportunity to generate one.
+    // give the adapter an opportunity to generate one. Typically,
+    // client-side ID generators will use something like uuid.js
+    // to avoid conflicts.
     var adapter;
     if (Ember.none(id)) {
       adapter = get(this, 'adapter');
       if (adapter && adapter.generateIdForRecord) {
-        id = adapter.generateIdForRecord(this, record);
+        id = coerceId(adapter.generateIdForRecord(this, record));
         properties.id = id;
       }
     }
 
-    var hash = {}, clientId;
+    id = coerceId(id);
 
-    // Push the hash into the store. If present, associate the
-    // extracted `id` with the hash.
-    clientId = this.pushHash(hash, id, type);
-
-    record.send('didChangeData');
-
-    var recordCache = get(this, 'recordCache');
+    // Create a new `clientId` and associate it with the
+    // specified (or generated) `id`. Since we don't have
+    // any data for the server yet (by definition), store
+    // the sentinel value CREATED as the hash for this
+    // clientId. If we see this value later, we will skip
+    // materialization.
+    var clientId = this.pushHash(CREATED, id, type);
 
     // Now that we have a clientId, attach it to the record we
     // just created.
     set(record, 'clientId', clientId);
 
+    // Move the record out of its initial `empty` state into
+    // the `loaded` state.
+    record.loadedData();
+
     // Store the record we just created in the record cache for
     // this clientId.
-    recordCache[clientId] = record;
+    this.recordCache[clientId] = record;
 
     // Set the properties specified on the record.
     record.setProperties(properties);
-
-    this.updateRecordArrays(type, clientId, get(record, 'data'));
 
     return record;
   },
@@ -26469,7 +26608,16 @@ DS.Store = Ember.Object.extend({
     @param {DS.Model} record
   */
   deleteRecord: function(record) {
-    record.send('deleteRecord');
+    record.deleteRecord();
+  },
+
+  /**
+    For symmetry, a record can be unloaded via the store.
+
+    @param {DS.Model} record
+  */
+  unloadRecord: function(record) {
+    record.unloadRecord();
   },
 
   // ................
@@ -26533,60 +26681,95 @@ DS.Store = Ember.Object.extend({
     You can check whether a query results `RecordArray` has loaded
     by checking its `isLoaded` property.
   */
-  find: function(type, id, query) {
+  find: function(type, id) {
     if (id === undefined) {
       return this.findAll(type);
     }
 
-    if (query !== undefined) {
-      return this.findMany(type, id, query);
-    } else if (Ember.typeOf(id) === 'object') {
+    // We are passed a query instead of an id.
+    if (Ember.typeOf(id) === 'object') {
       return this.findQuery(type, id);
     }
 
-    if (Ember.isArray(id)) {
-      return this.findMany(type, id);
-    }
-
-    var clientId = this.typeMapFor(type).idToCid[id];
-
-    return this.findByClientId(type, clientId, id);
+    return this.findById(type, coerceId(id));
   },
 
-  findByClientId: function(type, clientId, id) {
-    var recordCache = get(this, 'recordCache'),
-        dataCache, record;
+  /**
+    @private
 
-    // If there is already a clientId assigned for this
-    // type/id combination, try to find an existing
-    // record for that id and return. Otherwise,
-    // materialize a new record and set its data to the
-    // value we already have.
-    if (clientId !== undefined) {
-      record = recordCache[clientId];
+    This method returns a record for a given type and id
+    combination.
 
-      if (!record) {
-        // create a new instance of the model type in the
-        // 'isLoading' state
-        record = this.materializeRecord(type, clientId);
+    If the store has never seen this combination of type
+    and id before, it creates a new `clientId` with the
+    LOADING sentinel and asks the adapter to load the
+    data.
 
-        dataCache = this.typeMapFor(type).cidToHash;
+    If the store has seen the combination, this method
+    delegates to `findByClientId`.
+  */
+  findById: function(type, id) {
+    var clientId = this.typeMapFor(type).idToCid[id];
 
-        if (typeof dataCache[clientId] === 'object') {
-          record.send('didChangeData');
-        }
-      }
-    } else {
-      clientId = this.pushHash(LOADING, id, type);
+    if (clientId) {
+      return this.findByClientId(type, clientId);
+    }
 
+    clientId = this.pushHash(LOADING, id, type);
+
+    // create a new instance of the model type in the
+    // 'isLoading' state
+    var record = this.materializeRecord(type, clientId, id);
+
+    // let the adapter set the data, possibly async
+    var adapter = get(this, '_adapter');
+    if (adapter && adapter.find) { adapter.find(this, type, id); }
+    else { throw "Adapter is either null or does not implement `find` method"; }
+
+    return record;
+  },
+
+  /**
+    @private
+
+    This method returns a record for a given clientId.
+
+    If there is no record object yet for the clientId, this method
+    materializes a new record object. This allows adapters to
+    eagerly load many raw hashes into the store, and avoid incurring
+    the cost to create the objects until they are requested.
+
+    Several parts of Ember Data call this method:
+
+    * findById, if a clientId already exists for a given type and
+      id combination
+    * OneToManyChange, which is backed by clientIds, when getChild,
+      getOldParent or getNewParent are called
+    * RecordArray, which is backed by clientIds, when an object at
+      a particular index is looked up
+
+    In short, it's a convenient way to get a record for a known
+    clientId, materializing it if necessary.
+
+    @param {Class} type
+    @param {Number|String} clientId
+  */
+  findByClientId: function(type, clientId) {
+    var cidToHash, record, id;
+
+    record = this.recordCache[clientId];
+
+    if (!record) {
       // create a new instance of the model type in the
       // 'isLoading' state
+      id = this.clientIdToId[clientId];
       record = this.materializeRecord(type, clientId, id);
 
-      // let the adapter set the data, possibly async
-      var adapter = get(this, '_adapter');
-      if (adapter && adapter.find) { adapter.find(this, type, id); }
-      else { throw fmt("Adapter is either null or does not implement `find` method", this); }
+      cidToHash = this.clientIdToHash;
+
+      if (typeof cidToHash[clientId] === 'object') {
+        record.loadedData();
+      }
     }
 
     return record;
@@ -26603,15 +26786,14 @@ DS.Store = Ember.Object.extend({
   */
   neededClientIds: function(type, clientIds) {
     var neededClientIds = [],
-        typeMap = this.typeMapFor(type),
-        dataCache = typeMap.cidToHash,
+        cidToHash = this.clientIdToHash,
         clientId;
 
     for (var i=0, l=clientIds.length; i<l; i++) {
       clientId = clientIds[i];
-      if (dataCache[clientId] === UNLOADED) {
+      if (cidToHash[clientId] === UNLOADED) {
         neededClientIds.push(clientId);
-        dataCache[clientId] = LOADING;
+        cidToHash[clientId] = LOADING;
       }
     }
 
@@ -26647,7 +26829,7 @@ DS.Store = Ember.Object.extend({
   fetchMany: function(type, clientIds) {
     var clientIdToId = this.clientIdToId;
 
-    var neededIds = Ember.EnumerableUtils.map(clientIds, function(clientId) {
+    var neededIds = map(clientIds, function(clientId) {
       return clientIdToId[clientId];
     });
 
@@ -26655,7 +26837,7 @@ DS.Store = Ember.Object.extend({
 
     var adapter = get(this, '_adapter');
     if (adapter && adapter.findMany) { adapter.findMany(this, type, neededIds); }
-    else { throw fmt("Adapter is either null or does not implement `findMany` method", this); }
+    else { throw "Adapter is either null or does not implement `findMany` method"; }
   },
 
   /**
@@ -26678,7 +26860,7 @@ DS.Store = Ember.Object.extend({
     * ask the adapter to load the unloaded elements, by invoking
       findMany with the still-unloaded IDs.
   */
-  findMany: function(type, ids) {
+  findMany: function(type, ids, record, relationship) {
     // 1. Convert ids to client ids
     // 2. Determine which of the client ids need to be loaded
     // 3. Create a new ManyArray whose content is ALL of the clientIds
@@ -26688,19 +26870,34 @@ DS.Store = Ember.Object.extend({
     // 6. Ask the adapter to load the records for the unloaded clientIds (but
     //    convert them back to ids)
 
+    if (!Ember.isArray(ids)) {
+      var adapter = get(this, '_adapter');
+      if (adapter && adapter.findAssociation) { adapter.findAssociation(this, record, relationship, ids); }
+      else { throw fmt("Adapter is either null or does not implement `findMany` method", this); }
+
+      return this.createManyArray(type, Ember.A());
+    }
+
+    ids = map(ids, function(id) { return coerceId(id); });
     var clientIds = this.clientIdsForIds(type, ids);
 
     var neededClientIds = this.neededClientIds(type, clientIds),
         manyArray = this.createManyArray(type, Ember.A(clientIds)),
-        loadedCount = clientIds.length - neededClientIds.length,
         loadingRecordArrays = this.loadingRecordArrays,
         clientId, i, l;
 
-    manyArray.send('loadedRecords', loadedCount);
+    // Start the decrementing counter on the ManyArray at the number of
+    // records we need to load from the adapter
+    manyArray.loadingRecordsCount(neededClientIds.length);
 
     if (neededClientIds.length) {
       for (i=0, l=neededClientIds.length; i<l; i++) {
         clientId = neededClientIds[i];
+
+        // keep track of the record arrays that a given loading record
+        // is part of. This way, if the same record is in multiple
+        // ManyArrays, all of their loading records counters will be
+        // decremented when the adapter provides the data.
         if (loadingRecordArrays[clientId]) {
           loadingRecordArrays[clientId].push(manyArray);
         } else {
@@ -26714,31 +26911,125 @@ DS.Store = Ember.Object.extend({
     return manyArray;
   },
 
+  /**
+    @private
+
+    This method delegates a query to the adapter. This is the one place where
+    adapter-level semantics are exposed to the application.
+
+    Exposing queries this way seems preferable to creating an abstract query
+    language for all server-side queries, and then require all adapters to
+    implement them.
+
+    @param {Class} type
+    @param {Object} query an opaque query to be used by the adapter
+    @return {DS.AdapterPopulatedRecordArray}
+  */
   findQuery: function(type, query) {
-    var array = DS.AdapterPopulatedRecordArray.create({ type: type, content: Ember.A([]), store: this });
+    var array = DS.AdapterPopulatedRecordArray.create({ type: type, query: query, content: Ember.A([]), store: this });
     var adapter = get(this, '_adapter');
     if (adapter && adapter.findQuery) { adapter.findQuery(this, type, query, array); }
-    else { throw fmt("Adapter is either null or does not implement `findQuery` method", this); }
+    else { throw "Adapter is either null or does not implement `findQuery` method"; }
     return array;
   },
 
-  findAll: function(type) {
+  /**
+    @private
 
+    This method returns an array of all records adapter can find.
+    It triggers the adapter's `findAll` method to give it an opportunity to populate
+    the array with records of that type.
+
+    @param {Class} type
+    @return {DS.AdapterPopulatedRecordArray}
+  */
+  findAll: function(type) {
+    var array = this.all(type);
+    this.fetchAll(type, array);
+    return array;
+  },
+
+  /**
+    @private
+  */
+  fetchAll: function(type, array) {
+    var sinceToken = this.typeMapFor(type).sinceToken,
+        adapter = get(this, '_adapter');
+
+    set(array, 'isUpdating', true);
+
+    if (adapter && adapter.findAll) { adapter.findAll(this, type, sinceToken); }
+    else { throw "Adapter is either null or does not implement `findAll` method"; }
+  },
+
+  /**
+  */
+  sinceForType: function(type, sinceToken) {
+    this.typeMapFor(type).sinceToken = sinceToken;
+  },
+
+  /**
+  */
+  didUpdateAll: function(type) {
+    var findAllCache = this.typeMapFor(type).findAllCache;
+    set(findAllCache, 'isUpdating', false);
+  },
+
+  /**
+    This method returns a filtered array that contains all of the known records
+    for a given type.
+
+    Note that because it's just a filter, it will have any locally
+    created records of the type.
+
+    Also note that multiple calls to `all` for a given type will always
+    return the same RecordArray.
+
+    @param {Class} type
+    @return {DS.RecordArray}
+  */
+  all: function(type) {
     var typeMap = this.typeMapFor(type),
         findAllCache = typeMap.findAllCache;
 
     if (findAllCache) { return findAllCache; }
 
-    var array = DS.RecordArray.create({ type: type, content: Ember.A([]), store: this });
+    var array = DS.RecordArray.create({ type: type, content: Ember.A([]), store: this, isLoaded: true });
     this.registerRecordArray(array, type);
-
-    var adapter = get(this, '_adapter');
-    if (adapter && adapter.findAll) { adapter.findAll(this, type); }
 
     typeMap.findAllCache = array;
     return array;
   },
 
+  /**
+    Takes a type and filter function, and returns a live RecordArray that
+    remains up to date as new records are loaded into the store or created
+    locally.
+
+    The callback function takes a materialized record, and returns true
+    if the record should be included in the filter and false if it should
+    not.
+
+    The filter function is called once on all records for the type when
+    it is created, and then once on each newly loaded or created record.
+
+    If any of a record's properties change, or if it changes state, the
+    filter function will be invoked again to determine whether it should
+    still be in the array.
+
+    Note that the existence of a filter on a type will trigger immediate
+    materialization of all loaded data for a given type, so you might
+    not want to use filters for a type if you are loading many records
+    into the store, many of which are not active at any given time.
+
+    In this scenario, you might want to consider filtering the raw
+    data hashes before loading them into the store.
+
+    @param {Class} type
+    @param {Function} filter
+
+    @return {DS.FilteredRecordArray}
+  */
   filter: function(type, query, filter) {
     // allow an optional server query
     if (arguments.length === 3) {
@@ -26754,6 +27045,9 @@ DS.Store = Ember.Object.extend({
     return array;
   },
 
+  /**
+    TODO: What is this method trying to do?
+  */
   recordIsLoaded: function(type, id) {
     return !Ember.none(this.typeMapFor(type).idToCid[id]);
   },
@@ -26762,6 +27056,20 @@ DS.Store = Ember.Object.extend({
   // . UPDATING .
   // ............
 
+  /**
+    @private
+
+    If the adapter updates attributes or acknowledges creation
+    or deletion, the record will notify the store to update its
+    membership in any filters.
+
+    To avoid thrashing, this method is invoked only once per
+    run loop per record.
+
+    @param {Class} type
+    @param {Number|String} clientId
+    @param {DS.Model} record
+  */
   hashWasUpdated: function(type, clientId, record) {
     // Because hash updates are invoked at the end of the run loop,
     // it is possible that a record might be deleted after its hash
@@ -26773,126 +27081,326 @@ DS.Store = Ember.Object.extend({
     // give us any more trouble after this.
 
     if (get(record, 'isDeleted')) { return; }
-    this.updateRecordArrays(type, clientId, get(record, 'data'));
+
+    var cidToHash = this.clientIdToHash,
+        hash = cidToHash[clientId];
+
+    if (typeof hash === "object") {
+      this.updateRecordArrays(type, clientId);
+    }
   },
 
   // ..............
   // . PERSISTING .
   // ..............
 
+  /**
+    This method delegates committing to the store's implicit
+    transaction.
+
+    Calling this method is essentially a request to persist
+    any changes to records that were not explicitly added to
+    a transaction.
+  */
   commit: function() {
-    var defaultTransaction = get(this, 'defaultTransaction');
-    set(this, 'defaultTransaction', this.transaction());
-
-    defaultTransaction.commit();
+    get(this, 'defaultTransaction').commit();
   },
 
-  didUpdateRecords: function(array, hashes) {
-    if (hashes) {
-      array.forEach(function(record, idx) {
-        this.didUpdateRecord(record, hashes[idx]);
-      }, this);
-    } else {
-      array.forEach(function(record) {
-        this.didUpdateRecord(record);
-      }, this);
+  /**
+    Adapters should call this method if they would like to acknowledge
+    that all changes related to a record have persisted. It can be
+    called for created, deleted or updated records.
+
+    If the adapter supplies a hash, that hash will become the new
+    canonical data for the record. That will result in blowing away
+    all local changes and rematerializing the record with the new
+    data (the "sledgehammer" approach).
+
+    Alternatively, if the adapter does not supply a hash, the record
+    will collapse all local changes into its saved data. Subsequent
+    rollbacks of the record will roll back to this point.
+
+    If an adapter is acknowledging receipt of a newly created record
+    that did not generate an id in the client, it *must* either
+    provide a hash or explicitly invoke `store.didReceiveId` with
+    the server-provided id.
+
+    Note that an adapter may not supply a hash when acknowledging
+    a deleted record.
+
+    @param {DS.Model} record the in-flight record
+    @param {Object} hash an optional hash (see above)
+  */
+  didSaveRecord: function(record, hash) {
+    if (get(record, 'isNew')) {
+      this.didCreateRecord(record);
+    } else if (get(record, 'isDeleted')) {
+      this.didDeleteRecord(record);
     }
-  },
 
-  didUpdateRecord: function(record, hash) {
     if (hash) {
-      var clientId = get(record, 'clientId'),
-          dataCache = this.typeMapFor(record.constructor).cidToHash;
-
-      dataCache[clientId] = hash;
-      record.send('didChangeData');
-      record.hashWasUpdated();
+      // We're about to clobber the entire data hash with new
+      // data, so clear out any remaining unacknowledged changes
+      record.removeInFlightDirtyFactors();
+      this.updateId(record, hash);
+      this.updateRecordHash(record, hash);
     } else {
-      record.send('didSaveData');
+      this.didUpdateAttributes(record);
+      this.didUpdateRelationships(record);
     }
-
-    record.send('didCommit');
   },
 
-  didDeleteRecords: function(array) {
-    array.forEach(function(record) {
-      record.send('didCommit');
-    });
+  /**
+    For convenience, if an adapter is performing a bulk commit,
+    it can also acknowledge all of the records at once.
+
+    If the adapter supplies hashes, they must be in the same
+    order as the array of records passed in as the first
+    parameter.
+
+    @param {#forEach} list a list of records whose changes the
+      adapter is acknowledging. You can pass any object that
+      has an ES5-like `forEach` method, including the
+      `OrderedSet` objects passed into the adapter at commit
+      time.
+    @param {Array[Object]} hashes an Array of hashes. This
+      parameter must be an integer-indexed Array-like.
+  */
+  didSaveRecords: function(list, hashes) {
+    var i = 0;
+    list.forEach(function(record) {
+      this.didSaveRecord(record, hashes && hashes[i++]);
+    }, this);
   },
 
+  /**
+    TODO: Do we need this?
+  */
   didDeleteRecord: function(record) {
-    record.send('didCommit');
+    record.adapterDidDelete();
   },
 
-  _didCreateRecord: function(record, hash, typeMap, clientId, primaryKey) {
-    var recordData = get(record, 'data'), id, changes;
+  /**
+    This method allows the adapter to acknowledge just that
+    a record was created, but defer acknowledging specific
+    attributes or relationships.
 
-    if (hash) {
-      typeMap.cidToHash[clientId] = hash;
+    This is most useful for adapters that have a multi-step
+    creation process (first, create the record on the backend,
+    then make a separate request to add the attributes).
 
-      // If the server returns a hash, we assume that the server's version
-      // of the data supercedes the local changes.
-      record.beginPropertyChanges();
-      record.send('didChangeData');
-      recordData.adapterDidUpdate();
-      record.hashWasUpdated();
-      record.endPropertyChanges();
+    When acknowledging a newly created record using a more
+    fine-grained approach, you *must* call `didCreateRecord`,
+    or the record will remain in in-flight limbo forever.
 
-      id = hash[primaryKey];
-
-      typeMap.idToCid[id] = clientId;
-      this.clientIdToId[clientId] = id;
-    } else {
-      recordData.commit();
-    }
-
-    record.send('didCommit');
+    @param {DS.Model} record
+  */
+  didCreateRecord: function(record) {
+    record.adapterDidCreate();
   },
 
+  /**
+    This method allows the adapter to specify that a record
+    could not be saved because it had backend-supplied validation
+    errors.
 
-  didCreateRecords: function(type, array, hashes) {
-    var primaryKey = type.proto().primaryKey,
-        typeMap = this.typeMapFor(type),
-        clientId;
+    The errors object must have keys that correspond to the
+    attribute names. Once each of the specified attributes have
+    changed, the record will automatically move out of the
+    invalid state and be ready to commit again.
 
-    for (var i=0, l=get(array, 'length'); i<l; i++) {
-      var record = array[i], hash = hashes[i];
-      clientId = get(record, 'clientId');
+    TODO: We should probably automate the process of converting
+    server names to attribute names using the existing serializer
+    infrastructure.
 
-      this._didCreateRecord(record, hash, typeMap, clientId, primaryKey);
-    }
-  },
-
-  didCreateRecord: function(record, hash) {
-    var type = record.constructor,
-        typeMap = this.typeMapFor(type),
-        clientId, primaryKey;
-
-    // The hash is optional, but if it is not provided, the client must have
-    // provided a primary key.
-
-    primaryKey = type.proto().primaryKey;
-
-    // TODO: Make Ember.assert more flexible
-    if (hash) {
-      Ember.assert("The server must provide a primary key: " + primaryKey, get(hash, primaryKey));
-    } else {
-      Ember.assert("The server did not return data, and you did not create a primary key (" + primaryKey + ") on the client", get(get(record, 'data'), primaryKey));
-    }
-
-    clientId = get(record, 'clientId');
-
-    this._didCreateRecord(record, hash, typeMap, clientId, primaryKey);
-  },
-
+    @param {DS.Model} record
+    @param {Object} errors
+  */
   recordWasInvalid: function(record, errors) {
-    record.send('becameInvalid', errors);
+    record.adapterDidInvalidate(errors);
+  },
+
+  /**
+    This is a lower-level API than `didSaveRecord` that allows an
+    adapter to acknowledge the persistence of a single attribute.
+
+    This is useful if an adapter needs to make multiple asynchronous
+    calls to fully persist a record. The record will keep track of
+    which attributes and relationships are still outstanding and
+    automatically move into the `saved` state once the adapter has
+    acknowledged everything.
+
+    If a value is provided, it clobbers the locally specified value.
+    Otherwise, the local value becomes the record's last known
+    saved value (which is used when rolling back a record).
+
+    Note that the specified attributeName is the normalized name
+    specified in the definition of the `DS.Model`, not a key in
+    the server-provided hash.
+
+    Also note that the adapter is responsible for performing any
+    transformations on the value using the serializer API.
+
+    @param {DS.Model} record
+    @param {String} attributeName
+    @param {Object} value an
+  */
+  didUpdateAttribute: function(record, attributeName, value) {
+    record.adapterDidUpdateAttribute(attributeName, value);
+  },
+
+  /**
+    This method allows an adapter to acknowledge persistence
+    of all attributes of a record but not relationships or
+    other factors.
+
+    It loops through the record's defined attributes and
+    notifies the record that they are all acknowledged.
+
+    This method does not take optional values, because
+    the adapter is unlikely to have a hash of normalized
+    keys and transformed values, and instead of building
+    one up, it should just call `didUpdateAttribute` as
+    needed.
+
+    This method is intended as a middle-ground between
+    `didSaveRecord`, which acknowledges all changes to
+    a record, and `didUpdateAttribute`, which allows an
+    adapter fine-grained control over updates.
+
+    @param {DS.Model} record
+  */
+  didUpdateAttributes: function(record) {
+    record.eachAttribute(function(attributeName) {
+      this.didUpdateAttribute(record, attributeName);
+    }, this);
+  },
+
+  /**
+    This allows an adapter to acknowledge that it has saved all
+    necessary aspects of a relationship change.
+
+    The primary use-case for calling this method directly is an
+    adapter that saves relationships as separate entities (as
+    a "join table" or separate HTTP resource, for example).
+
+    @param {DS.OneToManyChange} relationship
+  */
+  didUpdateRelationship: function(relationship) {
+    relationship.adapterDidUpdate();
+  },
+
+  materializeHasMany: function(record, name, ids) {
+    record.materializeHasMany(name, ids);
+    record.adapterDidUpdateHasMany(name);
+  },
+
+  /**
+    This allows an adapter to acknowledge all relationship changes
+    for a given record.
+
+    Like `didUpdateAttributes`, this is intended as a middle ground
+    between `didSaveRecord` and fine-grained control via the
+    `didUpdateRelationship` API.
+  */
+  didUpdateRelationships: function(record) {
+    var changes = this.relationshipChangesFor(get(record, 'clientId'));
+
+    for (var name in changes) {
+      if (!changes.hasOwnProperty(name)) { continue; }
+      changes[name].adapterDidUpdate();
+    }
+  },
+
+  /**
+    When acknowledging the creation of a locally created record,
+    adapters must supply an id (if they did not implement
+    `generateIdForRecord` to generate an id locally).
+
+    If an adapter does not use `didSaveRecord` and supply a hash
+    (for example, if it needs to make multiple HTTP requests to
+    create and then update the record), it will need to invoke
+    `didReceiveId` with the backend-supplied id.
+
+    When not using `didSaveRecord`, an adapter will need to
+    invoke:
+
+    * didReceiveId (unless the id was generated locally)
+    * didCreateRecord
+    * didUpdateAttribute(s)
+    * didUpdateRelationship(s)
+
+    @param {DS.Model} record
+    @param {Number|String} id
+  */
+  didReceiveId: function(record, id) {
+    var typeMap = this.typeMapFor(record.constructor),
+        clientId = get(record, 'clientId'),
+        oldId = get(record, 'id');
+
+    Ember.assert("An adapter cannot assign a new id to a record that already has an id. " + record + " had id: " + oldId + " and you tried to update it with " + id + ". This likely happened because your server returned a data hash in response to a find or update that had a different id than the one you sent.", oldId === undefined || id === oldId);
+
+    typeMap.idToCid[id] = clientId;
+    this.clientIdToId[clientId] = id;
+  },
+
+  /**
+    @private
+
+    This method re-indexes the data by its clientId in the store
+    and then notifies the record that it should rematerialize
+    itself.
+
+    @param {DS.Model} record
+    @param {Object} hash
+  */
+  updateRecordHash: function(record, hash) {
+    var clientId = get(record, 'clientId'),
+        cidToHash = this.clientIdToHash;
+
+    cidToHash[clientId] = hash;
+
+    record.didChangeData();
+  },
+
+  /**
+    @private
+
+    If an adapter invokes `didSaveRecord` with a hash, this method
+    extracts the id from the supplied hash (using the adapter's
+    `extractId()` method) and indexes the clientId with that id.
+
+    @param {DS.Model} record
+    @param {Object} hash
+  */
+  updateId: function(record, hash) {
+    var typeMap = this.typeMapFor(record.constructor),
+        clientId = get(record, 'clientId'),
+        oldId = get(record, 'id'),
+        id = get(this, '_adapter').extractId(record.constructor, hash);
+
+    Ember.assert("An adapter cannot assign a new id to a record that already has an id. " + record + " had id: " + oldId + " and you tried to update it with " + id + ". This likely happened because your server returned a data hash in response to a find or update that had a different id than the one you sent.", oldId === undefined || id === oldId);
+
+    typeMap.idToCid[id] = clientId;
+    this.clientIdToId[clientId] = id;
   },
 
   // .................
   // . RECORD ARRAYS .
   // .................
 
+  /**
+    @private
+
+    Register a RecordArray for a given type to be backed by
+    a filter function. This will cause the array to update
+    automatically when records of that type change attribute
+    values or states.
+
+    @param {DS.RecordArray} array
+    @param {Class} type
+    @param {Function} filter
+  */
   registerRecordArray: function(array, type, filter) {
     var recordArrays = this.typeMapFor(type).recordArrays;
 
@@ -26901,6 +27409,19 @@ DS.Store = Ember.Object.extend({
     this.updateRecordArrayFilter(array, type, filter);
   },
 
+  /**
+    @private
+
+    Create a `DS.ManyArray` for a type and list of clientIds
+    and index the `ManyArray` under each clientId. This allows
+    us to efficiently remove records from `ManyArray`s when
+    they are deleted.
+
+    @param {Class} type
+    @param {Array} clientIds
+
+    @return {DS.ManyArray}
+  */
   createManyArray: function(type, clientIds) {
     var array = DS.ManyArray.create({ type: type, content: clientIds, store: this });
 
@@ -26912,67 +27433,95 @@ DS.Store = Ember.Object.extend({
     return array;
   },
 
+  /**
+    @private
+
+    This method is invoked if the `filterFunction` property is
+    changed on a `DS.FilteredRecordArray`.
+
+    It essentially re-runs the filter from scratch. This same
+    method is invoked when the filter is created in th first place.
+  */
   updateRecordArrayFilter: function(array, type, filter) {
     var typeMap = this.typeMapFor(type),
-        dataCache = typeMap.cidToHash,
+        cidToHash = this.clientIdToHash,
         clientIds = typeMap.clientIds,
-        clientId, hash, proxy;
-
-    var recordCache = get(this, 'recordCache'),
-        foundRecord,
-        record;
+        clientId, hash, shouldFilter, record;
 
     for (var i=0, l=clientIds.length; i<l; i++) {
       clientId = clientIds[i];
-      foundRecord = false;
+      shouldFilter = false;
 
-      hash = dataCache[clientId];
+      hash = cidToHash[clientId];
+
       if (typeof hash === 'object') {
-        if (record = recordCache[clientId]) {
-          if (!get(record, 'isDeleted')) {
-            proxy = get(record, 'data');
-            foundRecord = true;
-          }
+        if (record = this.recordCache[clientId]) {
+          if (!get(record, 'isDeleted')) { shouldFilter = true; }
         } else {
-          DATA_PROXY.savedData = hash;
-          proxy = DATA_PROXY;
-          foundRecord = true;
+          shouldFilter = true;
         }
 
-        if (foundRecord) { this.updateRecordArray(array, filter, type, clientId, proxy); }
+        if (shouldFilter) {
+          this.updateRecordArray(array, filter, type, clientId);
+        }
       }
     }
   },
 
-  updateRecordArrays: function(type, clientId, dataProxy) {
+  /**
+    @private
+
+    This method is invoked whenever data is loaded into the store
+    by the adapter or updated by the adapter, or when an attribute
+    changes on a record.
+
+    It updates all filters that a record belongs to.
+
+    To avoid thrashing, it only runs once per run loop per record.
+
+    @param {Class} type
+    @param {Number|String} clientId
+  */
+  updateRecordArrays: function(type, clientId) {
     var recordArrays = this.typeMapFor(type).recordArrays,
         filter;
 
     recordArrays.forEach(function(array) {
       filter = get(array, 'filterFunction');
-      this.updateRecordArray(array, filter, type, clientId, dataProxy);
+      this.updateRecordArray(array, filter, type, clientId);
     }, this);
 
     // loop through all manyArrays containing an unloaded copy of this
     // clientId and notify them that the record was loaded.
-    var manyArrays = this.loadingRecordArrays[clientId], manyArray;
+    var manyArrays = this.loadingRecordArrays[clientId];
 
     if (manyArrays) {
       for (var i=0, l=manyArrays.length; i<l; i++) {
-        manyArrays[i].send('loadedRecords', 1);
+        manyArrays[i].loadedRecord();
       }
 
       this.loadingRecordArrays[clientId] = null;
     }
   },
 
-  updateRecordArray: function(array, filter, type, clientId, dataProxy) {
-    var shouldBeInArray;
+  /**
+    @private
+
+    Update an individual filter.
+
+    @param {DS.FilteredRecordArray} array
+    @param {Function} filter
+    @param {Class} type
+    @param {Number|String} clientId
+  */
+  updateRecordArray: function(array, filter, type, clientId) {
+    var shouldBeInArray, record;
 
     if (!filter) {
       shouldBeInArray = true;
     } else {
-      shouldBeInArray = filter(dataProxy);
+      record = this.findByClientId(type, clientId);
+      shouldBeInArray = filter(record);
     }
 
     var content = get(array, 'content');
@@ -26989,6 +27538,14 @@ DS.Store = Ember.Object.extend({
     }
   },
 
+  /**
+    @private
+
+    When a record is deleted, it is removed from all its
+    record arrays.
+
+    @param {DS.Model} record
+  */
   removeFromRecordArrays: function(record) {
     var clientId = get(record, 'clientId');
     var recordArrays = this.recordArraysForClientId(clientId);
@@ -27003,6 +27560,14 @@ DS.Store = Ember.Object.extend({
   // . INDEXING .
   // ............
 
+  /**
+    @private
+
+    Return a list of all `DS.RecordArray`s a clientId is
+    part of.
+
+    @return {Object(clientId: Ember.OrderedSet)}
+  */
   recordArraysForClientId: function(clientId) {
     var recordArrays = get(this, 'recordArraysByClientId');
     var ret = recordArrays[clientId];
@@ -27027,7 +27592,6 @@ DS.Store = Ember.Object.extend({
         {
           idToCid: {},
           clientIds: [],
-          cidToHash: {},
           recordArrays: []
       });
     }
@@ -27042,8 +27606,9 @@ DS.Store = Ember.Object.extend({
     @param {String|Number} id
   */
   clientIdForId: function(type, id) {
-    var clientId = this.typeMapFor(type).idToCid[id];
+    id = coerceId(id);
 
+    var clientId = this.typeMapFor(type).idToCid[id];
     if (clientId !== undefined) { return clientId; }
 
     return this.pushHash(UNLOADED, id, type);
@@ -27060,11 +27625,21 @@ DS.Store = Ember.Object.extend({
     var typeMap = this.typeMapFor(type),
         idToClientIdMap = typeMap.idToCid;
 
-    return Ember.EnumerableUtils.map(ids, function(id) {
+    return map(ids, function(id) {
+      id = coerceId(id);
+
       var clientId = idToClientIdMap[id];
       if (clientId) { return clientId; }
       return this.pushHash(UNLOADED, id, type);
     }, this);
+  },
+
+  typeForClientId: function(clientId) {
+    return this.clientIdToType[clientId];
+  },
+
+  idForClientId: function(clientId) {
+    return this.clientIdToId[clientId];
   },
 
   // ................
@@ -27086,29 +27661,29 @@ DS.Store = Ember.Object.extend({
   load: function(type, id, hash) {
     if (hash === undefined) {
       hash = id;
-      var primaryKey = type.proto().primaryKey;
-      Ember.assert("A data hash was loaded for a record of type " + type.toString() + " but no primary key '" + primaryKey + "' was provided.", primaryKey in hash);
-      id = hash[primaryKey];
+
+      var adapter = get(this, '_adapter');
+      id = adapter.extractId(type, hash);
     }
 
+    id = coerceId(id);
+
     var typeMap = this.typeMapFor(type),
-        dataCache = typeMap.cidToHash,
-        clientId = typeMap.idToCid[id],
-        recordCache = get(this, 'recordCache');
+        cidToHash = this.clientIdToHash,
+        clientId = typeMap.idToCid[id];
 
     if (clientId !== undefined) {
-      dataCache[clientId] = hash;
+      cidToHash[clientId] = hash;
 
-      var record = recordCache[clientId];
+      var record = this.recordCache[clientId];
       if (record) {
-        record.send('didChangeData');
+        record.loadedData();
       }
     } else {
       clientId = this.pushHash(hash, id, type);
     }
 
-    DATA_PROXY.savedData = hash;
-    this.updateRecordArrays(type, clientId, DATA_PROXY);
+    this.updateRecordArrays(type, clientId);
 
     return { id: id, clientId: clientId };
   },
@@ -27119,10 +27694,11 @@ DS.Store = Ember.Object.extend({
     if (hashes === undefined) {
       hashes = ids;
       ids = [];
-      var primaryKey = type.proto().primaryKey;
 
-      ids = Ember.EnumerableUtils.map(hashes, function(hash) {
-        return hash[primaryKey];
+      var adapter = get(this, '_adapter');
+
+      ids = map(hashes, function(hash) {
+        return adapter.extractId(type, hash);
       });
     }
 
@@ -27149,12 +27725,14 @@ DS.Store = Ember.Object.extend({
 
     var idToClientIdMap = typeMap.idToCid,
         clientIdToIdMap = this.clientIdToId,
+        clientIdToTypeMap = this.clientIdToType,
         clientIds = typeMap.clientIds,
-        dataCache = typeMap.cidToHash;
+        cidToHash = this.clientIdToHash;
 
     var clientId = ++this.clientIdCounter;
 
-    dataCache[clientId] = hash;
+    cidToHash[clientId] = hash;
+    clientIdToTypeMap[clientId] = type;
 
     // if we're creating an item, this process will be done
     // later, once the object has been persisted.
@@ -27175,16 +27753,34 @@ DS.Store = Ember.Object.extend({
   materializeRecord: function(type, clientId, id) {
     var record;
 
-    get(this, 'recordCache')[clientId] = record = type._create({
+    this.recordCache[clientId] = record = type._create({
       store: this,
       clientId: clientId,
-      _id: id
     });
+
+    set(record, 'id', id);
 
     get(this, 'defaultTransaction').adoptRecord(record);
 
-    record.send('loadingData');
+    record.loadingData();
     return record;
+  },
+
+  dematerializeRecord: function(record) {
+    var id = get(record, 'id'),
+        clientId = get(record, 'clientId'),
+        type = this.typeForClientId(clientId),
+        typeMap = this.typeMapFor(type);
+
+    record.updateRecordArrays();
+
+    delete this.recordCache[clientId];
+    delete this.clientIdToId[clientId];
+    delete this.clientIdToType[clientId];
+    delete this.clientIdToHash[clientId];
+    delete this.recordArraysByClientId[clientId];
+
+    if (id) { delete typeMap.idToCid[id]; }
   },
 
   destroy: function() {
@@ -27193,6 +27789,41 @@ DS.Store = Ember.Object.extend({
     }
 
     return this._super();
+  },
+
+  // ........................
+  // . RELATIONSHIP CHANGES .
+  // ........................
+
+  addRelationshipChangeFor: function(clientId, key, change) {
+    var changes = this.relationshipChanges;
+    if (!(clientId in changes)) {
+      changes[clientId] = {};
+    }
+
+    changes[clientId][key] = change;
+  },
+
+  removeRelationshipChangeFor: function(clientId, key) {
+    var changes = this.relationshipChanges;
+    if (!(clientId in changes)) {
+      return;
+    }
+
+    delete changes[clientId][key];
+  },
+
+  relationshipChangeFor: function(clientId, key) {
+    var changes = this.relationshipChanges;
+    if (!(clientId in changes)) {
+      return;
+    }
+
+    return changes[clientId][key];
+  },
+
+  relationshipChangesFor: function(clientId) {
+    return this.relationshipChanges[clientId];
   }
 });
 
@@ -27230,8 +27861,8 @@ var get = Ember.get, set = Ember.set, guidFor = Ember.guidFor;
   string. You can determine a record's current state by getting its manager's
   current state path:
 
-        record.get('stateManager.currentState.path');
-        //=> "created.uncommitted"
+      record.get('stateManager.currentPath');
+      //=> "created.uncommitted"
 
   The `DS.Model` states are themselves stateless. What we mean is that,
   though each instance of a record also has a unique instance of a
@@ -27288,7 +27919,7 @@ var get = Ember.get, set = Ember.set, guidFor = Ember.guidFor;
   which will be passed as the second parameter to the event handler.
 
   Events should transition to a different state if appropriate. This can be
-  done by calling the state manager's `goToState()` method with a path to the
+  done by calling the state manager's `transitionTo()` method with a path to the
   desired state. The state manager will attempt to resolve the state path
   relative to the current state. If no state is found at that path, it will
   attempt to resolve it relative to the current state's parent, and then its
@@ -27302,12 +27933,12 @@ var get = Ember.get, set = Ember.set, guidFor = Ember.guidFor;
         * inFlight
 
   If we are currently in the `start` state, calling
-  `goToState('inFlight')` would transition to the `created.inFlight` state,
-  while calling `goToState('updated.inFlight')` would transition to
+  `transitionTo('inFlight')` would transition to the `created.inFlight` state,
+  while calling `transitionTo('updated.inFlight')` would transition to
   the `updated.inFlight` state.
 
   Remember that *only events* should ever cause a state transition. You should
-  never call `goToState()` from outside a state's event handler. If you are
+  never call `transitionTo()` from outside a state's event handler. If you are
   tempted to do so, create a new event and send that to the state manager.
 
   #### Flags
@@ -27316,7 +27947,7 @@ var get = Ember.get, set = Ember.set, guidFor = Ember.guidFor;
   state in a more user-friendly way than examining its state path. For example,
   instead of doing this:
 
-      var statePath = record.get('stateManager.currentState.path');
+      var statePath = record.get('stateManager.currentPath');
       if (statePath === 'created.inFlight') {
         doSomething();
       }
@@ -27377,6 +28008,32 @@ var hasDefinedProperties = function(object) {
   return false;
 };
 
+var didChangeData = function(manager) {
+  var record = get(manager, 'record');
+  record.materializeData();
+};
+
+var setProperty = function(manager, context) {
+  var value = context.value,
+      key = context.key,
+      record = get(manager, 'record'),
+      adapterValue = get(record, 'data.attributes')[key];
+
+  if (value === adapterValue) {
+    record.removeDirtyFactor(key);
+  } else {
+    record.addDirtyFactor(key);
+  }
+
+  updateRecordArrays(manager);
+};
+
+// Whenever a property is set, recompute all dependent filters
+var updateRecordArrays = function(manager) {
+  var record = manager.get('record');
+  record.updateRecordArraysLater();
+};
+
 DS.State = Ember.State.extend({
   isLoaded: stateProperty,
   isDirty: stateProperty,
@@ -27385,7 +28042,6 @@ DS.State = Ember.State.extend({
   isError: stateProperty,
   isNew: stateProperty,
   isValid: stateProperty,
-  isPending: stateProperty,
 
   // For states that are substates of a
   // DirtyState (updated or created), it is
@@ -27393,54 +28049,6 @@ DS.State = Ember.State.extend({
   // type of dirty state it is.
   dirtyType: stateProperty
 });
-
-var setProperty = function(manager, context) {
-  var key = context.key, value = context.value;
-
-  var record = get(manager, 'record'),
-      data = get(record, 'data');
-
-  set(data, key, value);
-};
-
-var setAssociation = function(manager, context) {
-  var key = context.key, value = context.value;
-
-  var record = get(manager, 'record'),
-      data = get(record, 'data');
-
-  data.setAssociation(key, value);
-};
-
-var didChangeData = function(manager) {
-  var record = get(manager, 'record'),
-      data = get(record, 'data');
-
-  data._savedData = null;
-  record.notifyPropertyChange('data');
-};
-
-// The waitingOn event shares common functionality
-// between the different dirty states, but each is
-// treated slightly differently. This method is exposed
-// so that each implementation can invoke the common
-// behavior, and then implement the behavior specific
-// to the state.
-var waitingOn = function(manager, object) {
-  var record = get(manager, 'record'),
-      pendingQueue = get(record, 'pendingQueue'),
-      objectGuid = guidFor(object);
-
-  var observer = function() {
-    if (get(object, 'id')) {
-      manager.send('doneWaitingOn', object);
-      Ember.removeObserver(object, 'id', observer);
-    }
-  };
-
-  pendingQueue[objectGuid] = [object, observer];
-  Ember.addObserver(object, 'id', observer);
-};
 
 // Implementation notes:
 //
@@ -27469,51 +28077,6 @@ var waitingOn = function(manager, object) {
 //   did not yet report that it was successfully saved.
 // * isValid: No client-side validations have failed and the
 //   adapter did not report any server-side validation failures.
-// * isPending: A record `isPending` when it belongs to an
-//   association on another record and that record has not been
-//   saved. A record in this state cannot be saved because it
-//   lacks a "foreign key" that will be supplied by its parent
-//   association when the parent record has been created. When
-//   the adapter reports that the parent has saved, the
-//   `isPending` property on all children will become `false`
-//   and the transaction will try to commit the records.
-
-// This mixin is mixed into various uncommitted states. Make
-// sure to mix it in *after* the class definition, so its
-// super points to the class definition.
-var Uncommitted = Ember.Mixin.create({
-  setProperty: setProperty,
-  setAssociation: setAssociation
-});
-
-// These mixins are mixed into substates of the concrete
-// subclasses of DirtyState.
-
-var CreatedUncommitted = Ember.Mixin.create({
-  deleteRecord: function(manager) {
-    var record = get(manager, 'record');
-    this._super(manager);
-
-    record.withTransaction(function(t) {
-      t.recordBecameClean('created', record);
-    });
-    manager.goToState('deleted.saved');
-  }
-});
-
-var UpdatedUncommitted = Ember.Mixin.create({
-  deleteRecord: function(manager) {
-    this._super(manager);
-
-    var record = get(manager, 'record');
-
-    record.withTransaction(function(t) {
-      t.recordBecameClean('updated', record);
-    });
-
-    manager.goToState('deleted');
-  }
-});
 
 // The dirty state is a abstract state whose functionality is
 // shared between the `created` and `updated` states.
@@ -27521,6 +28084,15 @@ var UpdatedUncommitted = Ember.Mixin.create({
 // The deleted state shares the `isDirty` flag with the
 // subclasses of `DirtyState`, but with a very different
 // implementation.
+//
+// Dirty states have three child states:
+//
+// `uncommitted`: the store has not yet handed off the record
+//   to be saved.
+// `inFlight`: the store has handed off the record to be saved,
+//   but the adapter has not yet acknowledged success.
+// `invalid`: the record has invalid information and cannot be
+//   send to the adapter yet.
 var DirtyState = DS.State.extend({
   initialState: 'uncommitted',
 
@@ -27530,8 +28102,8 @@ var DirtyState = DS.State.extend({
   // SUBSTATES
 
   // When a record first becomes dirty, it is `uncommitted`.
-  // This means that there are local pending changes,
-  // but they have not yet begun to be saved.
+  // This means that there are local pending changes, but they
+  // have not yet begun to be saved, and are not invalid.
   uncommitted: DS.State.extend({
     // TRANSITIONS
     enter: function(manager) {
@@ -27544,15 +28116,21 @@ var DirtyState = DS.State.extend({
     },
 
     // EVENTS
-    deleteRecord: Ember.K,
-
-    waitingOn: function(manager, object) {
-      waitingOn(manager, object);
-      manager.goToState('pending');
-    },
+    setProperty: setProperty,
 
     willCommit: function(manager) {
-      manager.goToState('inFlight');
+      manager.transitionTo('inFlight');
+    },
+
+    becameClean: function(manager) {
+      var record = get(manager, 'record'),
+          dirtyType = get(this, 'dirtyType');
+
+      record.withTransaction(function(t) {
+        t.recordBecameClean(dirtyType, record);
+      });
+
+      manager.transitionTo('loaded.saved');
     },
 
     becameInvalid: function(manager) {
@@ -27563,23 +28141,13 @@ var DirtyState = DS.State.extend({
         t.recordBecameInFlight(dirtyType, record);
       });
 
-      manager.goToState('invalid');
+      manager.transitionTo('invalid');
     },
 
     rollback: function(manager) {
-      var record = get(manager, 'record'),
-          dirtyType = get(this, 'dirtyType'),
-          data = get(record, 'data');
-
-      data.rollback();
-
-      record.withTransaction(function(t) {
-        t.recordBecameClean(dirtyType, record);
-      });
-
-      manager.goToState('saved');
+      get(manager, 'record').rollback();
     }
-  }, Uncommitted),
+  }),
 
   // Once a record has been handed off to the adapter to be
   // saved, it is in the 'in flight' state. Changes to the
@@ -27592,6 +28160,9 @@ var DirtyState = DS.State.extend({
     enter: function(manager) {
       var dirtyType = get(this, 'dirtyType'),
           record = get(manager, 'record');
+
+      // create inFlightDirtyFactors
+      record.becameInFlight();
 
       record.withTransaction(function (t) {
         t.recordBecameInFlight(dirtyType, record);
@@ -27607,7 +28178,7 @@ var DirtyState = DS.State.extend({
         t.recordBecameClean('inflight', record);
       });
 
-      manager.goToState('saved');
+      manager.transitionTo('saved');
       manager.send('invokeLifecycleCallbacks', dirtyType);
     },
 
@@ -27616,117 +28187,16 @@ var DirtyState = DS.State.extend({
 
       set(record, 'errors', errors);
 
-      manager.goToState('invalid');
+      record.restoreDirtyFactors();
+
+      manager.transitionTo('invalid');
       manager.send('invokeLifecycleCallbacks');
     },
 
     becameError: function(manager) {
-      manager.goToState('error');
+      manager.transitionTo('error');
       manager.send('invokeLifecycleCallbacks');
-    },
-
-    didChangeData: didChangeData
-  }),
-
-  // If a record becomes associated with a newly created
-  // parent record, it will be `pending` until the parent
-  // record has successfully persisted. Once this happens,
-  // this record can use the parent's primary key as its
-  // foreign key.
-  //
-  // If the record's transaction had already started to
-  // commit, the record will transition to the `inFlight`
-  // state. If it had not, the record will transition to
-  // the `uncommitted` state.
-  pending: DS.State.extend({
-    initialState: 'uncommitted',
-
-    // FLAGS
-    isPending: true,
-
-    // SUBSTATES
-
-    // A pending record whose transaction has not yet
-    // started to commit is in this state.
-    uncommitted: DS.State.extend({
-      // EVENTS
-      deleteRecord: function(manager) {
-        var record = get(manager, 'record'),
-            pendingQueue = get(record, 'pendingQueue'),
-            tuple;
-
-        // since we are leaving the pending state, remove any
-        // observers we have registered on other records.
-        for (var prop in pendingQueue) {
-          if (!pendingQueue.hasOwnProperty(prop)) { continue; }
-
-          tuple = pendingQueue[prop];
-          Ember.removeObserver(tuple[0], 'id', tuple[1]);
-        }
-      },
-
-      willCommit: function(manager) {
-        manager.goToState('committing');
-      },
-
-      doneWaitingOn: function(manager, object) {
-        var record = get(manager, 'record'),
-            pendingQueue = get(record, 'pendingQueue'),
-            objectGuid = guidFor(object);
-
-        delete pendingQueue[objectGuid];
-
-        if (isEmptyObject(pendingQueue)) {
-          manager.send('doneWaiting');
-        }
-      },
-
-      doneWaiting: function(manager) {
-        var dirtyType = get(this, 'dirtyType');
-        manager.goToState(dirtyType + '.uncommitted');
-      }
-    }, Uncommitted),
-
-    // A pending record whose transaction has started
-    // to commit is in this state. Since it has not yet
-    // been sent to the adapter, it is not `inFlight`
-    // until all of its dependencies have been committed.
-    committing: DS.State.extend({
-      // FLAGS
-      isSaving: true,
-
-      // EVENTS
-      doneWaitingOn: function(manager, object) {
-        var record = get(manager, 'record'),
-            pendingQueue = get(record, 'pendingQueue'),
-            objectGuid = guidFor(object);
-
-        delete pendingQueue[objectGuid];
-
-        if (isEmptyObject(pendingQueue)) {
-          manager.send('doneWaiting');
-        }
-      },
-
-      doneWaiting: function(manager) {
-        var record = get(manager, 'record'),
-            transaction = get(record, 'transaction');
-
-        // Now that the record is no longer pending, schedule
-        // the transaction to commit.
-        Ember.run.once(transaction, transaction.commit);
-      },
-
-      willCommit: function(manager) {
-        var record = get(manager, 'record'),
-            pendingQueue = get(record, 'pendingQueue');
-
-        if (isEmptyObject(pendingQueue)) {
-          var dirtyType = get(this, 'dirtyType');
-          manager.goToState(dirtyType + '.inFlight');
-        }
-      }
-    })
+    }
   }),
 
   // A record is in the `invalid` state when its client-side
@@ -27746,14 +28216,11 @@ var DirtyState = DS.State.extend({
 
     // EVENTS
     deleteRecord: function(manager) {
-      manager.goToState('deleted');
+      manager.transitionTo('deleted');
+      get(manager, 'record').clearRelationships();
     },
 
-    setAssociation: setAssociation,
-
     setProperty: function(manager, context) {
-      setProperty(manager, context);
-
       var record = get(manager, 'record'),
           errors = get(record, 'errors'),
           key = context.key;
@@ -27763,6 +28230,8 @@ var DirtyState = DS.State.extend({
       if (!hasDefinedProperties(errors)) {
         manager.send('becameValid');
       }
+
+      setProperty(manager, context);
     },
 
     rollback: function(manager) {
@@ -27771,7 +28240,7 @@ var DirtyState = DS.State.extend({
     },
 
     becameValid: function(manager) {
-      manager.goToState('uncommitted');
+      manager.transitionTo('uncommitted');
     },
 
     invokeLifecycleCallbacks: function(manager) {
@@ -27789,38 +28258,54 @@ var createdState = DirtyState.create({
   dirtyType: 'created',
 
   // FLAGS
-  isNew: true
+  isNew: true,
+
+  // TRANSITIONS
+  setup: function(manager) {
+    var record = get(manager, 'record');
+    record.addDirtyFactor('@created');
+  },
+
+  exit: function(manager) {
+    var record = get(manager, 'record');
+    record.removeDirtyFactor('@created');
+  }
 });
 
 var updatedState = DirtyState.create({
   dirtyType: 'updated'
 });
 
-// The created.uncommitted state and created.pending.uncommitted share
-// some logic defined in CreatedUncommitted.
-createdState.states.uncommitted.reopen(CreatedUncommitted);
-createdState.states.pending.states.uncommitted.reopen(CreatedUncommitted);
-
-// The created.uncommitted state needs to immediately transition to the
-// deleted state if it is rolled back.
 createdState.states.uncommitted.reopen({
-  rollback: function(manager) {
-    this._super(manager);
-    manager.goToState('deleted.saved');
+  deleteRecord: function(manager) {
+    var record = get(manager, 'record');
+
+    record.withTransaction(function(t) {
+      t.recordIsMoving('created', record);
+    });
+
+    manager.transitionTo('deleted.saved');
+    record.clearRelationships();
   }
 });
 
-// The updated.uncommitted state and updated.pending.uncommitted share
-// some logic defined in UpdatedUncommitted.
-updatedState.states.uncommitted.reopen(UpdatedUncommitted);
-updatedState.states.pending.states.uncommitted.reopen(UpdatedUncommitted);
-updatedState.states.inFlight.reopen({
-  didSaveData: function(manager) {
-    var record = get(manager, 'record'),
-        data = get(record, 'data');
+createdState.states.uncommitted.reopen({
+  rollback: function(manager) {
+    this._super(manager);
+    manager.transitionTo('deleted.saved');
+  }
+});
 
-    data.saveData();
-    data.adapterDidUpdate();
+updatedState.states.uncommitted.reopen({
+  deleteRecord: function(manager) {
+    var record = get(manager, 'record');
+
+    record.withTransaction(function(t) {
+      t.recordIsMoving('updated', record);
+    });
+
+    manager.transitionTo('deleted');
+    get(manager, 'record').clearRelationships();
   }
 });
 
@@ -27834,7 +28319,6 @@ var states = {
     isError: false,
     isNew: false,
     isValid: true,
-    isPending: false,
 
     // SUBSTATES
 
@@ -27846,13 +28330,11 @@ var states = {
     empty: DS.State.create({
       // EVENTS
       loadingData: function(manager) {
-        manager.goToState('loading');
+        manager.transitionTo('loading');
       },
 
-      didChangeData: function(manager) {
-        didChangeData(manager);
-
-        manager.goToState('loaded.created');
+      loadedData: function(manager) {
+        manager.transitionTo('loaded.created');
       }
     }),
 
@@ -27870,13 +28352,9 @@ var states = {
       },
 
       // EVENTS
-      didChangeData: function(manager, data) {
-        didChangeData(manager);
-        manager.send('loadedData');
-      },
-
       loadedData: function(manager) {
-        manager.goToState('loaded');
+        didChangeData(manager);
+        manager.transitionTo('loaded');
       }
     }),
 
@@ -27896,25 +28374,26 @@ var states = {
       saved: DS.State.create({
 
         // EVENTS
-        setProperty: function(manager, context) {
-          setProperty(manager, context);
-          manager.goToState('updated');
-        },
-
-        setAssociation: function(manager, context) {
-          setAssociation(manager, context);
-          manager.goToState('updated');
-        },
-
+        setProperty: setProperty,
         didChangeData: didChangeData,
+        loadedData: didChangeData,
+
+        becameDirty: function(manager) {
+          manager.transitionTo('updated');
+        },
 
         deleteRecord: function(manager) {
-          manager.goToState('deleted');
+          manager.transitionTo('deleted');
+          get(manager, 'record').clearRelationships();
         },
 
-        waitingOn: function(manager, object) {
-          waitingOn(manager, object);
-          manager.goToState('updated.pending');
+        unloadRecord: function(manager) {
+          manager.transitionTo('deleted.saved');
+          get(manager, 'record').clearRelationships();
+        },
+
+        willCommit: function(manager) {
+          manager.transitionTo('relationshipsInFlight');
         },
 
         invokeLifecycleCallbacks: function(manager, dirtyType) {
@@ -27924,6 +28403,30 @@ var states = {
           } else {
             record.trigger('didUpdate', record);
           }
+        }
+      }),
+
+      relationshipsInFlight: Ember.State.create({
+        // TRANSITIONS
+        enter: function(manager) {
+          var record = get(manager, 'record');
+
+          record.withTransaction(function (t) {
+            t.recordBecameInFlight('clean', record);
+          });
+        },
+
+        // EVENTS
+        didCommit: function(manager) {
+          var record = get(manager, 'record');
+
+          record.withTransaction(function(t) {
+            t.recordBecameClean('inflight', record);
+          });
+
+          manager.transitionTo('saved');
+
+          manager.send('invokeLifecycleCallbacks');
         }
       }),
 
@@ -27940,17 +28443,28 @@ var states = {
 
     // A record is in this state if it was deleted from the store.
     deleted: DS.State.create({
+      initialState: 'uncommitted',
+      dirtyType: 'deleted',
+
       // FLAGS
       isDeleted: true,
       isLoaded: true,
       isDirty: true,
 
       // TRANSITIONS
-      enter: function(manager) {
+      setup: function(manager) {
         var record = get(manager, 'record'),
             store = get(record, 'store');
 
+        record.addDirtyFactor('@deleted');
+
         store.removeFromRecordArrays(record);
+      },
+
+      exit: function(manager) {
+        var record = get(manager, 'record');
+
+        record.removeDirtyFactor('@deleted');
       },
 
       // SUBSTATES
@@ -27958,7 +28472,7 @@ var states = {
       // When a record is deleted, it enters the `start`
       // state. It will exit this state when the record's
       // transaction starts to commit.
-      start: DS.State.create({
+      uncommitted: DS.State.create({
         // TRANSITIONS
         enter: function(manager) {
           var record = get(manager, 'record');
@@ -27970,18 +28484,21 @@ var states = {
 
         // EVENTS
         willCommit: function(manager) {
-          manager.goToState('inFlight');
+          manager.transitionTo('inFlight');
         },
 
         rollback: function(manager) {
-          var record = get(manager, 'record'),
-              data = get(record, 'data');
+          get(manager, 'record').rollback();
+        },
 
-          data.rollback();
+        becameClean: function(manager) {
+          var record = get(manager, 'record');
+
           record.withTransaction(function(t) {
             t.recordBecameClean('deleted', record);
           });
-          manager.goToState('loaded');
+
+          manager.transitionTo('loaded.saved');
         }
       }),
 
@@ -27997,6 +28514,9 @@ var states = {
         enter: function(manager) {
           var record = get(manager, 'record');
 
+          // create inFlightDirtyFactors
+          record.becameInFlight();
+
           record.withTransaction(function (t) {
             t.recordBecameInFlight('deleted', record);
           });
@@ -28010,7 +28530,7 @@ var states = {
             t.recordBecameClean('inflight', record);
           });
 
-          manager.goToState('saved');
+          manager.transitionTo('saved');
 
           manager.send('invokeLifecycleCallbacks');
         }
@@ -28022,6 +28542,13 @@ var states = {
       saved: DS.State.create({
         // FLAGS
         isDirty: false,
+
+        setup: function(manager) {
+          var record = get(manager, 'record'),
+              store = get(record, 'store');
+
+          store.dematerializeRecord(record);
+        },
 
         invokeLifecycleCallbacks: function(manager) {
           var record = get(manager, 'record');
@@ -28057,157 +28584,11 @@ DS.StateManager = Ember.StateManager.extend({
 
 
 (function() {
-var get = Ember.get, set = Ember.set;
-
-//  When a record is changed on the client, it is considered "dirty"--there are
-//  pending changes that need to be saved to a persistence layer, such as a
-//  server.
-//
-//  If the record is rolled back, it re-enters a clean state, any changes are
-//  discarded, and its attributes are reset back to the last known good copy
-//  of the data that came from the server.
-//
-//  If the record is committed, the changes are sent to the server to be saved,
-//  and once the server confirms that they are valid, the record's "canonical"
-//  data becomes the original canonical data plus the changes merged in.
-//
-//  A DataProxy is an object that encapsulates this change tracking. It
-//  contains three buckets:
-//
-//  * `savedData` - the last-known copy of the data from the server
-//  * `unsavedData` - a hash that contains any changes that have not yet
-//     been committed
-//  * `associations` - this is similar to `savedData`, but holds the client
-//    ids of associated records
-//
-//  When setting a property on the object, the value is placed into the
-//  `unsavedData` bucket:
-//
-//      proxy.set('key', 'value');
-//
-//      // unsavedData:
-//      {
-//        key: "value"
-//      }
-//
-//  When retrieving a property from the object, it first looks to see
-//  if that value exists in the `unsavedData` bucket, and returns it if so.
-//  Otherwise, it returns the value from the `savedData` bucket.
-//
-//  When the adapter notifies a record that it has been saved, it merges the
-//  `unsavedData` bucket into the `savedData` bucket. If the record's
-//  transaction is rolled back, the `unsavedData` hash is simply discarded.
-//
-//  This object is a regular JS object for performance. It is only
-//  used internally for bookkeeping purposes.
-
-var DataProxy = DS._DataProxy = function(record) {
-  this.record = record;
-
-  this.unsavedData = {};
-
-  this.associations = {};
-};
-
-DataProxy.prototype = {
-  get: function(key) { return Ember.get(this, key); },
-  set: function(key, value) { return Ember.set(this, key, value); },
-
-  setAssociation: function(key, value) {
-    this.associations[key] = value;
-  },
-
-  savedData: function() {
-    var savedData = this._savedData;
-    if (savedData) { return savedData; }
-
-    var record = this.record,
-        clientId = get(record, 'clientId'),
-        store = get(record, 'store');
-
-    if (store) {
-      savedData = store.dataForRecord(record);
-      this._savedData = savedData;
-      return savedData;
-    }
-  },
-
-  unknownProperty: function(key) {
-    var unsavedData = this.unsavedData,
-        associations = this.associations,
-        savedData = this.savedData(),
-        store;
-
-    var value = unsavedData[key], association;
-
-    // if this is a belongsTo association, this will
-    // be a clientId.
-    association = associations[key];
-
-    if (association !== undefined) {
-      store = get(this.record, 'store');
-      return store.clientIdToId[association];
-    }
-
-    if (savedData && value === undefined) {
-      value = savedData[key];
-    }
-
-    return value;
-  },
-
-  setUnknownProperty: function(key, value) {
-    var record = this.record,
-        unsavedData = this.unsavedData;
-
-    unsavedData[key] = value;
-
-    record.hashWasUpdated();
-
-    return value;
-  },
-
-  commit: function() {
-    this.saveData();
-
-    this.record.notifyPropertyChange('data');
-  },
-
-  rollback: function() {
-    this.unsavedData = {};
-
-    this.record.notifyPropertyChange('data');
-  },
-
-  saveData: function() {
-    var record = this.record;
-
-    var unsavedData = this.unsavedData;
-    var savedData = this.savedData();
-
-    for (var prop in unsavedData) {
-      if (unsavedData.hasOwnProperty(prop)) {
-        savedData[prop] = unsavedData[prop];
-        delete unsavedData[prop];
-      }
-    }
-  },
-
-  adapterDidUpdate: function() {
-    this.unsavedData = {};
-  }
-};
-
-})();
-
-
-
-(function() {
 var get = Ember.get, set = Ember.set, none = Ember.none;
 
 var retrieveFromCurrentState = Ember.computed(function(key) {
   return get(get(this, 'stateManager.currentState'), key);
-}).property('stateManager.currentState').cacheable();
+}).property('stateManager.currentState');
 
 DS.Model = Ember.Object.extend(Ember.Evented, {
   isLoaded: retrieveFromCurrentState,
@@ -28216,185 +28597,29 @@ DS.Model = Ember.Object.extend(Ember.Evented, {
   isDeleted: retrieveFromCurrentState,
   isError: retrieveFromCurrentState,
   isNew: retrieveFromCurrentState,
-  isPending: retrieveFromCurrentState,
   isValid: retrieveFromCurrentState,
 
   clientId: null,
   transaction: null,
   stateManager: null,
-  pendingQueue: null,
   errors: null,
 
-  // because unknownProperty is used, any internal property
-  // must be initialized here.
-  primaryKey: 'id',
-  id: Ember.computed(function(key, value) {
-    var primaryKey = get(this, 'primaryKey'),
-        data = get(this, 'data');
-
-    if (arguments.length === 2) {
-      set(data, primaryKey, value);
-      return value;
-    }
-
-    var id = get(data, primaryKey);
-    return id ? id : this._id;
-  }).property('primaryKey', 'data'),
-
-  // The following methods are callbacks invoked by `toJSON`. You
-  // can override one of the callbacks to override specific behavior,
-  // or toJSON itself.
-  //
-  // If you override toJSON, you can invoke these callbacks manually
-  // to get the default behavior.
-
   /**
-    Add the record's primary key to the JSON hash.
+    Create a JSON representation of the record, using the serialization
+    strategy of the store's adapter.
 
-    The default implementation uses the record's specified `primaryKey`
-    and the `id` computed property, which are passed in as parameters.
+    Available options:
 
-    @param {Object} json the JSON hash being built
-    @param {Number|String} id the record's id
-    @param {String} key the primaryKey for the record
-  */
-  addIdToJSON: function(json, id, key) {
-    if (id) { json[key] = id; }
-  },
+    * `includeId`: `true` if the record's ID should be included in the
+      JSON representation.
 
-  /**
-    Add the attributes' current values to the JSON hash.
-
-    The default implementation gets the current value of each
-    attribute from the `data`, and uses a `defaultValue` if
-    specified in the `DS.attr` definition.
-
-    @param {Object} json the JSON hash being build
-    @param {Ember.Map} attributes a Map of attributes
-    @param {DataProxy} data the record's data, accessed with `get` and `set`.
-  */
-  addAttributesToJSON: function(json, attributes, data) {
-    attributes.forEach(function(name, meta) {
-      var key = meta.key(this.constructor),
-          value = get(data, key);
-
-      if (value === undefined) {
-        value = meta.options.defaultValue;
-      }
-
-      json[key] = value;
-    }, this);
-  },
-
-  /**
-    Add the value of a `hasMany` association to the JSON hash.
-
-    The default implementation honors the `embedded` option
-    passed to `DS.hasMany`. If embedded, `toJSON` is recursively
-    called on the child records. If not, the `id` of each
-    record is added.
-
-    Note that if a record is not embedded and does not
-    yet have an `id` (usually provided by the server), it
-    will not be included in the output.
-
-    @param {Object} json the JSON hash being built
-    @param {DataProxy} data the record's data, accessed with `get` and `set`.
-    @param {Object} meta information about the association
-    @param {Object} options options passed to `toJSON`
-  */
-  addHasManyToJSON: function(json, data, meta, options) {
-    var key = meta.key,
-        manyArray = get(this, key),
-        records = [], i, l,
-        clientId, id;
-
-    if (meta.options.embedded) {
-      // TODO: Avoid materializing embedded hashes if possible
-      manyArray.forEach(function(record) {
-        records.push(record.toJSON(options));
-      });
-    } else {
-      var clientIds = get(manyArray, 'content');
-
-      for (i=0, l=clientIds.length; i<l; i++) {
-        clientId = clientIds[i];
-        id = get(this, 'store').clientIdToId[clientId];
-
-        if (id !== undefined) {
-          records.push(id);
-        }
-      }
-    }
-
-    key = meta.options.key || get(this, 'namingConvention').keyToJSONKey(key);
-    json[key] = records;
-  },
-
-  /**
-    Add the value of a `belongsTo` association to the JSON hash.
-
-    The default implementation always includes the `id`.
-
-    @param {Object} json the JSON hash being built
-    @param {DataProxy} data the record's data, accessed with `get` and `set`.
-    @param {Object} meta information about the association
-    @param {Object} options options passed to `toJSON`
-  */
-  addBelongsToToJSON: function(json, data, meta, options) {
-    var key = meta.key, value, id;
-
-    if (meta.options.embedded) {
-      key = meta.options.key || get(this, 'namingConvention').keyToJSONKey(key);
-      value = get(data.record, key);
-      json[key] = value ? value.toJSON(options) : null;
-    } else {
-      key = meta.options.key || get(this, 'namingConvention').foreignKey(key);
-      id = data.get(key);
-      json[key] = none(id) ? null : id;
-    }
-  },
-  /**
-    Create a JSON representation of the record, including its `id`,
-    attributes and associations. Honor any settings defined on the
-    attributes or associations (such as `embedded` or `key`).
+    @param {Object} options
+    @returns {Object} an object whose values are primitive JSON values only
   */
   toJSON: function(options) {
-    var data = get(this, 'data'),
-        result = {},
-        type = this.constructor,
-        attributes = get(type, 'attributes'),
-        primaryKey = get(this, 'primaryKey'),
-        id = get(this, 'id'),
-        store = get(this, 'store'),
-        associations;
-
-    options = options || {};
-
-    // delegate to `addIdToJSON` callback
-    this.addIdToJSON(result, id, primaryKey);
-
-    // delegate to `addAttributesToJSON` callback
-    this.addAttributesToJSON(result, attributes, data);
-
-    associations = get(type, 'associationsByName');
-
-    // add associations, delegating to `addHasManyToJSON` and
-    // `addBelongsToToJSON`.
-    associations.forEach(function(key, meta) {
-      if (options.associations && meta.kind === 'hasMany') {
-        this.addHasManyToJSON(result, data, meta, options);
-      } else if (meta.kind === 'belongsTo') {
-        this.addBelongsToToJSON(result, data, meta, options);
-      }
-    }, this);
-
-    return result;
+    var store = get(this, 'store');
+    return store.toJSON(this, options);
   },
-
-  data: Ember.computed(function() {
-    return new DS._DataProxy(this);
-  }).cacheable(),
 
   didLoad: Ember.K,
   didUpdate: Ember.K,
@@ -28403,22 +28628,45 @@ DS.Model = Ember.Object.extend(Ember.Evented, {
   becameInvalid: Ember.K,
   becameError: Ember.K,
 
-  init: function() {
-    var stateManager = DS.StateManager.create({
-      record: this
+  data: Ember.computed(function() {
+    if (!this._data) {
+      this.materializeData();
+    }
+
+    return this._data;
+  }).property(),
+
+  materializeData: function() {
+    this.setupData();
+    get(this, 'store').materializeData(this);
+
+    this.suspendAssociationObservers(function() {
+      this.notifyPropertyChange('data');
     });
+  },
 
-    set(this, 'pendingQueue', {});
+  _data: null,
 
+  init: function() {
+    var stateManager = DS.StateManager.create({ record: this });
     set(this, 'stateManager', stateManager);
+
+    this.setup();
+
     stateManager.goToState('empty');
   },
 
-  destroy: function() {
+  setup: function() {
+    this._relationshipChanges = {};
+    this._dirtyFactors = Ember.OrderedSet.create();
+    this._inFlightDirtyFactors = Ember.OrderedSet.create();
+    this._dirtyReasons = { hasMany: 0, belongsTo: 0, attribute: 0 };
+  },
+
+  willDestroy: function() {
     if (!get(this, 'isDeleted')) {
       this.deleteRecord();
     }
-    this._super();
   },
 
   send: function(name, context) {
@@ -28430,6 +28678,18 @@ DS.Model = Ember.Object.extend(Ember.Evented, {
     if (transaction) { fn(transaction); }
   },
 
+  loadingData: function() {
+    this.send('loadingData');
+  },
+
+  loadedData: function() {
+    this.send('loadedData');
+  },
+
+  didChangeData: function() {
+    this.send('didChangeData');
+  },
+
   setProperty: function(key, value) {
     this.send('setProperty', { key: key, value: value });
   },
@@ -28438,83 +28698,318 @@ DS.Model = Ember.Object.extend(Ember.Evented, {
     this.send('deleteRecord');
   },
 
-  waitingOn: function(record) {
-    this.send('waitingOn', record);
+  unloadRecord: function() {
+    Ember.assert("You can only unload a loaded, non-dirty record.", !get(this, 'isDirty'));
+
+    this.send('unloadRecord');
   },
 
-  notifyHashWasUpdated: function() {
+  clearRelationships: function() {
+    this.eachAssociation(function(name, relationship) {
+      if (relationship.kind === 'belongsTo') {
+        set(this, name, null);
+      } else if (relationship.kind === 'hasMany') {
+        get(this, name).clear();
+      }
+    }, this);
+  },
+
+  updateRecordArrays: function() {
     var store = get(this, 'store');
     if (store) {
       store.hashWasUpdated(this.constructor, get(this, 'clientId'), this);
     }
   },
 
-  unknownProperty: function(key) {
-    var data = get(this, 'data');
+  /**
+    If the adapter did not return a hash in response to a commit,
+    merge the changed attributes and associations into the existing
+    saved data.
+  */
+  adapterDidCommit: function() {
+    var attributes = get(this, 'data').attributes;
 
-    if (data && key in data) {
-      Ember.assert("You attempted to access the " + key + " property on a record without defining an attribute.", false);
-    }
-  },
+    get(this.constructor, 'attributes').forEach(function(name, meta) {
+      attributes[name] = get(this, name);
+    }, this);
 
-  setUnknownProperty: function(key, value) {
-    var data = get(this, 'data');
-
-    if (data && key in data) {
-      Ember.assert("You attempted to set the " + key + " property on a record without defining an attribute.", false);
-    } else {
-      return this._super(key, value);
-    }
-  },
-
-  namingConvention: {
-    keyToJSONKey: function(key) {
-      // TODO: Strip off `is` from the front. Example: `isHipster` becomes `hipster`
-      return Ember.String.decamelize(key);
-    },
-
-    foreignKey: function(key) {
-      return Ember.String.decamelize(key) + '_id';
-    }
-  },
-
-  /** @private */
-  hashWasUpdated: function() {
-    // At the end of the run loop, notify record arrays that
-    // this record has changed so they can re-evaluate its contents
-    // to determine membership.
-    Ember.run.once(this, this.notifyHashWasUpdated);
+    this.updateRecordArraysLater();
   },
 
   dataDidChange: Ember.observer(function() {
     var associations = get(this.constructor, 'associationsByName'),
-        data = get(this, 'data'), store = get(this, 'store'),
+        hasMany = get(this, 'data').hasMany, store = get(this, 'store'),
         idToClientId = store.idToClientId,
         cachedValue;
+
+    this.updateRecordArraysLater();
 
     associations.forEach(function(name, association) {
       if (association.kind === 'hasMany') {
         cachedValue = this.cacheFor(name);
 
         if (cachedValue) {
-          var key = association.options.key || get(this, 'namingConvention').keyToJSONKey(name),
-              ids = data.get(key) || [];
+          var key = name,
+              ids = hasMany[key] || [];
 
           var clientIds;
-          if(association.options.embedded) {
-            clientIds = store.loadMany(association.type, ids).clientIds;
-          } else {
-            clientIds = Ember.EnumerableUtils.map(ids, function(id) {
-              return store.clientIdForId(association.type, id);
-            });
-          }
+
+          clientIds = Ember.EnumerableUtils.map(ids, function(id) {
+            return store.clientIdForId(association.type, id);
+          });
 
           set(cachedValue, 'content', Ember.A(clientIds));
-          cachedValue.fetch();
         }
       }
     }, this);
   }, 'data'),
+
+  updateRecordArraysLater: function() {
+    Ember.run.once(this, this.updateRecordArrays);
+  },
+
+  setupData: function() {
+    this._data = {
+      attributes: {},
+      belongsTo: {},
+      hasMany: {},
+      id: null
+    };
+  },
+
+  materializeId: function(id) {
+    set(this, 'id', id);
+  },
+
+  materializeAttributes: function(attributes) {
+    Ember.assert("Must pass a hash of attributes to materializeAttributes", !!attributes);
+    this._data.attributes = attributes;
+  },
+
+  materializeAttribute: function(name, value) {
+    this._data.attributes[name] = value;
+  },
+
+  materializeHasMany: function(name, ids) {
+    this._data.hasMany[name] = ids;
+  },
+
+  materializeBelongsTo: function(name, id) {
+    this._data.belongsTo[name] = id;
+  },
+
+  // DIRTINESS FACTORS
+  //
+  // These methods allow the manipulation of various "dirtiness factors" on
+  // the current record. A dirtiness factor can be:
+  //
+  // * the name of a dirty attribute
+  // * the name of a dirty relationship
+  // * @created, if the record was created
+  // * @deleted, if the record was deleted
+  //
+  // This allows adapters to acknowledge updates to any of the dirtiness
+  // factors one at a time, and keeps the bookkeeping for full acknowledgement
+  // in the record itself.
+
+  addDirtyFactor: function(name) {
+    var dirtyFactors = this._dirtyFactors, becameDirty;
+    if (dirtyFactors.has(name)) { return; }
+
+    if (this._dirtyFactors.isEmpty()) { becameDirty = true; }
+
+    this._addDirtyFactor(name);
+
+    if (becameDirty && name !== '@created' && name !== '@deleted') {
+      this.send('becameDirty');
+    }
+  },
+
+  _addDirtyFactor: function(name) {
+    this._dirtyFactors.add(name);
+
+    var reason = get(this.constructor, 'fields').get(name);
+    this._dirtyReasons[reason]++;
+  },
+
+  removeDirtyFactor: function(name) {
+    var dirtyFactors = this._dirtyFactors, becameClean = true;
+    if (!dirtyFactors.has(name)) { return; }
+
+    this._dirtyFactors.remove(name);
+
+    var reason = get(this.constructor, 'fields').get(name);
+    this._dirtyReasons[reason]--;
+
+    if (!this._dirtyFactors.isEmpty()) { becameClean = false; }
+
+    if (becameClean && name !== '@created' && name !== '@deleted') {
+      this.send('becameClean');
+    }
+  },
+
+  removeDirtyFactors: function() {
+    this._dirtyFactors.clear();
+    this._dirtyReasons = { hasMany: 0, belongsTo: 0, attribute: 0 };
+    this.send('becameClean');
+  },
+
+  rollback: function() {
+    this.setup();
+    this.send('becameClean');
+
+    this.suspendAssociationObservers(function() {
+      this.notifyPropertyChange('data');
+    });
+  },
+
+  isDirtyBecause: function(reason) {
+    return this._dirtyReasons[reason] > 0;
+  },
+
+  isCommittingBecause: function(reason) {
+    return this._inFlightDirtyReasons[reason] > 0;
+  },
+
+  /**
+    @private
+
+    The goal of this method is to temporarily disable specific observers
+    that take action in response to application changes.
+
+    This allows the system to make changes (such as materialization and
+    rollback) that should not trigger secondary behavior (such as setting an
+    inverse relationship or marking records as dirty).
+
+    The specific implementation will likely change as Ember proper provides
+    better infrastructure for suspending groups of observers, and if Array
+    observation becomes more unified with regular observers.
+  */
+  suspendAssociationObservers: function(callback, binding) {
+    var observers = get(this.constructor, 'associationNames').belongsTo;
+    var self = this;
+
+    try {
+      this._suspendedAssociations = true;
+      Ember._suspendObservers(self, observers, null, 'belongsToDidChange', function() {
+        Ember._suspendBeforeObservers(self, observers, null, 'belongsToWillChange', function() {
+          callback.call(binding || self);
+        });
+      });
+    } finally {
+      this._suspendedAssociations = false;
+    }
+  },
+
+  becameInFlight: function() {
+    this._inFlightDirtyFactors = this._dirtyFactors.copy();
+    this._inFlightDirtyReasons = this._dirtyReasons;
+    this._dirtyFactors.clear();
+    this._dirtyReasons = { hasMany: 0, belongsTo: 0, attribute: 0 };
+  },
+
+  restoreDirtyFactors: function() {
+    this._inFlightDirtyFactors.forEach(function(factor) {
+      this._addDirtyFactor(factor);
+    }, this);
+
+    this._inFlightDirtyFactors.clear();
+    this._inFlightDirtyReasons = null;
+  },
+
+  removeInFlightDirtyFactor: function(name) {
+    // It is possible for a record to have been materialized
+    // or loaded after the transaction was committed. This
+    // can happen with relationship changes involving
+    // unmaterialized records that subsequently load.
+    //
+    // XXX If a record is materialized after it was involved
+    // while it is involved in a relationship change, update
+    // it to be in the same state as if it had already been
+    // materialized.
+    //
+    // For now, this means that we have a blind spot where
+    // a record was loaded and its relationships changed
+    // while the adapter is in the middle of persisting
+    // a relationship change involving it.
+    if (this._inFlightDirtyFactors.has(name)) {
+      this._inFlightDirtyFactors.remove(name);
+      if (this._inFlightDirtyFactors.isEmpty()) {
+        this._inFlightDirtyReasons = null;
+        this.send('didCommit');
+      }
+    }
+  },
+
+  removeInFlightDirtyFactors: function() {
+    if (!this._inFlightDirtyFactors.isEmpty()) {
+      this._inFlightDirtyFactors.clear();
+      this._inFlightDirtyReasons = null;
+      this.send('didCommit');
+    }
+  },
+
+  // FOR USE DURING COMMIT PROCESS
+
+  adapterDidUpdateAttribute: function(attributeName, value) {
+    this.removeInFlightDirtyFactor(attributeName);
+
+    // If a value is passed in, update the internal attributes and clear
+    // the attribute cache so it picks up the new value. Otherwise,
+    // collapse the current value into the internal attributes because
+    // the adapter has acknowledged it.
+    if (value !== undefined) {
+      get(this, 'data.attributes')[attributeName] = value;
+      this.notifyPropertyChange(attributeName);
+    } else {
+      value = get(this, attributeName);
+      get(this, 'data.attributes')[attributeName] = value;
+    }
+
+    this.updateRecordArraysLater();
+  },
+
+  adapterDidUpdateHasMany: function(name) {
+    this.removeInFlightDirtyFactor(name);
+
+    var cachedValue = this.cacheFor(name),
+        hasMany = get(this, 'data').hasMany,
+        store = get(this, 'store');
+
+    var associations = get(this.constructor, 'associationsByName'),
+        association = associations.get(name),
+        idToClientId = store.idToClientId;
+
+    if (cachedValue) {
+      var key = name,
+          ids = hasMany[key] || [];
+
+      var clientIds;
+
+      clientIds = Ember.EnumerableUtils.map(ids, function(id) {
+        return store.clientIdForId(association.type, id);
+      });
+
+      set(cachedValue, 'content', Ember.A(clientIds));
+      set(cachedValue, 'isLoaded', true);
+    }
+
+    this.updateRecordArraysLater();
+  },
+
+  adapterDidDelete: function() {
+    this.removeInFlightDirtyFactor('@deleted');
+  },
+
+  adapterDidCreate: function() {
+    this.removeInFlightDirtyFactor('@created');
+
+    this.updateRecordArraysLater();
+  },
+
+  adapterDidInvalidate: function(errors) {
+    this.send('becameInvalid', errors);
+  },
 
   /**
     @private
@@ -28545,6 +29040,7 @@ var storeAlias = function(methodName) {
 DS.Model.reopenClass({
   isLoaded: storeAlias('recordIsLoaded'),
   find: storeAlias('find'),
+  all: storeAlias('all'),
   filter: storeAlias('filter'),
 
   _create: DS.Model.create,
@@ -28567,28 +29063,29 @@ DS.Model.reopenClass({
     var map = Ember.Map.create();
 
     this.eachComputedProperty(function(name, meta) {
-      if (meta.isAttribute) { map.set(name, meta); }
+      if (meta.isAttribute) {
+        Ember.assert("You may not set `id` as an attribute on your model. Please remove any lines that look like: `id: DS.attr('<type>')` from " + this.toString(), name !== 'id');
+
+        meta.name = name;
+        map.set(name, meta);
+      }
     });
 
     return map;
-  }).cacheable(),
+  })
+});
 
-  processAttributeKeys: function() {
-    if (this.processedAttributeKeys) { return; }
-
-    var namingConvention = this.proto().namingConvention;
-
-    this.eachComputedProperty(function(name, meta) {
-      if (meta.isAttribute && !meta.options.key) {
-        meta.options.key = namingConvention.keyToJSONKey(name, this);
-      }
-    }, this);
+DS.Model.reopen({
+  eachAttribute: function(callback, binding) {
+    get(this.constructor, 'attributes').forEach(function(name, meta) {
+      callback.call(binding, name, meta);
+    }, binding);
   }
 });
 
 function getAttr(record, options, key) {
-  var data = get(record, 'data');
-  var value = get(data, key);
+  var attributes = get(record, 'data').attributes;
+  var value = attributes[key];
 
   if (value === undefined) {
     value = options.defaultValue;
@@ -28598,126 +29095,29 @@ function getAttr(record, options, key) {
 }
 
 DS.attr = function(type, options) {
-  var transform = DS.attr.transforms[type];
-  Ember.assert("Could not find model attribute of type " + type, !!transform);
-
-  var transformFrom = transform.from;
-  var transformTo = transform.to;
-
   options = options || {};
 
   var meta = {
     type: type,
     isAttribute: true,
-    options: options,
-
-    // this will ensure that the key always takes naming
-    // conventions into consideration.
-    key: function(recordType) {
-      recordType.processAttributeKeys();
-      return options.key;
-    }
+    options: options
   };
 
   return Ember.computed(function(key, value) {
     var data;
 
-    key = meta.key(this.constructor);
-
     if (arguments.length === 2) {
-      value = transformTo(value);
-
-      if (value !== getAttr(this, options, key)) {
-        this.setProperty(key, value);
-      }
+      Ember.assert("You may not set `id` as an attribute on your model. Please remove any lines that look like: `id: DS.attr('<type>')` from " + this.toString(), key !== 'id');
+      this.setProperty(key, value);
     } else {
       value = getAttr(this, options, key);
     }
 
-    return transformFrom(value);
+    return value;
   // `data` is never set directly. However, it may be
   // invalidated from the state manager's setData
   // event.
-  }).property('data').cacheable().meta(meta);
-};
-
-DS.attr.transforms = {
-  string: {
-    from: function(serialized) {
-      return Ember.none(serialized) ? null : String(serialized);
-    },
-
-    to: function(deserialized) {
-      return Ember.none(deserialized) ? null : String(deserialized);
-    }
-  },
-
-  number: {
-    from: function(serialized) {
-      return Ember.none(serialized) ? null : Number(serialized);
-    },
-
-    to: function(deserialized) {
-      return Ember.none(deserialized) ? null : Number(deserialized);
-    }
-  },
-
-  'boolean': {
-    from: function(serialized) {
-      return Boolean(serialized);
-    },
-
-    to: function(deserialized) {
-      return Boolean(deserialized);
-    }
-  },
-
-  date: {
-    from: function(serialized) {
-      var type = typeof serialized;
-
-      if (type === "string" || type === "number") {
-        return new Date(serialized);
-      } else if (serialized === null || serialized === undefined) {
-        // if the value is not present in the data,
-        // return undefined, not null.
-        return serialized;
-      } else {
-        return null;
-      }
-    },
-
-    to: function(date) {
-      if (date instanceof Date) {
-        var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-        var pad = function(num) {
-          return num < 10 ? "0"+num : ""+num;
-        };
-
-        var utcYear = date.getUTCFullYear(),
-            utcMonth = date.getUTCMonth(),
-            utcDayOfMonth = date.getUTCDate(),
-            utcDay = date.getUTCDay(),
-            utcHours = date.getUTCHours(),
-            utcMinutes = date.getUTCMinutes(),
-            utcSeconds = date.getUTCSeconds();
-
-
-        var dayOfWeek = days[utcDay];
-        var dayOfMonth = pad(utcDayOfMonth);
-        var month = months[utcMonth];
-
-        return dayOfWeek + ", " + dayOfMonth + " " + month + " " + utcYear + " " +
-               pad(utcHours) + ":" + pad(utcMinutes) + ":" + pad(utcSeconds) + " GMT";
-      } else if (date === undefined) {
-        return undefined;
-      } else {
-        return null;
-      }
-    }
-  }
+  }).property('data').meta(meta);
 };
 
 
@@ -28735,54 +29135,26 @@ DS.attr.transforms = {
 var get = Ember.get, set = Ember.set,
     none = Ember.none;
 
-var embeddedFindRecord = function(store, type, data, key, one) {
-  var association = get(data, key);
-  return none(association) ? undefined : store.load(type, association).id;
-};
-
-var referencedFindRecord = function(store, type, data, key, one) {
-  return get(data, key);
-};
-
 var hasAssociation = function(type, options, one) {
   options = options || {};
-
-  var embedded = options.embedded,
-      findRecord = embedded ? embeddedFindRecord : referencedFindRecord;
 
   var meta = { type: type, isAssociation: true, options: options, kind: 'belongsTo' };
 
   return Ember.computed(function(key, value) {
-    var data = get(this, 'data'), ids, id, association,
-        store = get(this, 'store');
+    if (arguments.length === 2) {
+      return value === undefined ? null : value;
+    }
+
+    var data = get(this, 'data').belongsTo,
+        store = get(this, 'store'), id;
 
     if (typeof type === 'string') {
       type = get(this, type, false) || get(window, type);
     }
 
-    if (arguments.length === 2) {
-      key = options.key || get(this, 'namingConvention').foreignKey(key);
-      this.send('setAssociation', { key: key, value: Ember.none(value) ? null : get(value, 'clientId') });
-      //data.setAssociation(key, get(value, 'clientId'));
-      // put the client id in `key` in the data hash
-      return value;
-    } else {
-      // Embedded belongsTo associations should not look for
-      // a foreign key.
-      if (embedded) {
-        key = options.key || get(this, 'namingConvention').keyToJSONKey(key);
-
-      // Non-embedded associations should look for a foreign key.
-      // For example, instead of person, we might look for person_id
-      } else {
-        key = options.key || get(this, 'namingConvention').foreignKey(key);
-      }
-      id = findRecord(store, type, data, key, true);
-      association = id ? store.find(type, id) : null;
-    }
-
-    return association;
-  }).property('data').cacheable().meta(meta);
+    id = data[key];
+    return id ? store.find(type, id) : null;
+  }).property('data').meta(meta);
 };
 
 DS.belongsTo = function(type, options) {
@@ -28790,45 +29162,71 @@ DS.belongsTo = function(type, options) {
   return hasAssociation(type, options);
 };
 
+/**
+  These observers observe all `belongsTo` relationships on the record. See
+  `associations/ext` to see how these observers get their dependencies.
+
+  The observers use `removeFromContent` and `addToContent` to avoid
+  going through the public Enumerable API that would try to set the
+  inverse (again) and trigger an infinite loop.
+*/
+
+DS.Model.reopen({
+  /** @private */
+  belongsToWillChange: Ember.beforeObserver(function(record, key) {
+    if (get(record, 'isLoaded')) {
+      var oldParent = get(record, key);
+
+      var childId = get(record, 'clientId'),
+          store = get(record, 'store');
+
+      var change = DS.OneToManyChange.forChildAndParent(childId, store, { belongsToName: key });
+
+      if (change.oldParent === undefined) {
+        change.oldParent = oldParent ? get(oldParent, 'clientId') : null;
+      }
+    }
+  }),
+
+  /** @private */
+  belongsToDidChange: Ember.immediateObserver(function(record, key) {
+    if (get(record, 'isLoaded')) {
+      var change = get(record, 'store').relationshipChangeFor(get(record, 'clientId'), key),
+          newParent = get(record, key);
+
+      change.newParent = newParent ? get(newParent, 'clientId') : null;
+      change.sync();
+    }
+  })
+});
+
 })();
 
 
 
 (function() {
 var get = Ember.get, set = Ember.set;
-var embeddedFindRecord = function(store, type, data, key) {
-  var association = get(data, key);
-  return association ? store.loadMany(type, association).ids : [];
-};
-
-var referencedFindRecord = function(store, type, data, key, one) {
-  return get(data, key);
-};
-
 var hasAssociation = function(type, options) {
   options = options || {};
-
-  var embedded = options.embedded,
-      findRecord = embedded ? embeddedFindRecord : referencedFindRecord;
 
   var meta = { type: type, isAssociation: true, options: options, kind: 'hasMany' };
 
   return Ember.computed(function(key, value) {
-    var data = get(this, 'data'),
+    var data = get(this, 'data').hasMany,
         store = get(this, 'store'),
-        ids, id, association;
+        ids, association;
 
     if (typeof type === 'string') {
       type = get(this, type, false) || get(window, type);
     }
 
-    key = options.key || get(this, 'namingConvention').keyToJSONKey(key);
-    ids = findRecord(store, type, data, key);
-    association = store.findMany(type, ids || []);
-    set(association, 'parentRecord', this);
+    ids = data[key];
+    association = store.findMany(type, ids || [], this, meta);
+    set(association, 'owner', this);
+    set(association, 'name', key);
 
     return association;
-  }).property().cacheable().meta(meta);
+  }).property().meta(meta);
 };
 
 DS.hasMany = function(type, options) {
@@ -28841,7 +29239,20 @@ DS.hasMany = function(type, options) {
 
 
 (function() {
-var get = Ember.get;
+var get = Ember.get, set = Ember.set;
+
+DS.Model.reopen({
+  didDefineProperty: function(proto, key, value) {
+    if (value instanceof Ember.Descriptor) {
+      var meta = value.meta();
+
+      if (meta.isAssociation && meta.kind === 'belongsTo') {
+        Ember.addObserver(proto, key, null, 'belongsToDidChange');
+        Ember.addBeforeObserver(proto, key, null, 'belongsToWillChange');
+      }
+    }
+  }
+});
 
 DS.Model.reopenClass({
   typeForAssociation: function(name) {
@@ -28872,7 +29283,19 @@ DS.Model.reopenClass({
     });
 
     return map;
-  }).cacheable(),
+  }),
+
+  associationNames: Ember.computed(function() {
+    var names = { hasMany: [], belongsTo: [] };
+
+    this.eachComputedProperty(function(name, meta) {
+      if (meta.isAssociation) {
+        names[meta.kind].push(name);
+      }
+    });
+
+    return names;
+  }),
 
   associationsByName: Ember.computed(function() {
     var map = Ember.Map.create(), type;
@@ -28892,7 +29315,457 @@ DS.Model.reopenClass({
     });
 
     return map;
-  }).cacheable()
+  }),
+
+  fields: Ember.computed(function() {
+    var map = Ember.Map.create(), type;
+
+    this.eachComputedProperty(function(name, meta) {
+      if (meta.isAssociation) {
+        map.set(name, meta.kind);
+      } else if (meta.isAttribute) {
+        map.set(name, 'attribute');
+      }
+    });
+
+    return map;
+  })
+});
+
+DS.Model.reopen({
+  eachAssociation: function(callback, binding) {
+    get(this.constructor, 'associationsByName').forEach(function(name, association) {
+      callback.call(binding, name, association);
+    });
+  }
+});
+
+DS.inverseNameFor = function(modelType, inverseModelType, inverseAssociationKind) {
+  var associationMap = get(modelType, 'associations'),
+      possibleAssociations = associationMap.get(inverseModelType),
+      possible, actual, oldValue;
+
+  if (!possibleAssociations) { return; }
+
+  for (var i = 0, l = possibleAssociations.length; i < l; i++) {
+    possible = possibleAssociations[i];
+
+    if (possible.kind === inverseAssociationKind) {
+      actual = possible;
+      break;
+    }
+  }
+
+  if (actual) { return actual.name; }
+};
+
+DS.inverseTypeFor = function(modelType, associationName) {
+  var associations = get(modelType, 'associationsByName'),
+      association = associations.get(associationName);
+
+  if (association) { return association.type; }
+};
+
+})();
+
+
+
+(function() {
+var get = Ember.get, set = Ember.set;
+
+DS.OneToManyChange = function(options) {
+  this.oldParent = options.oldParent;
+  this.child = options.child;
+  this.belongsToName = options.belongsToName;
+  this.store = options.store;
+  this.committed = {};
+  this.awaiting = 0;
+};
+
+/** @private */
+DS.OneToManyChange.create = function(options) {
+  return new DS.OneToManyChange(options);
+};
+
+/** @private */
+DS.OneToManyChange.forChildAndParent = function(childClientId, store, options) {
+  var childType = store.typeForClientId(childClientId), key;
+
+  if (options.parentType) {
+    key = DS.inverseNameFor(childType, options.parentType, 'belongsTo');
+  } else {
+    key = options.belongsToName;
+  }
+
+  var change = store.relationshipChangeFor(childClientId, key);
+
+  if (!change) {
+    change = DS.OneToManyChange.create({
+      child: childClientId,
+      store: store
+    });
+
+    store.addRelationshipChangeFor(childClientId, key, change);
+  }
+
+  change.belongsToName = key;
+
+  return change;
+};
+
+DS.OneToManyChange.prototype = {
+  /**
+    Get the child type and ID, if available.
+
+    @returns {Array} an array of type and ID
+  */
+  getChildTypeAndId: function() {
+    return this.getTypeAndIdFor(this.child);
+  },
+
+  /**
+    Get the old parent type and ID, if available.
+
+    @returns {Array} an array of type and ID
+  */
+  getOldParentTypeAndId: function() {
+    return this.getTypeAndIdFor(this.oldParent);
+  },
+
+  /**
+    Get the new parent type and ID, if available.
+
+    @returns {Array} an array of type and ID
+  */
+  getNewParentTypeAndId: function() {
+    return this.getTypeAndIdFor(this.newParent);
+  },
+
+  /**
+    Get the name of the relationship on the hasMany side.
+
+    @returns {String}
+  */
+  getHasManyName: function() {
+    var name = this.hasManyName, store = this.store, parent;
+
+    if (!name) {
+      parent = this.oldParent || this.newParent;
+      if (!parent) { return; }
+
+      var childType = store.typeForClientId(this.child);
+      var inverseType = DS.inverseTypeFor(childType, this.belongsToName);
+      name = DS.inverseNameFor(inverseType, childType, 'hasMany');
+      this.hasManyName = name;
+    }
+
+    return name;
+  },
+
+  /**
+    Get the name of the relationship on the belongsTo side.
+
+    @returns {String}
+  */
+  getBelongsToName: function() {
+    var name = this.belongsToName, store = this.store, parent;
+
+    if (!name) {
+      parent = this.oldParent || this.newParent;
+      if (!parent) { return; }
+
+      var childType = store.typeForClientId(this.child);
+      var parentType = store.typeForClientId(parent);
+      name = DS.inverseNameFor(childType, parentType, 'belongsTo');
+
+      this.belongsToName = name;
+    }
+
+    return name;
+  },
+
+  /** @private */
+  getTypeAndIdFor: function(clientId) {
+    if (clientId) {
+      var store = this.store;
+
+      return [
+        store.typeForClientId(clientId),
+        store.idForClientId(clientId)
+      ];
+    }
+  },
+
+  /** @private */
+  destroy: function() {
+    var childClientId = this.child,
+        belongsToName = this.getBelongsToName(),
+        hasManyName = this.getHasManyName(),
+        store = this.store,
+        child, oldParent, newParent, transaction;
+
+    store.removeRelationshipChangeFor(childClientId, belongsToName);
+
+    if (child = this.getChild()) {
+      child.removeDirtyFactor(belongsToName);
+    }
+
+    if (oldParent = this.getOldParent()) {
+      oldParent.removeDirtyFactor(hasManyName);
+    }
+
+    if (newParent = this.getNewParent()) {
+      newParent.removeDirtyFactor(hasManyName);
+    }
+
+    if (transaction = this.transaction) {
+      transaction.relationshipBecameClean(this);
+    }
+  },
+
+  /** @private */
+  getByClientId: function(clientId) {
+    var store = this.store;
+
+    // return null or undefined if the original clientId was null or undefined
+    if (!clientId) { return clientId; }
+
+    if (store.recordIsMaterialized(clientId)) {
+      return store.findByClientId(null, clientId);
+    }
+  },
+
+  /** @private */
+  getChild: function() {
+    return this.getByClientId(this.child);
+  },
+
+  /** @private */
+  getOldParent: function() {
+    return this.getByClientId(this.oldParent);
+  },
+
+  /** @private */
+  getNewParent: function() {
+    return this.getByClientId(this.newParent);
+  },
+
+  /** @private */
+  getLastParent: function() {
+    return this.getByClientId(this.lastParent);
+  },
+
+  /**
+    @private
+
+    Make sure that all three parts of the relationship change are part of
+    the same transaction. If any of the three records is clean and in the
+    default transaction, and the rest are in a different transaction, move
+    them all into that transaction.
+  */
+  ensureSameTransaction: function(child, oldParent, newParent, hasManyName, belongsToName) {
+    var transactions = Ember.A();
+
+    if (child)     { transactions.pushObject(get(child, 'transaction')); }
+    if (oldParent) { transactions.pushObject(get(oldParent, 'transaction')); }
+    if (newParent) { transactions.pushObject(get(newParent, 'transaction')); }
+
+    var transaction = transactions.reduce(function(prev, t) {
+      if (!get(t, 'isDefault')) {
+        if (prev === null) { return t; }
+        Ember.assert("All records in a changed relationship must be in the same transaction. You tried to change the relationship between records when one is in " + t + " and the other is in " + prev, t === prev);
+      }
+
+      return prev;
+    }, null);
+
+    if (transaction) {
+      transaction.add(child);
+      if (oldParent) { transaction.add(oldParent); }
+      if (newParent) { transaction.add(newParent); }
+    } else {
+      transaction = transactions.objectAt(0);
+    }
+
+    this.transaction = transaction;
+    return transaction;
+  },
+
+  /** @private */
+  sync: function() {
+    var oldParentClientId = this.oldParent,
+        newParentClientId = this.newParent,
+        hasManyName = this.getHasManyName(),
+        belongsToName = this.getBelongsToName(),
+        child = this.getChild(),
+        oldParent, newParent;
+
+    //Ember.assert("You specified a hasMany (" + hasManyName + ") on " + (!belongsToName && (newParent || oldParent || this.lastParent).constructor) + " but did not specify an inverse belongsTo on " + child.constructor, belongsToName);
+
+    // This code path is reached if a child record was added to a new ManyArray
+    // without being removed from its old ManyArray. Below, this method will
+    // ensure (via `removeObject`) that the record is no longer in the old
+    // ManyArray.
+    if (oldParentClientId === undefined) {
+      // Since the child was added to a ManyArray, we know it was materialized.
+      oldParent = get(child, belongsToName);
+
+      if (oldParent) {
+        this.oldParent = get(oldParent, 'clientId');
+      } else {
+        this.oldParent = null;
+      }
+    } else {
+      oldParent = this.getOldParent();
+    }
+
+    // Coalesce changes from A to B and back to A.
+    if (oldParentClientId === newParentClientId) {
+      // If we have gone from oldParent to newParent and back to oldParent,
+      // there must be a materialized child.
+
+      // If our lastParent clientId is not null, there will always be a
+      // materialized lastParent.
+      var lastParent = this.getLastParent();
+      if (lastParent) {
+        get(lastParent, hasManyName).removeObject(child);
+      }
+
+      // Don't do anything if the belongsTo is going from null back to null
+      if (oldParent) {
+        get(oldParent, hasManyName).addObject(child);
+      }
+
+      this.destroy();
+      return;
+    }
+
+    //Ember.assert("You specified a belongsTo (" + belongsToName + ") on " + child.constructor + " but did not specify an inverse hasMany on " + (!hasManyName && (newParent || oldParent || this.lastParentRecord).constructor), hasManyName);
+
+    newParent = this.getNewParent();
+    var transaction = this.ensureSameTransaction(child, oldParent, newParent, hasManyName, belongsToName);
+
+    transaction.relationshipBecameDirty(this);
+
+    // Next, make sure that all three side of the association reflect the
+    // state of the OneToManyChange, while making sure to avoid an
+    // infinite loop.
+
+
+    // If there is an `oldParent`, use the idempotent `removeObject`
+    // to ensure that the record is no longer in its ManyArray. The
+    // `removeObject` method only has an effect if:
+    //
+    // 1. The change happened from the belongsTo side
+    // 2. The record was moved to a new parent without explicitly
+    //    removing it from the old parent first.
+    if (oldParent) {
+      get(oldParent, hasManyName).removeObject(child);
+
+      if (get(oldParent, 'isLoaded')) {
+        oldParent.addDirtyFactor(hasManyName);
+      }
+    }
+
+    // If there is a `newParent`, use the idempotent `addObject`
+    // to ensure that the record is in its ManyArray. The `addObject`
+    // method only has an effect if the change happened from the
+    // belongsTo side.
+    if (newParent) {
+      get(newParent, hasManyName).addObject(child);
+
+      if (get(newParent, 'isLoaded')) {
+        newParent.addDirtyFactor(hasManyName);
+      }
+    }
+
+    if (child) {
+      // Only set the belongsTo on the child if it is not already the
+      // newParent. This happens if the change happened from the
+      // ManyArray side.
+      if (get(child, belongsToName) !== newParent) {
+        set(child, belongsToName, newParent);
+      }
+
+      if (get(child, 'isLoaded')) {
+        child.addDirtyFactor(belongsToName);
+      }
+    }
+
+    // If this change is later reversed (A->B followed by B->A),
+    // we will need to remove the child from this parent. Save
+    // it off as `lastParent` so we can do that.
+    this.lastParent = newParentClientId;
+  },
+
+  /** @private */
+  adapterDidUpdate: function() {
+    if (this.awaiting > 0) { return; }
+    var belongsToName = this.getBelongsToName();
+    var hasManyName = this.getHasManyName();
+    var oldParent, newParent, child;
+
+    if (oldParent = this.getOldParent()) { oldParent.removeInFlightDirtyFactor(hasManyName); }
+    if (newParent = this.getNewParent()) { newParent.removeInFlightDirtyFactor(hasManyName); }
+    if (child = this.getChild())         { child.removeInFlightDirtyFactor(belongsToName); }
+    this.destroy();
+  },
+
+  wait: function() {
+    this.awaiting++;
+  },
+
+  done: function() {
+    this.awaiting--;
+
+    if (this.awaiting === 0) {
+      this.adapterDidUpdate();
+    }
+  }
+};
+
+})();
+
+
+
+(function() {
+
+})();
+
+
+
+(function() {
+var set = Ember.set;
+
+Ember.onLoad('Ember.Application', function(Application) {
+  Application.registerInjection({
+    name: "store",
+    before: "controllers",
+
+    injection: function(app, stateManager, property) {
+      if (!stateManager) { return; }
+      if (property === 'Store') {
+        set(stateManager, 'store', app[property].create());
+      }
+    }
+  });
+
+  Application.registerInjection({
+    name: "giveStoreToControllers",
+    after: ['store','controllers'],
+
+    injection: function(app, stateManager, property) {
+      if (!stateManager) { return; }
+      if (/^[A-Z].*Controller$/.test(property)) {
+        var controllerName = property.charAt(0).toLowerCase() + property.substr(1);
+        var store = stateManager.get('store');
+        var controller = stateManager.get(controllerName);
+        if(!controller) { return; }
+
+        controller.set('store', store);
+      }
+    }
+  });
 });
 
 })();
@@ -28900,6 +29773,401 @@ DS.Model.reopenClass({
 
 
 (function() {
+var get = Ember.get, set = Ember.set;
+
+var passthrough = {
+  fromJSON: function(value) {
+    return value;
+  },
+
+  toJSON: function(value) {
+    return value;
+  }
+};
+
+DS.Serializer = Ember.Object.extend({
+  init: function() {
+    // By default, the JSON types are passthrough transforms
+    this.transforms = {
+      'string': passthrough,
+      'number': passthrough,
+      'boolean': passthrough
+    };
+
+    this.mappings = Ember.Map.create();
+  },
+
+  /**
+    NAMING CONVENTIONS
+
+    The most commonly overridden APIs of the serializer are
+    the naming convention methods:
+
+    * `keyForAttributeName`: converts a camelized attribute name
+      into a key in the adapter-provided data hash. For example,
+      if the model's attribute name was `firstName`, and the
+      server used underscored names, you would return `first_name`.
+    * `primaryKey`: returns the key that should be used to
+      extract the id from the adapter-provided data hash. It is
+      also used when serializing a record.
+  */
+
+  _keyForAttributeName: function(type, name) {
+    return this._keyForJSONKey('keyForAttributeName', type, name);
+  },
+
+  keyForAttributeName: function(type, name) {
+    return name;
+  },
+
+  _keyForBelongsTo: function(type, name) {
+    return this._keyForJSONKey('keyForBelongsTo', type, name);
+  },
+
+  keyForBelongsTo: function(type, name) {
+    return this.keyForAttributeName(type, name);
+  },
+
+  _keyForHasMany: function(type, name) {
+    return this._keyForJSONKey('keyForHasMany', type, name);
+  },
+
+  keyForHasMany: function(type, name) {
+    return this.keyForAttributeName(type, name);
+  },
+
+  _keyForJSONKey: function(publicMethod, type, name) {
+    var mapping = this.mappingForType(type),
+        mappingOptions = mapping && mapping[name],
+        key = mappingOptions && mappingOptions.key;
+
+    if (key) {
+      return key;
+    } else {
+      return this[publicMethod](type, name);
+    }
+  },
+
+  _primaryKey: function(type) {
+    var mapping = this.mappingForType(type),
+        primaryKey = mapping && mapping.primaryKey;
+
+    if (primaryKey) {
+      return primaryKey;
+    } else {
+      return this.primaryKey(type);
+    }
+  },
+
+  primaryKey: function(type) {
+    return "id";
+  },
+
+  /**
+    SERIALIZATION
+
+    These methods are responsible for taking a record and
+    producing a JSON object.
+
+    These methods are designed in layers, like a delicious 7-layer
+    cake (but with fewer layers).
+
+    The main entry point for serialization is the `toJSON`
+    method, which takes the record and options.
+
+    The `toJSON` method is responsible for:
+
+    * turning the record's attributes (`DS.attr`) into
+      attributes on the JSON object.
+    * optionally adding the record's ID onto the hash
+    * adding relationships (`DS.hasMany` and `DS.belongsTo`)
+      to the JSON object.
+
+    Depending on the backend, the serializer can choose
+    whether to include the `hasMany` or `belongsTo`
+    relationships on the JSON hash.
+
+    For very custom serialization, you can implement your
+    own `toJSON` method. In general, however, you will want
+    to override the hooks described below.
+
+    ## Adding the ID
+
+    The default `toJSON` will optionally call your serializer's
+    `addId` method with the JSON hash it is creating, the
+    record's type, and the record's ID. The `toJSON` method
+    will not call `addId` if the record's ID is undefined.
+
+    Your adapter must specifically request ID inclusion by
+    passing `{ includeId: true }` as an option to `toJSON`.
+
+    NOTE: You may not want to include the ID when updating an
+    existing record, because your server will likely disallow
+    changing an ID after it is created, and the PUT request
+    itself will include the record's identification.
+
+    By default, `addId` will:
+
+    1. Get the primary key name for the record by calling
+       the serializer's `primaryKey` with the record's type.
+       Unless you override the `primaryKey` method, this
+       will be `'id'`.
+    2. Assign the record's ID to the primary key in the
+       JSON hash being built.
+
+    If your backend expects a JSON object with the primary
+    key at the root, you can just override the `primaryKey`
+    method on your serializer subclass.
+
+    Otherwise, you can override the `addId` method for
+    more specialized handling.
+
+    ## Adding Attributes
+
+    By default, the serializer's `toJSON` method will call
+    `addAttributes` with the JSON object it is creating
+    and the record to serialize.
+
+    The `addAttributes` method will then call `addAttribute`
+    in turn, with the JSON object, the record to serialize,
+    the attribute's name and its type.
+
+    Finally, the `addAttribute` method will serialize the
+    attribute:
+
+    1. It will call `keyForAttributeName` to determine
+       the key to use in the JSON hash.
+    2. It will get the value from the record.
+    3. It will call `transformValueToJSON` with the attribute's
+       value and attribute type to convert it into a
+       JSON-compatible value. For example, it will convert a
+       Date into a String.
+
+    If your backend expects a JSON object with attributes as
+    keys at the root, you can just override the `transformValueToJSON`
+    and `keyForAttributeName` methods in your serializer
+    subclass and let the base class do the heavy lifting.
+
+    If you need something more specialized, you can probably
+    override `addAttribute` and let the default `addAttributes`
+    handle the nitty gritty.
+
+    ## Adding Relationships
+
+    By default, `toJSON` will call your serializer's
+    `addRelationships` method with the JSON object that is
+    being built and the record being serialized. The default
+    implementation of this method is to loop over all of the
+    relationships defined on your record type and:
+
+    * If the relationship is a `DS.hasMany` relationship,
+      call `addHasMany` with the JSON object, the record
+      and a description of the relationship.
+    * If the relationship is a `DS.belongsTo` relationship,
+      call `addBelongsTo` with the JSON object, the record
+      and a description of the relationship.
+
+    The relationship description has the following keys:
+
+    * `type`: the class of the associated information (the
+      first parameter to `DS.hasMany` or `DS.belongsTo`)
+    * `kind`: either `hasMany` or `belongsTo`
+
+    The relationship description may get additional
+    information in the future if more capabilities or
+    relationship types are added. However, it will
+    remain backwards-compatible, so the mere existence
+    of new features should not break existing adapters.
+  */
+
+  transformValueToJSON: function(value, attributeType) {
+    var transform = this.transforms[attributeType];
+
+    Ember.assert("You tried to use an attribute type (" + attributeType + ") that has not been registered", transform);
+    return transform.toJSON(value);
+  },
+
+  toJSON: function(record, options) {
+    options = options || {};
+
+    var hash = {}, id;
+
+    if (options.includeId) {
+      if (id = get(record, 'id')) {
+        this.addId(hash, record.constructor, id);
+      }
+    }
+
+    this.addAttributes(hash, record);
+
+    this.addRelationships(hash, record);
+
+    return hash;
+  },
+
+  addAttributes: function(hash, record) {
+    record.eachAttribute(function(name, attribute) {
+      this.addAttribute(hash, record, name, attribute.type);
+    }, this);
+  },
+
+  addAttribute: function(hash, record, attributeName, attributeType) {
+    var key = this._keyForAttributeName(record.constructor, attributeName);
+    var value = get(record, attributeName);
+
+    hash[key] = this.transformValueToJSON(value, attributeType);
+  },
+
+  addId: function(hash, type, id) {
+    var primaryKey = this._primaryKey(type);
+
+    hash[primaryKey] = this.serializeId(id);
+  },
+
+  addRelationships: function(hash, record) {
+    record.eachAssociation(function(name, relationship) {
+      var key = this._keyForAttributeName(record.constructor, name);
+
+      if (relationship.kind === 'belongsTo') {
+        this.addBelongsTo(hash, record, key, relationship);
+      } else if (relationship.kind === 'hasMany') {
+        this.addHasMany(hash, record, key, relationship);
+      }
+    }, this);
+  },
+
+  addBelongsTo: Ember.K,
+  addHasMany: Ember.K,
+
+  /**
+   Allows IDs to be normalized before being sent back to the
+   persistence layer. Because the store coerces all IDs to strings
+   for consistency, this is the opportunity for the serializer to,
+   for example, convert numerical IDs back into number form.
+  */
+  serializeId: function(id) {
+    if (isNaN(id)) { return id; }
+    return +id;
+  },
+
+  serializeIds: function(ids) {
+    return Ember.EnumerableUtils.map(ids, function(id) {
+      return this.serializeId(id);
+    }, this);
+  },
+
+  /**
+    DESERIALIZATION
+  */
+
+  transformValueFromJSON: function(value, attributeType) {
+    var transform = this.transforms[attributeType];
+
+    Ember.assert("You tried to use a attribute type (" + attributeType + ") that has not been registered", transform);
+    return transform.fromJSON(value);
+  },
+
+  materializeFromJSON: function(record, hash) {
+    if (Ember.none(get(record, 'id'))) {
+      record.materializeId(this.extractId(record.constructor, hash));
+    }
+
+    this.materializeAttributes(record, hash);
+    this.materializeRelationships(record, hash);
+  },
+
+  materializeAttributes: function(record, hash) {
+    record.eachAttribute(function(name, attribute) {
+      this.materializeAttribute(record, hash, name, attribute.type);
+    }, this);
+  },
+
+  materializeAttribute: function(record, hash, attributeName, attributeType) {
+    var value = this.extractAttribute(record.constructor, hash, attributeName);
+    value = this.transformValueFromJSON(value, attributeType);
+
+    record.materializeAttribute(attributeName, value);
+  },
+
+  extractAttribute: function(type, hash, attributeName) {
+    var key = this._keyForAttributeName(type, attributeName);
+    return hash[key];
+  },
+
+  extractId: function(type, hash) {
+    var primaryKey = this._primaryKey(type);
+
+    // Ensure that we coerce IDs to strings so that record
+    // IDs remain consistent between application runs; especially
+    // if the ID is serialized and later deserialized from the URL,
+    // when type information will have been lost.
+    return hash[primaryKey]+'';
+  },
+
+  materializeRelationships: function(record, hash) {
+    record.eachAssociation(function(name, relationship) {
+      if (relationship.kind === 'hasMany') {
+        record.materializeHasMany(name, this.extractHasMany(record, hash, relationship));
+      } else if (relationship.kind === 'belongsTo') {
+        record.materializeBelongsTo(name, this.extractBelongsTo(record, hash, relationship));
+      }
+    }, this);
+  },
+
+  extractHasMany: function(record, hash, relationship) {
+    var key = this._keyForHasMany(record.constructor, relationship.key);
+    return hash[key];
+  },
+
+  extractBelongsTo: function(record, hash, relationship) {
+    var key = this._keyForBelongsTo(record.constructor, relationship.key);
+    return hash[key];
+  },
+
+  /**
+    TRANSFORMS
+  */
+
+  registerTransform: function(type, transform) {
+    this.transforms[type] = transform;
+  },
+
+  /**
+    MAPPING CONVENIENCE
+  */
+
+  map: function(type, mappings) {
+    this.mappings.set(type, mappings);
+  },
+
+  mappingForType: function(type) {
+    this._reifyMappings();
+    return this.mappings.get(type);
+  },
+
+  _reifyMappings: function() {
+    if (this._didReifyMappings) { return; }
+
+    var mappings = this.mappings,
+        reifiedMappings = Ember.Map.create();
+
+    mappings.forEach(function(key, mapping) {
+      if (typeof key === 'string') {
+        var type = Ember.get(window, key);
+        Ember.assert("Could not find model at path" + key, type);
+
+        reifiedMappings.set(type, mapping);
+      } else {
+        reifiedMappings.set(key, mapping);
+      }
+    });
+
+    this.mappings = reifiedMappings;
+
+    this._didReifyMappings = true;
+  }
+});
+
 
 })();
 
@@ -28948,7 +30216,79 @@ DS.Model.reopenClass({
    For more information about the adapter API, please see `README.md`.
 */
 
+var get = Ember.get, set = Ember.set;
+
 DS.Adapter = Ember.Object.extend({
+
+  init: function() {
+    var serializer = get(this, 'serializer');
+
+    if (Ember.Object.detect(serializer)) {
+      serializer = serializer.create();
+      set(this, 'serializer', serializer);
+    }
+
+    this.registerSerializerTransforms(this.constructor, serializer, {});
+    this.registerSerializerMappings(this.constructor, serializer);
+  },
+
+  /**
+    @private
+
+    This method recursively climbs the superclass hierarchy and
+    registers any class-registered transforms on the adapter's
+    serializer.
+
+    Once it registers a transform for a given type, it ignores
+    subsequent transforms for the same attribute type.
+
+    @param {Class} klass the DS.Adapter subclass to extract the
+      transforms from
+    @param {DS.Serializer} serializer the serializer to register
+      the transforms onto
+    @param {Object} seen a hash of attributes already seen
+  */
+  registerSerializerTransforms: function(klass, serializer, seen) {
+    var transforms = klass._registeredTransforms, superclass, prop;
+
+    for (prop in transforms) {
+      if (!transforms.hasOwnProperty(prop) || prop in seen) { continue; }
+      seen[prop] = true;
+
+      serializer.registerTransform(prop, transforms[prop]);
+    }
+
+    if (superclass = klass.superclass) {
+      this.registerSerializerTransforms(superclass, serializer, seen);
+    }
+  },
+
+  /**
+    @private
+
+    This method recursively climbs the superclass hierarchy and
+    registers any class-registered mappings on the adapter's
+    serializer.
+
+    @param {Class} klass the DS.Adapter subclass to extract the
+      transforms from
+    @param {DS.Serializer} serializer the serializer to register the
+      mappings onto
+  */
+  registerSerializerMappings: function(klass, serializer) {
+    var mappings = klass._registeredMappings, superclass, prop;
+
+    if (superclass = klass.superclass) {
+      this.registerSerializerMappings(superclass, serializer);
+    }
+
+    if (!mappings) { return; }
+
+    mappings.forEach(function(type, mapping) {
+      serializer.map(type, mapping);
+    }, this);
+  },
+
   /**
     The `find()` method is invoked when the store is asked for a record that
     has not previously been loaded. In response to `find()` being called, you
@@ -28972,6 +30312,12 @@ DS.Adapter = Ember.Object.extend({
   */
   find: null,
 
+  serializer: DS.Serializer,
+
+  registerTransform: function(attributeType, transform) {
+    get(this, 'serializer').registerTransform(attributeType, transform);
+  },
+
   /**
     If the globally unique IDs for your records should be generated on the client,
     implement the `generateIdForRecord()` method. This method will be invoked
@@ -28993,17 +30339,66 @@ DS.Adapter = Ember.Object.extend({
   */
   generateIdForRecord: null,
 
+  materialize: function(record, hash) {
+    get(this, 'serializer').materializeFromJSON(record, hash);
+  },
+
+  toJSON: function(record, options) {
+    return get(this, 'serializer').toJSON(record, options);
+  },
+
+  extractId: function(type, hash) {
+    return get(this, 'serializer').extractId(type, hash);
+  },
+
+  shouldCommit: function(record) {
+    return true;
+  },
+
+  groupByType: function(enumerable) {
+    var map = Ember.MapWithDefault.create({
+      defaultValue: function() { return Ember.OrderedSet.create(); }
+    });
+
+    enumerable.forEach(function(item) {
+      map.get(item.constructor).add(item);
+    });
+
+    return map;
+  },
+
   commit: function(store, commitDetails) {
-    commitDetails.updated.eachType(function(type, array) {
-      this.updateRecords(store, type, array.slice());
+    // nº1: determine which records the adapter actually l'cares about
+    // nº2: for each relationship, give the adapter an opportunity to mark
+    //      related records as l'pending
+    // nº3: trigger l'save on l'non-pending records
+
+    var updated = Ember.OrderedSet.create();
+    commitDetails.updated.forEach(function(record) {
+      var shouldCommit = this.shouldCommit(record);
+
+      if (!shouldCommit) {
+        store.didSaveRecord(record);
+      } else {
+        updated.add(record);
+      }
     }, this);
 
-    commitDetails.created.eachType(function(type, array) {
-      this.createRecords(store, type, array.slice());
+    commitDetails.updated = updated;
+    this.save(store, commitDetails);
+  },
+
+  save: function(store, commitDetails) {
+    this.groupByType(commitDetails.created).forEach(function(type, set) {
+      this.createRecords(store, type, set.copy());
     }, this);
 
-    commitDetails.deleted.eachType(function(type, array) {
-      this.deleteRecords(store, type, array.slice());
+    this.groupByType(commitDetails.updated).forEach(function(type, set) {
+      this.updateRecords(store, type, set.copy());
+    }, this);
+
+    this.groupByType(commitDetails.deleted).forEach(function(type, set) {
+      this.deleteRecords(store, type, set.copy());
     }, this);
   },
 
@@ -29032,38 +30427,28 @@ DS.Adapter = Ember.Object.extend({
   }
 });
 
-})();
+DS.Adapter.reopenClass({
+  registerTransform: function(attributeType, transform) {
+    var registeredTransforms = this._registeredTransforms || {};
 
+    registeredTransforms[attributeType] = transform;
 
+    this._registeredTransforms = registeredTransforms;
+  },
 
-(function() {
-var set = Ember.set;
+  map: function(type, mapping) {
+    var mappings = this._registeredMappings || Ember.MapWithDefault.create({
+      defaultValue: function() { return {}; }
+    });
+    var mappingsForType = mappings.get(type);
 
-Ember.onLoad('Ember.Application', function(Application) {
-  Application.registerInjection({
-    name: "store",
-    before: "controllers",
-
-    injection: function(app, stateManager, property) {
-      if (property === 'Store') {
-        set(stateManager, 'store', app[property].create());
-      }
+    for (var prop in mapping) {
+      if (!mapping.hasOwnProperty(prop)) { continue; }
+      mappingsForType[prop] = mapping[prop];
     }
-  });
 
-  Application.registerInjection({
-    name: "giveStoreToControllers",
-
-    injection: function(app, stateManager, property) {
-      if (/^[A-Z].*Controller$/.test(property)) {
-        var controllerName = property.charAt(0).toLowerCase() + property.substr(1);
-        var store = stateManager.get('store');
-        var controller = stateManager.get(controllerName);
-
-        controller.set('store', store);
-      }
-    }
-  });
+    this._registeredMappings = mappings;
+  }
 });
 
 })();
@@ -29097,7 +30482,7 @@ DS.FixtureAdapter = DS.Adapter.extend({
     Implement this method in order to provide provide json for CRUD methods
   */
   mockJSON: function(type, record) {
-    return record.toJSON({associations: true});
+    return this.toJSON(record, { includeId: true });
   },
 
   /*
@@ -29171,7 +30556,7 @@ DS.FixtureAdapter = DS.Adapter.extend({
     fixture.id = this.generateIdForRecord(store, record);
 
     this.simulateRemoteCall(function() {
-      store.didCreateRecord(record, fixture);
+      store.didSaveRecord(record, fixture);
     }, store, type, record);
   },
 
@@ -29179,13 +30564,13 @@ DS.FixtureAdapter = DS.Adapter.extend({
     var fixture = this.mockJSON(type, record);
 
     this.simulateRemoteCall(function() {
-      store.didUpdateRecord(record, fixture);
+      store.didSaveRecord(record, fixture);
     }, store, type, record);
   },
 
   deleteRecord: function(store, type, record) {
     this.simulateRemoteCall(function() {
-      store.didDeleteRecord(record);
+      store.didSaveRecord(record);
     }, store, type, record);
   },
 
@@ -29208,6 +30593,30 @@ DS.fixtureAdapter = DS.FixtureAdapter.create();
 
 
 (function() {
+var get = Ember.get;
+
+DS.RESTSerializer = DS.Serializer.create({
+  keyForBelongsTo: function(type, name) {
+    return this.keyForAttributeName(type, name) + "_id";
+  },
+
+  keyForAttributeName: function(type, name) {
+    return Ember.String.decamelize(name);
+  },
+
+  addBelongsTo: function(hash, record, key, relationship) {
+    var hashKey = this._keyForBelongsTo(record.constructor, key),
+        id = get(record, key+'.id');
+
+    if (!Ember.none(id)) { hash[hashKey] = id; }
+  }
+});
+
+})();
+
+
+
+(function() {
 /*global jQuery*/
 
 var get = Ember.get, set = Ember.set;
@@ -29215,11 +30624,19 @@ var get = Ember.get, set = Ember.set;
 DS.RESTAdapter = DS.Adapter.extend({
   bulkCommit: false,
 
+  serializer: DS.RESTSerializer,
+
+  shouldCommit: function(record) {
+    if (record.isCommittingBecause('attribute') || record.isCommittingBecause('belongsTo')) {
+      return true;
+    }
+  },
+
   createRecord: function(store, type, record) {
     var root = this.rootForType(type);
 
     var data = {};
-    data[root] = record.toJSON();
+    data[root] = this.toJSON(record, { includeId: true });
 
     this.ajax(this.buildURL(root), "POST", {
       data: data,
@@ -29234,7 +30651,7 @@ DS.RESTAdapter = DS.Adapter.extend({
     var root = this.rootForType(type);
 
     this.sideload(store, type, json, root);
-    store.didCreateRecord(record, json[root]);
+    store.didSaveRecord(record, json[root]);
   },
 
   createRecords: function(store, type, records) {
@@ -29246,9 +30663,10 @@ DS.RESTAdapter = DS.Adapter.extend({
         plural = this.pluralize(root);
 
     var data = {};
-    data[plural] = records.map(function(record) {
-      return record.toJSON();
-    });
+    data[plural] = [];
+    records.forEach(function(record) {
+      data[plural].push(this.toJSON(record, { includeId: true }));
+    }, this);
 
     this.ajax(this.buildURL(root), "POST", {
       data: data,
@@ -29263,7 +30681,7 @@ DS.RESTAdapter = DS.Adapter.extend({
     var root = this.pluralize(this.rootForType(type));
 
     this.sideload(store, type, json, root);
-    store.didCreateRecords(type, records, json[root]);
+    store.didSaveRecords(records, json[root]);
   },
 
   updateRecord: function(store, type, record) {
@@ -29271,7 +30689,7 @@ DS.RESTAdapter = DS.Adapter.extend({
     var root = this.rootForType(type);
 
     var data = {};
-    data[root] = record.toJSON();
+    data[root] = this.toJSON(record);
 
     this.ajax(this.buildURL(root, id), "PUT", {
       data: data,
@@ -29286,7 +30704,7 @@ DS.RESTAdapter = DS.Adapter.extend({
     var root = this.rootForType(type);
 
     this.sideload(store, type, json, root);
-    store.didUpdateRecord(record, json && json[root]);
+    store.didSaveRecord(record, json && json[root]);
   },
 
   updateRecords: function(store, type, records) {
@@ -29298,9 +30716,10 @@ DS.RESTAdapter = DS.Adapter.extend({
         plural = this.pluralize(root);
 
     var data = {};
-    data[plural] = records.map(function(record) {
-      return record.toJSON();
-    });
+    data[plural] = [];
+    records.forEach(function(record) {
+      data[plural].push(record.toJSON());
+    }, this);
 
     this.ajax(this.buildURL(root, "bulk"), "PUT", {
       data: data,
@@ -29315,7 +30734,7 @@ DS.RESTAdapter = DS.Adapter.extend({
     var root = this.pluralize(this.rootForType(type));
 
     this.sideload(store, type, json, root);
-    store.didUpdateRecords(records, json[root]);
+    store.didSaveRecords(records, json[root]);
   },
 
   deleteRecord: function(store, type, record) {
@@ -29332,7 +30751,7 @@ DS.RESTAdapter = DS.Adapter.extend({
 
   didDeleteRecord: function(store, type, record, json) {
     if (json) { this.sideload(store, type, json); }
-    store.didDeleteRecord(record);
+    store.didSaveRecord(record);
   },
 
   deleteRecords: function(store, type, records) {
@@ -29344,8 +30763,9 @@ DS.RESTAdapter = DS.Adapter.extend({
         plural = this.pluralize(root);
 
     var data = {};
-    data[plural] = records.map(function(record) {
-      return get(record, 'id');
+    data[plural] = [];
+    records.forEach(function(record) {
+      data[plural].push(get(record, 'id'));
     });
 
     this.ajax(this.buildURL(root, 'bulk'), "DELETE", {
@@ -29359,7 +30779,7 @@ DS.RESTAdapter = DS.Adapter.extend({
 
   didDeleteRecords: function(store, type, records, json) {
     if (json) { this.sideload(store, type, json); }
-    store.didDeleteRecords(records);
+    store.didSaveRecords(records);
   },
 
   find: function(store, type, id) {
@@ -29367,45 +30787,78 @@ DS.RESTAdapter = DS.Adapter.extend({
 
     this.ajax(this.buildURL(root, id), "GET", {
       success: function(json) {
-        this.sideload(store, type, json, root);
-        store.load(type, json[root]);
+        this.didFindRecord(store, type, json, id);
       }
     });
   },
 
-  findMany: function(store, type, ids) {
-    var root = this.rootForType(type), plural = this.pluralize(root);
+  didFindRecord: function(store, type, json, id) {
+    var root = this.rootForType(type);
+
+    this.sideload(store, type, json, root);
+    store.load(type, id, json[root]);
+  },
+
+  findAll: function(store, type, since) {
+    var root = this.rootForType(type);
 
     this.ajax(this.buildURL(root), "GET", {
-      data: { ids: ids },
+      data: this.sinceQuery(since),
       success: function(json) {
-        this.sideload(store, type, json, plural);
-        store.loadMany(type, json[plural]);
+        this.didFindAll(store, type, json);
       }
     });
   },
 
-  findAll: function(store, type) {
-    var root = this.rootForType(type), plural = this.pluralize(root);
+  didFindAll: function(store, type, json) {
+    var root = this.pluralize(this.rootForType(type)),
+        since = this.extractSince(json);
 
-    this.ajax(this.buildURL(root), "GET", {
-      success: function(json) {
-        this.sideload(store, type, json, plural);
-        store.loadMany(type, json[plural]);
-      }
-    });
+    this.sideload(store, type, json, root);
+    store.loadMany(type, json[root]);
+
+    // this registers the id with the store, so it will be passed
+    // into the next call to `findAll`
+    if (since) { store.sinceForType(type, since); }
+
+    store.didUpdateAll(type);
   },
 
   findQuery: function(store, type, query, recordArray) {
-    var root = this.rootForType(type), plural = this.pluralize(root);
+    var root = this.rootForType(type);
 
     this.ajax(this.buildURL(root), "GET", {
       data: query,
       success: function(json) {
-        this.sideload(store, type, json, plural);
-        recordArray.load(json[plural]);
+        this.didFindQuery(store, type, json, recordArray);
       }
     });
+  },
+
+  didFindQuery: function(store, type, json, recordArray) {
+    var root = this.pluralize(this.rootForType(type));
+
+    this.sideload(store, type, json, root);
+    recordArray.load(json[root]);
+  },
+
+  findMany: function(store, type, ids) {
+    var root = this.rootForType(type);
+    ids = get(this, 'serializer').serializeIds(ids);
+
+    this.ajax(this.buildURL(root), "GET", {
+      data: {ids: ids},
+      success: function(json) {
+        this.didFindMany(store, type, json);
+      }
+    });
+  },
+
+  didFindMany: function(store, type, json) {
+    var root = this.pluralize(this.rootForType(type));
+
+    this.sideload(store, type, json, root);
+    store.loadMany(type, json[root]);
   },
 
   // HELPERS
@@ -29449,6 +30902,7 @@ DS.RESTAdapter = DS.Adapter.extend({
     for (var prop in json) {
       if (!json.hasOwnProperty(prop)) { continue; }
       if (prop === root) { continue; }
+      if (prop === get(this, 'meta')) { continue; }
 
       sideloadedType = type.typeForAssociation(prop);
 
@@ -29493,8 +30947,10 @@ DS.RESTAdapter = DS.Adapter.extend({
     }
   },
 
+  url: "",
+
   buildURL: function(record, suffix) {
-    var url = [""];
+    var url = [this.url];
 
     Ember.assert("Namespace URL (" + this.namespace + ") must not start with slash", !this.namespace || this.namespace.toString().charAt(0) !== "/");
     Ember.assert("Record URL (" + record + ") must not start with slash", !record || record.toString().charAt(0) !== "/");
@@ -29510,9 +30966,33 @@ DS.RESTAdapter = DS.Adapter.extend({
     }
 
     return url.join("/");
+  },
+
+  meta: 'meta',
+  since: 'since',
+
+  sinceQuery: function(since) {
+    var query = {};
+    query[get(this, 'since')] = since;
+    return since ? query : null;
+  },
+
+  extractSince: function(json) {
+    var meta = this.extractMeta(json);
+    return meta[get(this, 'since')] || null;
+  },
+
+  extractMeta: function(json) {
+    return json[get(this, 'meta')] || {};
   }
 });
 
+
+})();
+
+
+
+(function() {
 
 })();
 
@@ -30753,4 +32233,4 @@ var _require=function(){function c(a,c){document.addEventListener?a.addEventList
 ++g&&setTimeout(c,0)})}}();
 (function(){!window.WebSocket&&window.MozWebSocket&&(window.WebSocket=window.MozWebSocket);if(window.WebSocket)Pusher.Transport=window.WebSocket,Pusher.TransportType="native";var c=(document.location.protocol=="http:"?Pusher.cdn_http:Pusher.cdn_https)+Pusher.VERSION,a=[];window.JSON||a.push(c+"/json2"+Pusher.dependency_suffix+".js");if(!window.WebSocket)window.WEB_SOCKET_DISABLE_AUTO_INITIALIZATION=!0,a.push(c+"/flashfallback"+Pusher.dependency_suffix+".js");var b=function(){return window.WebSocket?function(){Pusher.ready()}:
 function(){window.WebSocket?(Pusher.Transport=window.WebSocket,Pusher.TransportType="flash",window.WEB_SOCKET_SWF_LOCATION=c+"/WebSocketMain.swf",WebSocket.__addTask(function(){Pusher.ready()}),WebSocket.__initialize()):(Pusher.Transport=null,Pusher.TransportType="none",Pusher.ready())}}(),e=function(a){var b=function(){document.body?a():setTimeout(b,0)};b()},g=function(){e(b)};a.length>0?_require(a,g):g()})();
-;minispade.register('app', "(function() {(function() {\nminispade.require('auth');\nminispade.require('controllers');\nminispade.require('helpers');\nminispade.require('models');\nminispade.require('pusher');\nminispade.require('routes');\nminispade.require('slider');\nminispade.require('store');\nminispade.require('tailing');\nminispade.require('templates');\nminispade.require('views');\nminispade.require('config/locales');\nminispade.require('data/sponsors');\n\n  Travis.reopen({\n    App: Em.Application.extend({\n      autoinit: false,\n      currentUserBinding: 'auth.user',\n      authStateBinding: 'auth.state',\n      init: function() {\n        this._super.apply(this, arguments);\n        this.store = Travis.Store.create();\n        this.store.loadMany(Travis.Sponsor, Travis.SPONSORS);\n        this.slider = new Travis.Slider();\n        this.pusher = new Travis.Pusher(Travis.config.pusher_key);\n        this.tailing = new Travis.Tailing();\n        return this.set('auth', Travis.Auth.create({\n          app: this,\n          endpoint: Travis.config.api_endpoint\n        }));\n      },\n      storeAfterSignInPath: function(path) {\n        return this.get('auth').storeAfterSignInPath(path);\n      },\n      autoSignIn: function(path) {\n        return this.get('auth').autoSignIn(path);\n      },\n      signIn: function() {\n        return this.get('auth').signIn();\n      },\n      signOut: function() {\n        this.get('auth').signOut();\n        return this.get('router').send('afterSignOut');\n      },\n      receive: function() {\n        return this.store.receive.apply(this.store, arguments);\n      },\n      toggleSidebar: function() {\n        var element;\n        $('body').toggleClass('maximized');\n        element = $('<span></span>');\n        $('#top .profile').append(element);\n        Em.run.later((function() {\n          return element.remove();\n        }), 10);\n        element = $('<span></span>');\n        $('#repo').append(element);\n        return Em.run.later((function() {\n          return element.remove();\n        }), 10);\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=app");minispade.register('auth', "(function() {(function() {\n\n  this.Travis.Auth = Ember.Object.extend({\n    iframe: $('<iframe id=\"auth-frame\" />').hide(),\n    timeout: 10000,\n    state: 'signed-out',\n    receivingEnd: \"\" + location.protocol + \"//\" + location.host,\n    init: function() {\n      var _this = this;\n      this.iframe.appendTo('body');\n      return window.addEventListener('message', function(e) {\n        return _this.receiveMessage(e);\n      });\n    },\n    accessToken: (function() {\n      return sessionStorage.getItem('travis.token');\n    }).property(),\n    autoSignIn: function(path) {\n      var user;\n      if (user = sessionStorage.getItem('travis.user')) {\n        return this.setData({\n          user: JSON.parse(user)\n        });\n      } else if (localStorage.getItem('travis.auto_signin')) {\n        return this.signIn();\n      }\n    },\n    signIn: function() {\n      this.set('state', 'signing-in');\n      this.trySignIn();\n      return Ember.run.later(this, this.checkSignIn.bind(this), this.timeout);\n    },\n    signOut: function() {\n      localStorage.removeItem('travis.auto_signin');\n      localStorage.removeItem('travis.locale');\n      sessionStorage.clear();\n      return this.setData();\n    },\n    trySignIn: function() {\n      return this.iframe.attr('src', \"\" + this.endpoint + \"/auth/post_message?origin=\" + this.receivingEnd);\n    },\n    checkSignIn: function() {\n      if (this.get('state') === 'signing-in') {\n        return this.forceSignIn();\n      }\n    },\n    forceSignIn: function() {\n      localStorage.setItem('travis.auto_signin', 'true');\n      return window.location = \"\" + this.endpoint + \"/auth/handshake?redirect_uri=\" + location;\n    },\n    setData: function(data) {\n      var user;\n      if (typeof data === 'string') {\n        data = JSON.parse(data);\n      }\n      if (data != null ? data.token : void 0) {\n        this.storeToken(data.token);\n      }\n      if (data != null ? data.user : void 0) {\n        user = this.storeUser(data.user);\n      }\n      this.set('state', user ? 'signed-in' : 'signed-out');\n      this.set('user', user ? user : void 0);\n      return this.afterSignIn();\n    },\n    afterSignIn: function() {\n      return this.get('app.router').send('afterSignIn', this.readAfterSignInPath());\n    },\n    storeToken: function(token) {\n      sessionStorage.setItem('travis.token', token);\n      return this.notifyPropertyChange('accessToken');\n    },\n    storeUser: function(user) {\n      localStorage.setItem('travis.auto_signin', 'true');\n      sessionStorage.setItem('travis.user', JSON.stringify(user));\n      this.app.store.load(Travis.User, user);\n      user = this.app.store.find(Travis.User, user.id);\n      user.get('permissions');\n      return user;\n    },\n    storeAfterSignInPath: function(path) {\n      return sessionStorage.setItem('travis.after_signin_path', path);\n    },\n    readAfterSignInPath: function() {\n      var path;\n      path = sessionStorage.getItem('travis.after_signin_path');\n      sessionStorage.removeItem('travis.after_signin_path');\n      return path;\n    },\n    receiveMessage: function(event) {\n      if (event.origin === this.expectedOrigin()) {\n        if (event.data.token) {\n          event.data.user.token = event.data.token;\n        }\n        this.setData(event.data);\n        return console.log(\"signed in as \" + event.data.user.login);\n      } else {\n        return console.log(\"unexpected message \" + event.origin + \": \" + event.data);\n      }\n    },\n    expectedOrigin: function() {\n      if (this.endpoint[0] === '/') {\n        return this.receivingEnd;\n      } else {\n        return this.endpoint;\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=auth");minispade.register('controllers', "(function() {(function() {\nminispade.require('helpers');\nminispade.require('travis/ticker');\n\n  Travis.reopen({\n    Controller: Em.Controller.extend(),\n    TopController: Em.Controller.extend({\n      userBinding: 'Travis.app.currentUser'\n    }),\n    ApplicationController: Em.Controller.extend(),\n    MainController: Em.Controller.extend(),\n    StatsLayoutController: Em.Controller.extend(),\n    ProfileLayoutController: Em.Controller.extend(),\n    AuthLayoutController: Em.Controller.extend()\n  });\nminispade.require('controllers/accounts');\nminispade.require('controllers/builds');\nminispade.require('controllers/flash');\nminispade.require('controllers/home');\nminispade.require('controllers/profile');\nminispade.require('controllers/repos');\nminispade.require('controllers/repo');\nminispade.require('controllers/sidebar');\nminispade.require('controllers/stats');\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers");minispade.register('controllers/accounts', "(function() {(function() {\n\n  Travis.AccountsController = Ember.ArrayController.extend({\n    tab: 'accounts',\n    init: function() {\n      return this._super();\n    },\n    findByLogin: function(login) {\n      return this.find(function(account) {\n        return account.get('login') === login;\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/accounts");minispade.register('controllers/builds', "(function() {(function() {\n\n  Travis.BuildsController = Em.ArrayController.extend({\n    repo: 'parent.repo',\n    contentBinding: 'parent.builds'\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/builds");minispade.register('controllers/flash', "(function() {(function() {\n\n  Travis.FlashController = Ember.ArrayController.extend({\n    broadcastBinding: 'Travis.app.currentUser.broadcasts',\n    init: function() {\n      this.set('flashes', Ember.A());\n      return this._super.apply(this, arguments);\n    },\n    content: (function() {\n      return this.get('unseenBroadcasts').concat(this.get('flashes'));\n    }).property('unseenBroadcasts.length', 'flashes.length'),\n    unseenBroadcasts: (function() {\n      return this.get('broadcasts').filterProperty('isSeen', false);\n    }).property('broadcasts.isLoaded', 'broadcasts.length'),\n    broadcasts: (function() {\n      if (Travis.app.get('currentUser')) {\n        return Travis.Broadcast.find();\n      } else {\n        return Ember.A();\n      }\n    }).property('Travis.app.currentUser'),\n    loadFlashes: function(msgs) {\n      var msg, type, _i, _len, _results;\n      _results = [];\n      for (_i = 0, _len = msgs.length; _i < _len; _i++) {\n        msg = msgs[_i];\n        type = Ember.keys(msg)[0];\n        msg = {\n          type: type,\n          message: msg[type]\n        };\n        this.get('flashes').pushObject(msg);\n        _results.push(Ember.run.later(this, (function() {\n          return this.get('flashes').removeObject(msg);\n        }), 15000));\n      }\n      return _results;\n    },\n    close: function(msg) {\n      if (msg instanceof Travis.Broadcast) {\n        msg.setSeen();\n        return this.notifyPropertyChange('unseenBroadcasts');\n      } else {\n        return this.get('flashes').removeObject(msg);\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/flash");minispade.register('controllers/home', "(function() {(function() {\n\n  Travis.HomeLayoutController = Travis.Controller.extend();\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/home");minispade.register('controllers/profile', "(function() {(function() {\n\n  Travis.ProfileController = Travis.Controller.extend({\n    name: 'profile',\n    userBinding: 'Travis.app.currentUser',\n    accountsBinding: 'Travis.app.router.accountsController',\n    account: (function() {\n      var account, login;\n      login = this.get('params.login') || Travis.app.get('currentUser.login');\n      account = this.get('accounts').filter(function(account) {\n        if (account.get('login') === login) {\n          return account;\n        }\n      })[0];\n      if (account) {\n        account.select();\n      }\n      return account;\n    }).property('accounts.length', 'params.login'),\n    activate: function(action, params) {\n      this.setParams(params || this.get('params'));\n      return this[\"view\" + ($.camelize(action))]();\n    },\n    viewHooks: function() {\n      this.connectTab('hooks');\n      return this.set('hooks', Travis.Hook.find({\n        owner_name: this.get('params.login') || Travis.app.get('currentUser.login')\n      }));\n    },\n    viewUser: function() {\n      return this.connectTab('user');\n    },\n    connectTab: function(tab) {\n      var viewClass;\n      viewClass = Travis[\"\" + ($.camelize(tab)) + \"View\"];\n      this.set('tab', tab);\n      return this.connectOutlet({\n        outletName: 'pane',\n        controller: this,\n        viewClass: viewClass\n      });\n    },\n    setParams: function(params) {\n      var key, value, _results;\n      this.set('params', {});\n      _results = [];\n      for (key in params) {\n        value = params[key];\n        _results.push(this.set(\"params.\" + key, params[key]));\n      }\n      return _results;\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/profile");minispade.register('controllers/repo', "(function() {(function() {\n\n  Travis.RepoController = Travis.Controller.extend({\n    bindings: [],\n    init: function() {\n      this._super.apply(this, arguments);\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    updateTimes: function() {\n      var build, builds, jobs;\n      if (builds = this.get('builds')) {\n        builds.forEach(function(b) {\n          return b.updateTimes();\n        });\n      }\n      if (build = this.get('build')) {\n        build.updateTimes();\n      }\n      if (build && (jobs = build.get('jobs'))) {\n        jobs.forEach(function(j) {\n          return j.updateTimes();\n        });\n      }\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    activate: function(action) {\n      this._unbind();\n      return this[\"view\" + ($.camelize(action))]();\n    },\n    viewIndex: function() {\n      this._bind('repo', 'controllers.reposController.firstObject');\n      this._bind('build', 'repo.lastBuild');\n      return this.connectTab('current');\n    },\n    viewCurrent: function() {\n      this.connectTab('current');\n      return this._bind('build', 'repo.lastBuild');\n    },\n    viewBuilds: function() {\n      this.connectTab('builds');\n      return this._bind('builds', 'repo.builds');\n    },\n    viewPullRequests: function() {\n      this.connectTab('pull_requests');\n      return this._bind('builds', 'repo.pullRequests');\n    },\n    viewBranches: function() {\n      this.connectTab('branches');\n      return this._bind('builds', 'repo.branches');\n    },\n    viewEvents: function() {\n      this.connectTab('events');\n      return this._bind('events', 'repo.events');\n    },\n    viewBuild: function() {\n      return this.connectTab('build');\n    },\n    viewJob: function() {\n      this._bind('build', 'job.build');\n      return this.connectTab('job');\n    },\n    repoObserver: (function() {\n      var repo;\n      repo = this.get('repo');\n      if (repo) {\n        return repo.select();\n      }\n    }).observes('repo.id'),\n    connectTab: function(tab) {\n      var name, viewClass;\n      name = tab === 'current' ? 'build' : tab;\n      viewClass = name === 'builds' || name === 'branches' || name === 'pull_requests' ? Travis.BuildsView : Travis[\"\" + ($.camelize(name)) + \"View\"];\n      this.set('tab', tab);\n      return this.connectOutlet({\n        outletName: 'pane',\n        controller: this,\n        viewClass: viewClass\n      });\n    },\n    _bind: function(to, from) {\n      return this.bindings.push(Ember.oneWay(this, to, from));\n    },\n    _unbind: function() {\n      var binding, _i, _len, _ref;\n      _ref = this.bindings;\n      for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n        binding = _ref[_i];\n        binding.disconnect(this);\n      }\n      return this.bindings.length = 0;\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/repo");minispade.register('controllers/repos', "(function() {(function() {\nminispade.require('travis/limited_array');\n\n  Travis.ReposController = Ember.ArrayController.extend({\n    defaultTab: 'recent',\n    sortProperties: ['sortOrder'],\n    init: function() {\n      this.activate(this.defaultTab);\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    updateTimes: function() {\n      var content;\n      if (content = this.get('content')) {\n        content.forEach(function(r) {\n          return r.updateTimes();\n        });\n      }\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    activate: function(tab, params) {\n      this.set('tab', tab);\n      return this[\"view\" + ($.camelize(tab))](params);\n    },\n    viewRecent: function() {\n      var content;\n      content = Travis.LimitedArray.create({\n        content: Travis.Repo.find(),\n        limit: 30\n      });\n      return this.set('content', content);\n    },\n    viewOwned: function() {\n      return this.set('content', Travis.Repo.accessibleBy(Travis.app.get('currentUser.login')));\n    },\n    viewSearch: function(params) {\n      return this.set('content', Travis.Repo.search(params.search));\n    },\n    searchObserver: (function() {\n      var search;\n      search = this.get('search');\n      if (search) {\n        return this.searchFor(search);\n      } else {\n        this.activate('recent');\n        return 'recent';\n      }\n    }).observes('search'),\n    searchFor: function(phrase) {\n      if (this.searchLater) {\n        Ember.run.cancel(this.searchLater);\n      }\n      return this.searchLater = Ember.run.later(this, (function() {\n        return this.activate('search', {\n          search: phrase\n        });\n      }), 500);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/repos");minispade.register('controllers/sidebar', "(function() {(function() {\n\n  Travis.reopen({\n    SidebarController: Em.ArrayController.extend({\n      init: function() {\n        this.tickables = [];\n        return Travis.Ticker.create({\n          target: this,\n          interval: Travis.INTERVALS.sponsors\n        });\n      },\n      tick: function() {\n        var tickable, _i, _len, _ref, _results;\n        _ref = this.tickables;\n        _results = [];\n        for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n          tickable = _ref[_i];\n          _results.push(tickable.tick());\n        }\n        return _results;\n      }\n    }),\n    QueuesController: Em.ArrayController.extend(),\n    WorkersController: Em.ArrayController.extend({\n      groups: (function() {\n        var content, groups, host, worker, _i, _len, _ref;\n        if (content = this.get('arrangedContent')) {\n          groups = {};\n          _ref = content.toArray();\n          for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n            worker = _ref[_i];\n            host = worker.get('host');\n            if (!groups[host]) {\n              groups[host] = Em.ArrayProxy.create(Em.SortableMixin, {\n                content: [],\n                sortProperties: ['nameForSort']\n              });\n            }\n            groups[host].addObject(worker);\n          }\n          return $.values(groups);\n        }\n      }).property('length')\n    }),\n    SponsorsController: Em.ArrayController.extend({\n      page: 0,\n      arrangedContent: (function() {\n        return this.get('shuffled').slice(this.start(), this.end());\n      }).property('shuffled.length', 'page'),\n      shuffled: (function() {\n        var content;\n        if (content = this.get('content')) {\n          return $.shuffle(content);\n        } else {\n          return [];\n        }\n      }).property('content.length'),\n      tick: function() {\n        return this.set('page', this.isLast() ? 0 : this.get('page') + 1);\n      },\n      pages: (function() {\n        var length;\n        length = this.get('content.length');\n        if (length) {\n          return parseInt(length / this.get('perPage') + 1);\n        } else {\n          return 1;\n        }\n      }).property('length'),\n      isLast: function() {\n        return this.get('page') === this.get('pages') - 1;\n      },\n      start: function() {\n        return this.get('page') * this.get('perPage');\n      },\n      end: function() {\n        return this.start() + this.get('perPage');\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/sidebar");minispade.register('controllers/stats', "(function() {(function() {\n\n  Travis.StatsController = Travis.Controller.extend({\n    name: 'stats',\n    init: function() {\n      return this._super('top');\n    },\n    activate: function(action, params) {}\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/stats");minispade.register('helpers', "(function() {(function() {\nminispade.require('helpers/handlebars');\nminispade.require('helpers/helpers');\nminispade.require('helpers/urls');\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers");minispade.register('helpers/handlebars', "(function() {(function() {\n  var safe;\nminispade.require('ext/ember/bound_helper');\n\n  safe = function(string) {\n    return new Handlebars.SafeString(string);\n  };\n\n  Handlebars.registerHelper('tipsy', function(text, tip) {\n    return safe('<span class=\"tool-tip\" original-title=\"' + tip + '\">' + text + '</span>');\n  });\n\n  Handlebars.registerHelper('t', function(key) {\n    return safe(I18n.t(key));\n  });\n\n  Ember.registerBoundHelper('formatTime', function(value, options) {\n    return safe(Travis.Helpers.timeAgoInWords(value) || '-');\n  });\n\n  Ember.registerBoundHelper('formatDuration', function(duration, options) {\n    return safe(Travis.Helpers.timeInWords(duration));\n  });\n\n  Ember.registerBoundHelper('formatCommit', function(commit, options) {\n    if (commit) {\n      return safe(Travis.Helpers.formatCommit(commit.get('sha'), commit.get('branch')));\n    }\n  });\n\n  Ember.registerBoundHelper('formatSha', function(sha, options) {\n    return safe(Travis.Helpers.formatSha(sha));\n  });\n\n  Ember.registerBoundHelper('pathFrom', function(url, options) {\n    return safe(Travis.Helpers.pathFrom(url));\n  });\n\n  Ember.registerBoundHelper('formatMessage', function(message, options) {\n    return safe(Travis.Helpers.formatMessage(message, options));\n  });\n\n  Ember.registerBoundHelper('formatConfig', function(config, options) {\n    return safe(Travis.Helpers.formatConfig(config));\n  });\n\n  Ember.registerBoundHelper('formatLog', function(log, options) {\n    var item, parentView, repo;\n    parentView = this.get('parentView');\n    repo = parentView.get(options.repo);\n    item = parentView.get(options.item);\n    return Travis.Helpers.formatLog(log, repo, item) || '';\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers/handlebars");minispade.register('helpers/helpers', "(function() {(function() {\nminispade.require('travis/log');\nminispade.require('config/emoij');\n\n  this.Travis.Helpers = {\n    compact: function(object) {\n      var key, result, value, _ref;\n      result = {};\n      _ref = object || {};\n      for (key in _ref) {\n        value = _ref[key];\n        if (!$.isEmpty(value)) {\n          result[key] = value;\n        }\n      }\n      return result;\n    },\n    safe: function(string) {\n      return new Handlebars.SafeString(string);\n    },\n    colorForResult: function(result) {\n      if (result === 0) {\n        return 'green';\n      } else {\n        if (result === 1) {\n          return 'red';\n        } else {\n          return null;\n        }\n      }\n    },\n    formatCommit: function(sha, branch) {\n      return Travis.Helpers.formatSha(sha) + (branch ? \" (\" + branch + \")\" : '');\n    },\n    formatSha: function(sha) {\n      return (sha || '').substr(0, 7);\n    },\n    formatConfig: function(config) {\n      var values;\n      config = $.only(config, 'rvm', 'gemfile', 'env', 'otp_release', 'php', 'node_js', 'scala', 'jdk', 'python', 'perl');\n      values = $.map(config, function(value, key) {\n        value = (value && value.join ? value.join(', ') : value) || '';\n        return '%@: %@'.fmt($.camelize(key), value);\n      });\n      if (values.length === 0) {\n        return '-';\n      } else {\n        return values.join(', ');\n      }\n    },\n    formatMessage: function(message, options) {\n      message = message || '';\n      if (options.short) {\n        message = message.split(/\\n/)[0];\n      }\n      return this._emojize(this._escape(message)).replace(/\\n/g, '<br/>');\n    },\n    formatLog: function(log, repo, item) {\n      var event, url;\n      event = item.constructor === Travis.Build ? 'showBuild' : 'showJob';\n      url = Travis.app.get('router').urlForEvent(event, repo, item);\n      return Travis.Log.filter(log, url);\n    },\n    pathFrom: function(url) {\n      return (url || '').split('/').pop();\n    },\n    timeAgoInWords: function(date) {\n      return $.timeago.distanceInWords(date);\n    },\n    durationFrom: function(started, finished) {\n      started = started && this._toUtc(new Date(this._normalizeDateString(started)));\n      finished = finished ? this._toUtc(new Date(this._normalizeDateString(finished))) : this._nowUtc();\n      if (started && finished) {\n        return Math.round((finished - started) / 1000);\n      } else {\n        return 0;\n      }\n    },\n    timeInWords: function(duration) {\n      var days, hours, minutes, result, seconds;\n      days = Math.floor(duration / 86400);\n      hours = Math.floor(duration % 86400 / 3600);\n      minutes = Math.floor(duration % 3600 / 60);\n      seconds = duration % 60;\n      if (days > 0) {\n        return 'more than 24 hrs';\n      } else {\n        result = [];\n        if (hours === 1) {\n          result.push(hours + ' hr');\n        }\n        if (hours > 1) {\n          result.push(hours + ' hrs');\n        }\n        if (minutes > 0) {\n          result.push(minutes + ' min');\n        }\n        if (seconds > 0) {\n          result.push(seconds + ' sec');\n        }\n        if (result.length > 0) {\n          return result.join(' ');\n        } else {\n          return '-';\n        }\n      }\n    },\n    _normalizeDateString: function(string) {\n      if (window.JHW) {\n        string = string.replace('T', ' ').replace(/-/g, '/');\n        string = string.replace('Z', '').replace(/\\..*$/, '');\n      }\n      return string;\n    },\n    _nowUtc: function() {\n      return this._toUtc(new Date());\n    },\n    _toUtc: function(date) {\n      return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());\n    },\n    _emojize: function(text) {\n      var emojis;\n      emojis = text.match(/:\\S+?:/g);\n      if (emojis !== null) {\n        $.each(emojis.uniq(), function(ix, emoji) {\n          var image, strippedEmoji;\n          strippedEmoji = emoji.substring(1, emoji.length - 1);\n          if (EmojiDictionary.indexOf(strippedEmoji) !== -1) {\n            image = '<img class=\\'emoji\\' title=\\'' + emoji + '\\' alt=\\'' + emoji + '\\' src=\\'' + '/images/emoji/' + strippedEmoji + '.png\\'/>';\n            return text = text.replace(new RegExp(emoji, 'g'), image);\n          }\n        });\n      }\n      return text;\n    },\n    _escape: function(text) {\n      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers/helpers");minispade.register('helpers/urls', "(function() {(function() {\n\n  this.Travis.Urls = {\n    repo: function(slug) {\n      return \"/\" + slug;\n    },\n    builds: function(slug) {\n      return \"/\" + slug + \"/builds\";\n    },\n    pullRequests: function(slug) {\n      return \"/\" + slug + \"/pull_requests\";\n    },\n    branches: function(slug) {\n      return \"/\" + slug + \"/branches\";\n    },\n    build: function(slug, id) {\n      return \"/\" + slug + \"/builds/\" + id;\n    },\n    job: function(slug, id) {\n      return \"/\" + slug + \"/jobs/\" + id;\n    },\n    githubCommit: function(slug, sha) {\n      return \"http://github.com/\" + slug + \"/commit/\" + sha;\n    },\n    githubRepo: function(slug) {\n      return \"http://github.com/\" + slug;\n    },\n    githubWatchers: function(slug) {\n      return \"http://github.com/\" + slug + \"/watchers\";\n    },\n    githubNetwork: function(slug) {\n      return \"http://github.com/\" + slug + \"/network\";\n    },\n    githubAdmin: function(slug) {\n      return \"http://github.com/\" + slug + \"/admin/hooks#travis_minibucket\";\n    },\n    statusImage: function(slug, branch) {\n      return (\"https://secure.travis-ci.org/\" + slug + \".png\") + (branch ? \"?branch=\" + branch : '');\n    },\n    email: function(email) {\n      return \"mailto:\" + email;\n    },\n    account: function(login) {\n      return \"/profile/\" + login;\n    },\n    user: function(login) {\n      return \"/profile/\" + login + \"/me\";\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers/urls");minispade.register('models', "(function() {(function() {\nminispade.require('models/extensions');\nminispade.require('models/account');\nminispade.require('models/artifact');\nminispade.require('models/broadcast');\nminispade.require('models/branch');\nminispade.require('models/build');\nminispade.require('models/commit');\nminispade.require('models/event');\nminispade.require('models/hook');\nminispade.require('models/job');\nminispade.require('models/repo');\nminispade.require('models/sponsor');\nminispade.require('models/user');\nminispade.require('models/worker');\n\n}).call(this);\n\n})();\n//@ sourceURL=models");minispade.register('models/account', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Account = Travis.Model.extend({\n    primaryKey: 'login',\n    login: DS.attr('string'),\n    name: DS.attr('string'),\n    type: DS.attr('string'),\n    reposCount: DS.attr('number'),\n    urlGithub: (function() {\n      return \"http://github.com/\" + (this.get('login'));\n    }).property()\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/account");minispade.register('models/artifact', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Artifact = Travis.Model.extend({\n    body: DS.attr('string'),\n    init: function() {\n      this._super.apply(this, arguments);\n      this.set('queue', Ember.A([]));\n      this.addObserver('body', this.fetchWorker);\n      return this.fetchWorker();\n    },\n    append: function(body) {\n      if (this.get('isLoaded')) {\n        return this.set('body', this.get('body') + body);\n      } else {\n        return this.get('queue').pushObject(body);\n      }\n    },\n    recordDidLoad: (function() {\n      var queue;\n      if (this.get('isLoaded')) {\n        queue = this.get('queue');\n        if (queue.get('length') > 0) {\n          return this.append(queue.toArray().join(''));\n        }\n      }\n    }).observes('isLoaded'),\n    fetchWorker: function() {\n      var body, line, match, worker;\n      if (body = this.get('body')) {\n        line = body.split(\"\\n\")[0];\n        if (line && (match = line.match(/Using worker: (.*)/))) {\n          if (worker = match[1]) {\n            worker = worker.trim().split(':')[0];\n            this.set('workerName', worker);\n            return this.removeObserver('body', this.fetchWorker);\n          }\n        }\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/artifact");minispade.register('models/branch', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Branch = Travis.Model.extend(Travis.Helpers, {\n    repoId: DS.attr('number', {\n      key: 'repository_id'\n    }),\n    commitId: DS.attr('number'),\n    number: DS.attr('number'),\n    branch: DS.attr('string'),\n    message: DS.attr('string'),\n    result: DS.attr('number'),\n    duration: DS.attr('number'),\n    startedAt: DS.attr('string'),\n    finishedAt: DS.attr('string'),\n    commit: DS.belongsTo('Travis.Commit'),\n    repo: (function() {\n      if (this.get('repoId')) {\n        return Travis.Repo.find(this.get('repoId'));\n      }\n    }).property('repoId'),\n    updateTimes: function() {\n      this.notifyPropertyChange('started_at');\n      return this.notifyPropertyChange('finished_at');\n    }\n  });\n\n  this.Travis.Branch.reopenClass({\n    byRepoId: function(id) {\n      return this.find({\n        repository_id: id\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/branch");minispade.register('models/broadcast', "(function() {(function() {\n  var __indexOf = [].indexOf || function(item) { for (var i = 0, l = this.length; i < l; i++) { if (i in this && this[i] === item) return i; } return -1; };\nminispade.require('travis/model');\n\n  this.Travis.Broadcast = Travis.Model.extend({\n    message: DS.attr('string'),\n    toObject: function() {\n      return {\n        type: 'broadcast',\n        id: this.get('id'),\n        message: this.get('message')\n      };\n    },\n    isSeen: (function() {\n      var _ref;\n      return _ref = this.get('id'), __indexOf.call(Travis.Broadcast.seen, _ref) >= 0;\n    }).property(),\n    setSeen: function() {\n      Travis.Broadcast.seen.pushObject(this.get('id'));\n      localStorage.setItem('travis.seen_broadcasts', JSON.stringify(Travis.Broadcast.seen));\n      return this.notifyPropertyChange('isSeen');\n    }\n  });\n\n  this.Travis.Broadcast.reopenClass({\n    seen: Ember.A(JSON.parse(localStorage.getItem('travis.seen_broadcasts')) || [])\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/broadcast");minispade.register('models/build', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Build = Travis.Model.extend(Travis.DurationCalculations, {\n    eventType: DS.attr('string'),\n    repoId: DS.attr('number', {\n      key: 'repository_id'\n    }),\n    commitId: DS.attr('number'),\n    state: DS.attr('string'),\n    number: DS.attr('number'),\n    branch: DS.attr('string'),\n    message: DS.attr('string'),\n    result: DS.attr('number'),\n    _duration: DS.attr('number', {\n      key: 'duration'\n    }),\n    startedAt: DS.attr('string', {\n      key: 'started_at'\n    }),\n    finishedAt: DS.attr('string', {\n      key: 'finished_at'\n    }),\n    repo: DS.belongsTo('Travis.Repo', {\n      key: 'repository_id'\n    }),\n    commit: DS.belongsTo('Travis.Commit'),\n    jobs: DS.hasMany('Travis.Job', {\n      key: 'job_ids'\n    }),\n    config: (function() {\n      return Travis.Helpers.compact(this.get('data.config'));\n    }).property('data.config'),\n    isMatrix: (function() {\n      return this.get('data.job_ids.length') > 1;\n    }).property('data.job_ids.length'),\n    isFinished: (function() {\n      return this.get('state') === 'finished';\n    }).property('state'),\n    requiredJobs: (function() {\n      return this.get('jobs').filter(function(data) {\n        return !data.get('allowFailure');\n      });\n    }).property('jobs.@each.allowFailure'),\n    allowedFailureJobs: (function() {\n      return this.get('jobs').filter(function(data) {\n        return data.get('allowFailure');\n      });\n    }).property('jobs.@each.allowFailure'),\n    configKeys: (function() {\n      var config, headers, key, keys;\n      if (!(config = this.get('config'))) {\n        return [];\n      }\n      keys = $.intersect($.keys(config), Travis.CONFIG_KEYS);\n      headers = (function() {\n        var _i, _len, _ref, _results;\n        _ref = ['build.job', 'build.duration', 'build.finished_at'];\n        _results = [];\n        for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n          key = _ref[_i];\n          _results.push(I18n.t(key));\n        }\n        return _results;\n      })();\n      return $.map(headers.concat(keys), function(key) {\n        return $.camelize(key);\n      });\n    }).property('config'),\n    requeue: (function() {\n      return Travis.ajax.post('/requests', {\n        build_id: this.get('id')\n      });\n    })\n  });\n\n  this.Travis.Build.reopenClass({\n    byRepoId: function(id, parameters) {\n      return this.find($.extend(parameters || {}, {\n        repository_id: id\n      }));\n    },\n    olderThanNumber: function(id, build_number) {\n      return this.find({\n        url: \"/builds\",\n        repository_id: id,\n        after_number: build_number\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/build");minispade.register('models/commit', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Commit = Travis.Model.extend({\n    buildId: DS.attr('number'),\n    sha: DS.attr('string'),\n    branch: DS.attr('string'),\n    message: DS.attr('string'),\n    compareUrl: DS.attr('string'),\n    authorName: DS.attr('string'),\n    authorEmail: DS.attr('string'),\n    committerName: DS.attr('string'),\n    committerEmail: DS.attr('string'),\n    build: DS.belongsTo('Travis.Build', {\n      key: 'buildId'\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/commit");minispade.register('models/event', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Event = Travis.Model.extend({\n    event: DS.attr('string'),\n    repoId: DS.attr('number', {\n      key: 'repository_id'\n    }),\n    sourceId: DS.attr('number', {\n      key: 'source_id'\n    }),\n    sourceType: DS.attr('string', {\n      key: 'source_type'\n    }),\n    createdAt: DS.attr('string', {\n      key: 'created_at'\n    }),\n    event_: (function() {\n      return this.get('event');\n    }).property('event'),\n    result: (function() {\n      return this.get('data.data.result');\n    }).property('data.data.result'),\n    message: (function() {\n      return this.get('data.data.message');\n    }).property('data.data.message'),\n    source: (function() {\n      var type;\n      if (type = this.get('sourceType')) {\n        return Travis[type].find(this.get('sourceId'));\n      }\n    }).property('sourceType', 'sourceId')\n  });\n\n  this.Travis.Event.reopenClass({\n    byRepoId: function(id) {\n      return this.find({\n        repository_id: id\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/event");minispade.register('models/extensions', "(function() {(function() {\n\n  Travis.DurationCalculations = Ember.Mixin.create({\n    duration: (function() {\n      var duration;\n      if (duration = this.get('_duration')) {\n        return duration;\n      } else {\n        return Travis.Helpers.durationFrom(this.get('startedAt'), this.get('finishedAt'));\n      }\n    }).property('_duration', 'finishedAt', 'startedAt'),\n    updateTimes: function() {\n      this.notifyPropertyChange('_duration');\n      return this.notifyPropertyChange('finished_at');\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/extensions");minispade.register('models/hook', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Hook = Travis.Model.extend({\n    name: DS.attr('string'),\n    ownerName: DS.attr('string'),\n    description: DS.attr('string'),\n    active: DS.attr('boolean'),\n    account: (function() {\n      return this.get('slug').split('/')[0];\n    }).property('slug'),\n    slug: (function() {\n      return \"\" + (this.get('ownerName')) + \"/\" + (this.get('name'));\n    }).property('ownerName', 'name'),\n    urlGithub: (function() {\n      return \"http://github.com/\" + (this.get('slug'));\n    }).property(),\n    urlGithubAdmin: (function() {\n      return \"http://github.com/\" + (this.get('slug')) + \"/admin/hooks#travis_minibucket\";\n    }).property(),\n    toggle: function() {\n      var transaction;\n      transaction = this.get('store').transaction();\n      transaction.add(this);\n      this.set('active', !this.get('active'));\n      return transaction.commit();\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/hook");minispade.register('models/job', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Job = Travis.Model.extend(Travis.DurationCalculations, {\n    repoId: DS.attr('number', {\n      key: 'repository_id'\n    }),\n    buildId: DS.attr('number'),\n    commitId: DS.attr('number'),\n    logId: DS.attr('number'),\n    queue: DS.attr('string'),\n    state: DS.attr('string'),\n    number: DS.attr('string'),\n    result: DS.attr('number'),\n    _duration: DS.attr('number', {\n      key: 'duration'\n    }),\n    startedAt: DS.attr('string'),\n    finishedAt: DS.attr('string'),\n    allowFailure: DS.attr('boolean', {\n      key: 'allow_failure'\n    }),\n    repo: DS.belongsTo('Travis.Repo', {\n      key: 'repository_id'\n    }),\n    build: DS.belongsTo('Travis.Build', {\n      key: 'build_id'\n    }),\n    commit: DS.belongsTo('Travis.Commit', {\n      key: 'commit_id'\n    }),\n    log: DS.belongsTo('Travis.Artifact', {\n      key: 'log_id'\n    }),\n    config: (function() {\n      return Travis.Helpers.compact(this.get('data.config'));\n    }).property('data.config'),\n    sponsor: (function() {\n      var worker;\n      worker = this.get('log.workerName');\n      if (worker && worker.length) {\n        return Travis.WORKERS[worker] || {\n          name: \"Travis Pro\",\n          url: \"http://travis-ci.com\"\n        };\n      }\n    }).property('log.workerName'),\n    configValues: (function() {\n      var buildConfig, config, keys;\n      config = this.get('config');\n      buildConfig = this.get('build.config');\n      if (config && buildConfig) {\n        keys = $.intersect($.keys(buildConfig), Travis.CONFIG_KEYS);\n        return keys.map(function(key) {\n          return config[key];\n        });\n      } else {\n        return [];\n      }\n    }).property('config'),\n    appendLog: function(text) {\n      var log;\n      if (log = this.get('log')) {\n        return log.append(text);\n      }\n    },\n    subscribe: function() {\n      var id;\n      if (id = this.get('id')) {\n        return Travis.app.pusher.subscribe(\"job-\" + id);\n      }\n    },\n    onStateChange: (function() {\n      if (this.get('state') === 'finished') {\n        return Travis.app.pusher.unsubscribe(\"job-\" + (this.get('id')));\n      }\n    }).observes('state')\n  });\n\n  this.Travis.Job.reopenClass({\n    queued: function(queue) {\n      this.find();\n      return Travis.app.store.filter(this, function(job) {\n        var queued;\n        queued = ['created', 'queued'].indexOf(job.get('state')) !== -1;\n        return queued && (!queue || job.get('queue') === (\"builds.\" + queue));\n      });\n    },\n    findMany: function(ids) {\n      return Travis.app.store.findMany(this, ids);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/job");minispade.register('models/repo', "(function() {(function() {\nminispade.require('travis/expandable_record_array');\nminispade.require('travis/model');\n\n  this.Travis.Repo = Travis.Model.extend({\n    slug: DS.attr('string'),\n    description: DS.attr('string'),\n    lastBuildId: DS.attr('number'),\n    lastBuildNumber: DS.attr('string'),\n    lastBuildResult: DS.attr('number'),\n    lastBuildStartedAt: DS.attr('string'),\n    lastBuildFinishedAt: DS.attr('string'),\n    lastBuild: DS.belongsTo('Travis.Build'),\n    builds: (function() {\n      var array, builds, id;\n      id = this.get('id');\n      builds = Travis.Build.byRepoId(id, {\n        event_type: 'push'\n      });\n      array = Travis.ExpandableRecordArray.create({\n        type: Travis.Build,\n        content: Ember.A([]),\n        store: this.get('store')\n      });\n      array.load(builds);\n      return array;\n    }).property(),\n    pullRequests: (function() {\n      var array, builds, id;\n      id = this.get('id');\n      builds = Travis.Build.byRepoId(id, {\n        event_type: 'pull_request'\n      });\n      array = Travis.ExpandableRecordArray.create({\n        type: Travis.Build,\n        content: Ember.A([]),\n        store: this.get('store')\n      });\n      array.load(builds);\n      return array;\n    }).property(),\n    branches: (function() {\n      return Travis.Branch.byRepoId(this.get('id'));\n    }).property(),\n    events: (function() {\n      return Travis.Event.byRepoId(this.get('id'));\n    }).property(),\n    owner: (function() {\n      return (this.get('slug') || '').split('/')[0];\n    }).property('slug'),\n    name: (function() {\n      return (this.get('slug') || '').split('/')[1];\n    }).property('slug'),\n    lastBuildDuration: (function() {\n      var duration;\n      duration = this.get('data.last_build_duration');\n      if (!duration) {\n        duration = Travis.Helpers.durationFrom(this.get('lastBuildStartedAt'), this.get('lastBuildFinishedAt'));\n      }\n      return duration;\n    }).property('data.last_build_duration', 'lastBuildStartedAt', 'lastBuildFinishedAt'),\n    sortOrder: (function() {\n      var lastBuildFinishedAt;\n      if (lastBuildFinishedAt = this.get('lastBuildFinishedAt')) {\n        return -new Date(lastBuildFinishedAt).getTime();\n      } else {\n        return -new Date('9999').getTime() - parseInt(this.get('lastBuildId'));\n      }\n    }).property('lastBuildFinishedAt', 'lastBuildId'),\n    stats: (function() {\n      var _this = this;\n      return this.get('_stats') || $.get(\"https://api.github.com/repos/\" + (this.get('slug')), function(data) {\n        _this.set('_stats', data);\n        return _this.notifyPropertyChange('stats');\n      }) && {};\n    }).property(),\n    updateTimes: function() {\n      return this.notifyPropertyChange('lastBuildDuration');\n    }\n  });\n\n  this.Travis.Repo.reopenClass({\n    recent: function() {\n      return this.find();\n    },\n    ownedBy: function(login) {\n      return this.find({\n        owner_name: login,\n        orderBy: 'name'\n      });\n    },\n    accessibleBy: function(login) {\n      return this.find({\n        member: login,\n        orderBy: 'name'\n      });\n    },\n    search: function(query) {\n      return this.find({\n        search: query,\n        orderBy: 'name'\n      });\n    },\n    bySlug: function(slug) {\n      var repo;\n      repo = $.select(this.find().toArray(), function(repo) {\n        return repo.get('slug') === slug;\n      });\n      if (repo.length > 0) {\n        return repo;\n      } else {\n        return this.find({\n          slug: slug\n        });\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/repo");minispade.register('models/sponsor', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Sponsor = Travis.Model.extend({\n    type: DS.attr('string'),\n    url: DS.attr('string'),\n    link: DS.attr('string'),\n    image: (function() {\n      return \"/images/sponsors/\" + (this.get('data.image'));\n    }).property('data.image')\n  });\n\n  Travis.Sponsor.reopenClass({\n    decks: function() {\n      return this.platinum().concat(this.gold());\n    },\n    platinum: function() {\n      var platinum, sponsor, _i, _len, _results;\n      platinum = this.byType('platinum').toArray();\n      _results = [];\n      for (_i = 0, _len = platinum.length; _i < _len; _i++) {\n        sponsor = platinum[_i];\n        _results.push([sponsor]);\n      }\n      return _results;\n    },\n    gold: function() {\n      var gold, _results;\n      gold = this.byType('gold').toArray();\n      _results = [];\n      while (gold.length > 0) {\n        _results.push(gold.splice(0, 2));\n      }\n      return _results;\n    },\n    links: function() {\n      return this.byType('silver');\n    },\n    byType: function() {\n      var types;\n      types = Array.prototype.slice.apply(arguments);\n      return Travis.Sponsor.filter(function(sponsor) {\n        return types.indexOf(sponsor.get('type')) !== -1;\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/sponsor");minispade.register('models/user', "(function() {(function() {\nminispade.require('travis/ajax');\nminispade.require('travis/model');\n\n  this.Travis.User = Travis.Model.extend({\n    name: DS.attr('string'),\n    email: DS.attr('string'),\n    login: DS.attr('string'),\n    token: DS.attr('string'),\n    locale: DS.attr('string'),\n    gravatarId: DS.attr('string'),\n    isSyncing: DS.attr('boolean'),\n    syncedAt: DS.attr('string'),\n    repoCount: DS.attr('number'),\n    init: function() {\n      if (this.get('isSyncing')) {\n        this.poll();\n      }\n      this._super();\n      return Ember.run.next(this, function() {\n        var transaction;\n        transaction = this.get('store').transaction();\n        return transaction.add(this);\n      });\n    },\n    urlGithub: (function() {\n      return \"https://github.com/\" + (this.get('login'));\n    }).property(),\n    permissions: (function() {\n      var _this = this;\n      if (!this.permissions) {\n        this.permissions = Ember.ArrayProxy.create({\n          content: []\n        });\n        Travis.ajax.get('/users/permissions', function(data) {\n          return _this.permissions.set('content', data.permissions);\n        });\n      }\n      return this.permissions;\n    }).property(),\n    updateLocale: function(locale) {\n      var observer, self, transaction;\n      this.setWithSession('locale', locale);\n      transaction = this.get('transaction');\n      transaction.commit();\n      self = this;\n      observer = function() {\n        if (!self.get('isSaving')) {\n          self.removeObserver('isSaving', observer);\n          transaction = self.get('store').transaction();\n          return transaction.add(self);\n        }\n      };\n      return this.addObserver('isSaving', observer);\n    },\n    type: (function() {\n      return 'user';\n    }).property(),\n    sync: function() {\n      Travis.ajax.post('/users/sync');\n      this.setWithSession('isSyncing', true);\n      return this.poll();\n    },\n    poll: function() {\n      var _this = this;\n      return Travis.ajax.get('/users', function(data) {\n        if (data.user.is_syncing) {\n          return Ember.run.later(_this, _this.poll.bind(_this), 3000);\n        } else {\n          _this.set('isSyncing', false);\n          return _this.setWithSession('syncedAt', data.user.synced_at);\n        }\n      });\n    },\n    setWithSession: function(name, value) {\n      var user;\n      this.set(name, value);\n      user = JSON.parse(typeof sessionStorage !== \"undefined\" && sessionStorage !== null ? sessionStorage.getItem('travis.user') : void 0);\n      user[$.underscore(name)] = this.get(name);\n      return typeof sessionStorage !== \"undefined\" && sessionStorage !== null ? sessionStorage.setItem('travis.user', JSON.stringify(user)) : void 0;\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/user");minispade.register('models/worker', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Worker = Travis.Model.extend({\n    state: DS.attr('string'),\n    name: DS.attr('string'),\n    host: DS.attr('string'),\n    lastSeenAt: DS.attr('string'),\n    payload: (function() {\n      return this.get('data.payload');\n    }).property('data.payload'),\n    number: (function() {\n      return this.get('name').match(/\\d+$/)[0];\n    }).property('name'),\n    isWorking: (function() {\n      return this.get('state') === 'working';\n    }).property('state'),\n    jobId: (function() {\n      return this.get('payload.job.id');\n    }).property('payload.job.id'),\n    job: (function() {\n      return Travis.Job.find(this.get('job_id'));\n    }).property('jobId'),\n    repo: (function() {\n      return Travis.Repo.find(this.get('payload.repository.id') || this.get('payload.repo.id'));\n    }).property('payload.repository.id', 'payload.repo.id'),\n    repoSlug: (function() {\n      return this.get('payload.repo.slug') || this.get('payload.repository.slug');\n    }).property('payload.repo.slug', 'payload.repository.slug'),\n    nameForSort: (function() {\n      var id, match, name;\n      if (name = this.get('name')) {\n        match = name.match(/(.*?)-(\\d+)/);\n        if (match) {\n          name = match[1];\n          id = match[2].toString();\n          if (id.length < 2) {\n            id = \"00\" + id;\n          } else if (id.length < 3) {\n            id = \"0\" + id;\n          }\n          return \"\" + name + \"-\" + id;\n        }\n      }\n    }).property('name')\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/worker");minispade.register('pusher', "(function() {(function() {\n\n  Travis.Pusher = function(key) {\n    if (key) {\n      this.init(key);\n    }\n    return this;\n  };\n\n  $.extend(Travis.Pusher, {\n    CHANNELS: ['common'],\n    CHANNEL_PREFIX: ''\n  });\n\n  $.extend(Travis.Pusher.prototype, {\n    active_channels: [],\n    init: function(key) {\n      var channel, _i, _len, _ref, _results;\n      Pusher.warn = this.warn.bind(this);\n      this.pusher = new Pusher(key);\n      _ref = Travis.Pusher.CHANNELS;\n      _results = [];\n      for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n        channel = _ref[_i];\n        _results.push(this.subscribe(channel));\n      }\n      return _results;\n    },\n    subscribe: function(channel) {\n      var _this = this;\n      if (this.pusher && this.active_channels.indexOf(channel) === -1) {\n        this.active_channels.push(channel);\n        return this.pusher.subscribe(this.prefix(channel)).bind_all(function(event, data) {\n          return _this.receive(event, data);\n        });\n      }\n    },\n    unsubscribe: function(channel) {\n      var ix;\n      ix = this.active_channels.indexOf(channel);\n      if (this.pusher && ix === -1) {\n        this.active_channels.splice(ix, 1);\n        return this.pusher.unsubscribe(this.prefix(channel));\n      }\n    },\n    prefix: function(channel) {\n      return \"\" + Travis.Pusher.CHANNEL_PREFIX + channel;\n    },\n    receive: function(event, data) {\n      if (event.substr(0, 6) === 'pusher') {\n        return;\n      }\n      if (data.id) {\n        data = this.normalize(event, data);\n      }\n      return Ember.run.next(function() {\n        return Travis.app.store.receive(event, data);\n      });\n    },\n    normalize: function(event, data) {\n      switch (event) {\n        case 'build:started':\n        case 'build:finished':\n          return data;\n        case 'job:created':\n        case 'job:started':\n        case 'job:finished':\n        case 'job:log':\n          if (data.queue) {\n            data.queue = data.queue.replace('builds.', '');\n          }\n          return {\n            job: data\n          };\n        case 'worker:added':\n        case 'worker:updated':\n        case 'worker:removed':\n          return {\n            worker: data\n          };\n      }\n    },\n    warn: function(type, warning) {\n      if (!this.ignoreWarning(warning)) {\n        return console.warn(warning);\n      }\n    },\n    ignoreWarning: function(warning) {\n      var message, _ref;\n      if (message = (_ref = warning.data) != null ? _ref.message : void 0) {\n        return message.indexOf('Existing subscription') === 0 || message.indexOf('No current subscription') === 0;\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=pusher");minispade.register('routes', "(function() {(function() {\n  var defaultRoute, lineNumberRoute;\nminispade.require('travis/location');\n\n  defaultRoute = Ember.Route.extend({\n    route: '/',\n    index: 1000\n  });\n\n  lineNumberRoute = Ember.Route.extend({\n    route: '#L:number',\n    index: 1,\n    connectOutlets: function(router) {\n      return router.saveLineNumberHash();\n    },\n    dynamicSegmentPattern: \"([0-9]+)\"\n  });\n\n  Travis.Router = Ember.Router.extend({\n    location: 'travis',\n    enableLogging: true,\n    initialState: 'loading',\n    showRoot: Ember.Route.transitionTo('root.home.show'),\n    showStats: Ember.Route.transitionTo('root.stats'),\n    showRepo: Ember.Route.transitionTo('root.home.repo.show'),\n    showBuilds: Ember.Route.transitionTo('root.home.repo.builds.index'),\n    showBuild: Ember.Route.transitionTo('root.home.repo.builds.show'),\n    showPullRequests: Ember.Route.transitionTo('root.home.repo.pullRequests'),\n    showBranches: Ember.Route.transitionTo('root.home.repo.branches'),\n    showEvents: Ember.Route.transitionTo('root.home.repo.events'),\n    showJob: Ember.Route.transitionTo('root.home.repo.job'),\n    showProfile: Ember.Route.transitionTo('root.profile'),\n    showAccount: Ember.Route.transitionTo('root.profile.account'),\n    showUserProfile: Ember.Route.transitionTo('root.profile.account.profile'),\n    saveLineNumberHash: function(path) {\n      return Ember.run.next(this, function() {\n        var match;\n        path = path || this.get('location').getURL();\n        if (match = path.match(/#L\\d+$/)) {\n          return this.set('repoController.lineNumberHash', match[0]);\n        }\n      });\n    },\n    reload: function() {\n      var url;\n      console.log('Triggering reload');\n      url = this.get('location').getURL();\n      this.transitionTo('loading');\n      return Ember.run.next(this, function() {\n        return this.route(url);\n      });\n    },\n    signedIn: function() {\n      return !!Travis.app.get('auth.user');\n    },\n    needsAuth: function(path) {\n      return path.indexOf('/profile') === 0;\n    },\n    afterSignOut: function() {\n      return this.authorize('/');\n    },\n    loading: Ember.Route.extend({\n      routePath: function(router, path) {\n        router.saveLineNumberHash(path);\n        router.authorize(path);\n        if (!router.signedIn()) {\n          return Travis.app.autoSignIn();\n        }\n      }\n    }),\n    authorize: function(path) {\n      if (!this.signedIn() && this.needsAuth(path)) {\n        Travis.app.storeAfterSignInPath(path);\n        return this.transitionTo('root.auth');\n      } else {\n        this.transitionTo('root');\n        return this.route(path);\n      }\n    },\n    root: Ember.Route.extend({\n      route: '/',\n      loading: Ember.State.extend(),\n      afterSignIn: (function() {}),\n      auth: Ember.Route.extend({\n        route: '/auth',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('simple');\n          $('body').attr('id', 'auth');\n          router.get('applicationController').connectOutlet('top', 'top');\n          return router.get('applicationController').connectOutlet('main', 'signin');\n        },\n        afterSignIn: function(router, path) {\n          return router.route(path || '/');\n        }\n      }),\n      stats: Ember.Route.extend({\n        route: '/stats',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('simple');\n          $('body').attr('id', 'stats');\n          router.get('applicationController').connectOutlet('top', 'top');\n          return router.get('applicationController').connectOutlet('main', 'stats');\n        }\n      }),\n      profile: Ember.Route.extend({\n        initialState: 'index',\n        route: '/profile',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('profile');\n          $('body').attr('id', 'profile');\n          router.get('accountsController').set('content', Travis.Account.find());\n          router.get('applicationController').connectOutlet('top', 'top');\n          return router.get('applicationController').connectOutlet('left', 'accounts');\n        },\n        index: Ember.Route.extend({\n          route: '/',\n          connectOutlets: function(router) {\n            router.get('applicationController').connectOutlet('main', 'profile');\n            return router.get('profileController').activate('hooks');\n          }\n        }),\n        account: Ember.Route.extend({\n          initialState: 'index',\n          route: '/:login',\n          connectOutlets: function(router, account) {\n            var params;\n            if (account) {\n              params = {\n                login: account.get('login')\n              };\n              return router.get('profileController').setParams(params);\n            } else {\n              return router.send('showProfile');\n            }\n          },\n          deserialize: function(router, params) {\n            var account, controller, deferred, observer;\n            controller = router.get('accountsController');\n            if (!controller.get('content')) {\n              controller.set('content', Travis.Account.find());\n            }\n            account = controller.findByLogin(params.login);\n            if (account) {\n              return account;\n            } else {\n              deferred = $.Deferred();\n              observer = function() {\n                if (account = controller.findByLogin(params.login)) {\n                  controller.removeObserver('content.length', observer);\n                  return deferred.resolve(account);\n                }\n              };\n              controller.addObserver('content.length', observer);\n              return deferred.promise();\n            }\n          },\n          serialize: function(router, account) {\n            if (account) {\n              return {\n                login: account.get('login')\n              };\n            } else {\n              return {};\n            }\n          },\n          index: Ember.Route.extend({\n            route: '/',\n            connectOutlets: function(router) {\n              return router.get('profileController').activate('hooks');\n            }\n          }),\n          profile: Ember.Route.extend({\n            route: '/profile',\n            connectOutlets: function(router) {\n              return router.get('profileController').activate('user');\n            }\n          })\n        })\n      }),\n      home: Ember.Route.extend({\n        route: '/',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('home');\n          $('body').attr('id', 'home');\n          router.get('applicationController').connectOutlet('left', 'repos');\n          router.get('applicationController').connectOutlet('right', 'sidebar');\n          router.get('applicationController').connectOutlet('top', 'top');\n          router.get('applicationController').connectOutlet('main', 'repo');\n          router.get('applicationController').connectOutlet('flash', 'flash');\n          return router.get('repoController').set('repos', router.get('reposController'));\n        },\n        show: Ember.Route.extend({\n          route: '/',\n          connectOutlets: function(router) {\n            return router.get('repoController').activate('index');\n          },\n          initialState: 'default',\n          \"default\": defaultRoute,\n          lineNumber: lineNumberRoute\n        }),\n        showWithLineNumber: Ember.Route.extend({\n          route: '/#/L:number',\n          connectOutlets: function(router) {\n            return router.get('repoController').activate('index');\n          }\n        }),\n        repo: Ember.Route.extend({\n          route: '/:owner/:name',\n          dynamicSegmentPattern: \"([^/#]+)\",\n          connectOutlets: function(router, repo) {\n            return router.get('repoController').set('repo', repo);\n          },\n          deserialize: function(router, params) {\n            var deferred, observer, repos, slug;\n            slug = \"\" + params.owner + \"/\" + params.name;\n            repos = Travis.Repo.bySlug(slug);\n            deferred = $.Deferred();\n            observer = function() {\n              if (repos.get('isLoaded')) {\n                repos.removeObserver('isLoaded', observer);\n                return deferred.resolve(repos.objectAt(0));\n              }\n            };\n            if (repos.length) {\n              deferred.resolve(repos[0]);\n            } else {\n              repos.addObserver('isLoaded', observer);\n            }\n            return deferred.promise();\n          },\n          serialize: function(router, repo) {\n            var name, owner, _ref;\n            if (typeof repo === 'string') {\n              _ref = repo.split('/'), owner = _ref[0], name = _ref[1];\n              return {\n                owner: owner,\n                name: name\n              };\n            } else if (repo) {\n              return {\n                owner: repo.get('owner'),\n                name: repo.get('name')\n              };\n            } else {\n              return {};\n            }\n          },\n          show: Ember.Route.extend({\n            route: '/',\n            connectOutlets: function(router) {\n              return router.get('repoController').activate('current');\n            },\n            initialState: 'default',\n            \"default\": defaultRoute,\n            lineNumber: lineNumberRoute\n          }),\n          builds: Ember.Route.extend({\n            route: '/builds',\n            index: Ember.Route.extend({\n              route: '/',\n              connectOutlets: function(router, repo) {\n                return router.get('repoController').activate('builds');\n              }\n            }),\n            show: Ember.Route.extend({\n              route: '/:build_id',\n              connectOutlets: function(router, build) {\n                if (!build.get) {\n                  build = Travis.Build.find(build);\n                }\n                router.get('repoController').set('build', build);\n                return router.get('repoController').activate('build');\n              },\n              serialize: function(router, build) {\n                if (build.get) {\n                  return {\n                    build_id: build.get('id')\n                  };\n                } else {\n                  return {\n                    build_id: build\n                  };\n                }\n              },\n              deserialize: function(router, params) {\n                var build, deferred, observer;\n                build = Travis.Build.find(params.build_id);\n                if (build.get('id')) {\n                  return build;\n                } else {\n                  deferred = $.Deferred();\n                  observer = function() {\n                    if (build.get('id')) {\n                      build.removeObserver('id', observer);\n                      return deferred.resolve(build);\n                    }\n                  };\n                  build.addObserver('id', observer);\n                  return deferred.promise();\n                }\n              },\n              initialState: 'default',\n              \"default\": defaultRoute,\n              lineNumber: lineNumberRoute,\n              dynamicSegmentPattern: \"([^/#]+)\"\n            })\n          }),\n          pullRequests: Ember.Route.extend({\n            route: '/pull_requests',\n            connectOutlets: function(router, repo) {\n              return router.get('repoController').activate('pull_requests');\n            }\n          }),\n          branches: Ember.Route.extend({\n            route: '/branches',\n            connectOutlets: function(router, repo) {\n              return router.get('repoController').activate('branches');\n            }\n          }),\n          events: Ember.Route.extend({\n            route: '/events',\n            connectOutlets: function(router, repo) {\n              return router.get('repoController').activate('events');\n            }\n          }),\n          job: Ember.Route.extend({\n            route: '/jobs/:job_id',\n            dynamicSegmentPattern: \"([^/#]+)\",\n            connectOutlets: function(router, job) {\n              if (!job.get) {\n                job = Travis.Job.find(job);\n              }\n              router.get('repoController').set('job', job);\n              return router.get('repoController').activate('job');\n            },\n            serialize: function(router, job) {\n              if (job.get) {\n                return {\n                  job_id: job.get('id')\n                };\n              } else {\n                return {\n                  job_id: job\n                };\n              }\n            },\n            deserialize: function(router, params) {\n              var deferred, job, observer;\n              job = Travis.Job.find(params.job_id);\n              if (job.get('id')) {\n                return job;\n              } else {\n                deferred = $.Deferred();\n                observer = function() {\n                  if (job.get('id')) {\n                    job.removeObserver('id', observer);\n                    return deferred.resolve(job);\n                  }\n                };\n                job.addObserver('id', observer);\n                return deferred.promise();\n              }\n            },\n            initialState: 'default',\n            \"default\": defaultRoute,\n            lineNumber: lineNumberRoute\n          })\n        })\n      })\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=routes");minispade.register('slider', "(function() {(function() {\n\n  this.Travis.Slider = function() {\n    if ((typeof localStorage !== \"undefined\" && localStorage !== null ? localStorage.getItem('travis.maximized') : void 0) === 'true') {\n      this.minimize();\n    }\n    return this;\n  };\n\n  $.extend(Travis.Slider.prototype, {\n    persist: function() {\n      return typeof localStorage !== \"undefined\" && localStorage !== null ? localStorage.setItem('travis.maximized', this.isMinimized()) : void 0;\n    },\n    isMinimized: function() {\n      return $('body').hasClass('maximized');\n    },\n    minimize: function() {\n      return $('body').addClass('maximized');\n    },\n    toggle: function() {\n      var element;\n      $('body').toggleClass('maximized');\n      this.persist();\n      element = $('<span></span>');\n      $('#top .profile').append(element);\n      return Em.run.later((function() {\n        return element.remove();\n      }), 10);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=slider");minispade.register('store', "(function() {(function() {\n  var DATA_PROXY,\n    __indexOf = [].indexOf || function(item) { for (var i = 0, l = this.length; i < l; i++) { if (i in this && this[i] === item) return i; } return -1; };\nminispade.require('store/rest_adapter');\n\n  DATA_PROXY = {\n    get: function(name) {\n      return this.savedData[name];\n    }\n  };\n\n  Travis.Store = DS.Store.extend({\n    revision: 4,\n    adapter: Travis.RestAdapter.create(),\n    init: function() {\n      this._super.apply(this, arguments);\n      return this._loadedData = {};\n    },\n    load: function(type, id, hash) {\n      var record, result;\n      result = this._super.apply(this, arguments);\n      if (result && result.clientId) {\n        record = this.findByClientId(type, result.clientId);\n        record.set('incomplete', false);\n        record.set('complete', true);\n      }\n      return result;\n    },\n    merge: function(type, id, hash) {\n      var clientId, data, dataCache, primaryKey, record, recordCache, typeMap;\n      if (hash === void 0) {\n        hash = id;\n        primaryKey = type.proto().primaryKey;\n        Ember.assert(\"A data hash was loaded for a record of type \" + type.toString() + \" but no primary key '\" + primaryKey + \"' was provided.\", hash[primaryKey]);\n        id = hash[primaryKey];\n      }\n      typeMap = this.typeMapFor(type);\n      dataCache = typeMap.cidToHash;\n      clientId = typeMap.idToCid[id];\n      recordCache = this.get('recordCache');\n      if (clientId !== void 0) {\n        if (data = dataCache[clientId]) {\n          delete hash.id;\n          $.extend(data, hash);\n        } else {\n          dataCache[clientId] = hash;\n        }\n        if (record = recordCache[clientId]) {\n          record.send('didChangeData');\n        }\n      } else {\n        clientId = this.pushHash(hash, id, type);\n      }\n      if (clientId) {\n        DATA_PROXY.savedData = hash;\n        this.updateRecordArrays(type, clientId, DATA_PROXY);\n        return {\n          id: id,\n          clientId: clientId\n        };\n      }\n    },\n    receive: function(event, data) {\n      var job, mappings, name, type, _ref;\n      _ref = event.split(':'), name = _ref[0], type = _ref[1];\n      mappings = this.adapter.get('mappings');\n      type = mappings[name];\n      if (event === 'job:log') {\n        if (job = this.find(Travis.Job, data['job']['id'])) {\n          return job.appendLog(data['job']['_log']);\n        }\n      } else if (data[type.singularName()]) {\n        return this._loadOne(this, type, data);\n      } else if (data[type.pluralName()]) {\n        return this._loadMany(this, type, data);\n      } else {\n        if (!type) {\n          throw \"can't load data for \" + name;\n        }\n      }\n    },\n    _loadOne: function(store, type, json) {\n      var job, repo, root;\n      root = type.singularName();\n      if (type === Travis.Build && (json.repository || json.repo)) {\n        this.loadIncomplete(Travis.Repo, json.repository || json.repo);\n      } else if (type === Travis.Worker && json.worker.payload) {\n        if (repo = json.worker.payload.repo || json.worker.payload.repository) {\n          this.loadIncomplete(Travis.Repo, repo);\n        }\n        if (job = json.worker.payload.job) {\n          this.loadIncomplete(Travis.Job, job);\n        }\n      }\n      return this.loadIncomplete(type, json[root]);\n    },\n    addLoadedData: function(type, clientId, hash) {\n      var id, key, loadedData, _base, _base1, _name, _results;\n      id = hash.id;\n      (_base = this._loadedData)[_name = type.toString()] || (_base[_name] = {});\n      loadedData = ((_base1 = this._loadedData[type])[clientId] || (_base1[clientId] = []));\n      _results = [];\n      for (key in hash) {\n        if (!loadedData.contains(key)) {\n          _results.push(loadedData.pushObject(key));\n        } else {\n          _results.push(void 0);\n        }\n      }\n      return _results;\n    },\n    isDataLoadedFor: function(type, clientId, key) {\n      var data, recordsData;\n      if (recordsData = this._loadedData[type.toString()]) {\n        if (data = recordsData[clientId]) {\n          return data.contains(key);\n        }\n      }\n    },\n    loadIncomplete: function(type, hash) {\n      var record, result;\n      result = this.merge(type, hash);\n      if (result && result.clientId) {\n        this.addLoadedData(type, result.clientId, hash);\n        record = this.findByClientId(type, result.clientId);\n        if (!record.get('complete')) {\n          record.loadedAsIncomplete();\n        }\n        this._updateAssociations(type, type.singularName(), hash);\n        return record;\n      }\n    },\n    _loadMany: function(store, type, json) {\n      var root;\n      root = type.pluralName();\n      this.adapter.sideload(store, type, json, root);\n      return this.loadMany(type, json[root]);\n    },\n    _updateAssociations: function(type, name, data) {\n      var _this = this;\n      return Em.get(type, 'associationsByName').forEach(function(key, meta) {\n        var clientId, dataProxy, id, ids, parent, _ref;\n        if (meta.kind === 'belongsTo') {\n          id = data[\"\" + key + \"_id\"];\n          if (clientId = _this.typeMapFor(meta.type).idToCid[id]) {\n            if (parent = _this.findByClientId(meta.type, clientId, id)) {\n              dataProxy = parent.get('data');\n              if (ids = dataProxy.get(\"\" + name + \"_ids\")) {\n                if (_ref = data.id, __indexOf.call(ids, _ref) < 0) {\n                  ids.pushObject(data.id);\n                }\n                return parent.send('didChangeData');\n              }\n            }\n          }\n        }\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=store");minispade.register('store/fixture_adapter', "(function() {(function() {\n\n  this.Travis.FixtureAdapter = DS.Adapter.extend({\n    find: function(store, type, id) {\n      var fixtures;\n      fixtures = type.FIXTURES;\n      Ember.assert(\"Unable to find fixtures for model type \" + type.toString(), !!fixtures);\n      if (fixtures.hasLoaded) {\n        return;\n      }\n      return setTimeout((function() {\n        store.loadMany(type, fixtures);\n        return fixtures.hasLoaded = true;\n      }), 300);\n    },\n    findMany: function() {\n      return this.find.apply(this, arguments);\n    },\n    findAll: function(store, type) {\n      var fixtures, ids;\n      fixtures = type.FIXTURES;\n      Ember.assert(\"Unable to find fixtures for model type \" + type.toString(), !!fixtures);\n      ids = fixtures.map(function(item, index, self) {\n        return item.id;\n      });\n      return store.loadMany(type, ids, fixtures);\n    },\n    findQuery: function(store, type, params, array) {\n      var fixture, fixtures, hashes, key, matches, value;\n      fixtures = type.FIXTURES;\n      Ember.assert(\"Unable to find fixtures for model type \" + type.toString(), !!fixtures);\n      hashes = (function() {\n        var _i, _len, _results;\n        _results = [];\n        for (_i = 0, _len = fixtures.length; _i < _len; _i++) {\n          fixture = fixtures[_i];\n          matches = (function() {\n            var _results1;\n            _results1 = [];\n            for (key in params) {\n              value = params[key];\n              _results1.push(key === 'orderBy' || fixture[key] === value);\n            }\n            return _results1;\n          })();\n          if (matches.reduce(function(a, b) {\n            return a && b;\n          })) {\n            _results.push(fixture);\n          } else {\n            _results.push(null);\n          }\n        }\n        return _results;\n      })();\n      return array.load(hashes.compact());\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=store/fixture_adapter");minispade.register('store/rest_adapter', "(function() {(function() {\nminispade.require('travis/ajax');\nminispade.require('models');\n\n  this.Travis.RestAdapter = DS.RESTAdapter.extend({\n    mappings: {\n      broadcasts: Travis.Broadcast,\n      repositories: Travis.Repo,\n      repository: Travis.Repo,\n      repos: Travis.Repo,\n      repo: Travis.Repo,\n      builds: Travis.Build,\n      build: Travis.Build,\n      commits: Travis.Commit,\n      commit: Travis.Commit,\n      jobs: Travis.Job,\n      job: Travis.Job,\n      account: Travis.Account,\n      accounts: Travis.Account,\n      worker: Travis.Worker,\n      workers: Travis.Worker\n    },\n    plurals: {\n      repositories: 'repositories',\n      repository: 'repositories',\n      repo: 'repos',\n      repos: 'repos',\n      build: 'builds',\n      branch: 'branches',\n      job: 'jobs',\n      worker: 'workers',\n      profile: 'profile'\n    },\n    ajax: function() {\n      return Travis.ajax.ajax.apply(this, arguments);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=store/rest_adapter");minispade.register('tailing', "(function() {(function() {\n\n  this.Travis.Tailing = function() {\n    this.position = $(window).scrollTop();\n    $(window).scroll($.throttle(200, this.onScroll.bind(this)));\n    return this;\n  };\n\n  $.extend(Travis.Tailing.prototype, {\n    options: {\n      timeout: 200\n    },\n    run: function() {\n      this.autoScroll();\n      this.positionButton();\n      if (this.active()) {\n        return Ember.run.later(this.run.bind(this), this.options.timeout);\n      }\n    },\n    toggle: function(event) {\n      if (this.active()) {\n        return this.stop();\n      } else {\n        return this.start();\n      }\n    },\n    active: function() {\n      return $('#tail').hasClass('active');\n    },\n    start: function() {\n      $('#tail').addClass('active');\n      return this.run();\n    },\n    stop: function() {\n      return $('#tail').removeClass('active');\n    },\n    autoScroll: function() {\n      var log, logBottom, win, winBottom;\n      if (!this.active()) {\n        return;\n      }\n      win = $(window);\n      log = $('#log');\n      logBottom = log.offset().top + log.outerHeight() + 40;\n      winBottom = win.scrollTop() + win.height();\n      if (logBottom - winBottom > 0) {\n        return win.scrollTop(logBottom - win.height());\n      }\n    },\n    onScroll: function() {\n      var position;\n      this.positionButton();\n      position = $(window).scrollTop();\n      if (position < this.position) {\n        this.stop();\n      }\n      return this.position = position;\n    },\n    positionButton: function() {\n      var max, offset, tail;\n      tail = $('#tail');\n      if (tail.length === 0) {\n        return;\n      }\n      offset = $(window).scrollTop() - $('#log').offset().top;\n      max = $('#log').height() - $('#tail').height() + 5;\n      if (offset > max) {\n        offset = max;\n      }\n      if (offset > 0) {\n        return tail.css({\n          top: offset - 2\n        });\n      } else {\n        return tail.css({\n          top: 0\n        });\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=tailing");minispade.register('views', "(function() {(function() {\nminispade.require('ext/ember/namespace');\n\n  this.Travis.reopen({\n    View: Em.View.extend({\n      popup: function(event) {\n        this.popupCloseAll();\n        return $(\"#\" + event.target.name).toggleClass('display');\n      },\n      popupClose: function(event) {\n        return $(event.target).closest('.popup').removeClass('display');\n      },\n      popupCloseAll: function() {\n        return $('.popup').removeClass('display');\n      }\n    })\n  });\nminispade.require('views/accounts');\nminispade.require('views/application');\nminispade.require('views/build');\nminispade.require('views/events');\nminispade.require('views/flash');\nminispade.require('views/job');\nminispade.require('views/repo');\nminispade.require('views/profile');\nminispade.require('views/sidebar');\nminispade.require('views/stats');\nminispade.require('views/signin');\nminispade.require('views/top');\n\n}).call(this);\n\n})();\n//@ sourceURL=views");minispade.register('views/accounts', "(function() {(function() {\n\n  this.Travis.reopen({\n    AccountsView: Travis.View.extend({\n      tabBinding: 'controller.tab',\n      templateName: 'profile/accounts',\n      classAccounts: (function() {\n        if (this.get('tab') === 'accounts') {\n          return 'active';\n        }\n      }).property('tab')\n    }),\n    AccountsListView: Em.CollectionView.extend({\n      elementId: 'accounts',\n      accountBinding: 'content',\n      tagName: 'ul',\n      emptyView: Ember.View.extend({\n        template: Ember.Handlebars.compile('<div class=\"loading\"><span>Loading</span></div>')\n      }),\n      itemViewClass: Travis.View.extend({\n        accountBinding: 'content',\n        typeBinding: 'content.type',\n        selectedBinding: 'account.selected',\n        classNames: ['account'],\n        classNameBindings: ['type', 'selected'],\n        name: (function() {\n          return this.get('content.name') || this.get('content.login');\n        }).property('content.login', 'content.name'),\n        urlAccount: (function() {\n          return Travis.Urls.account(this.get('account.login'));\n        }).property('account.login')\n      })\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/accounts");minispade.register('views/application', "(function() {(function() {\n\n  this.Travis.reopen({\n    ApplicationView: Travis.View.extend({\n      templateName: 'layouts/home',\n      classNames: ['application'],\n      connectLayout: function(name) {\n        name = \"layouts/\" + name;\n        if (this.get('templateName') !== name) {\n          this.set('templateName', name);\n          return this.rerender();\n        }\n      },\n      localeDidChange: (function() {\n        var locale;\n        if (locale = Travis.app.get('auth.user.locale')) {\n          if (Travis.needsLocaleChange(locale)) {\n            Travis.setLocale(locale);\n            return Travis.app.get('router').reload();\n          }\n        }\n      }).observes('Travis.app.auth.user.locale'),\n      click: function(event) {\n        var targetAndParents;\n        targetAndParents = $(event.target).parents().andSelf();\n        if (!(targetAndParents.hasClass('open-popup') || targetAndParents.hasClass('popup'))) {\n          this.popupCloseAll();\n        }\n        if (!targetAndParents.hasClass('menu')) {\n          return $('.menu').removeClass('display');\n        }\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/application");minispade.register('views/build', "(function() {(function() {\n\n  this.Travis.reopen({\n    BuildsView: Travis.View.extend({\n      templateName: 'builds/list',\n      buildsBinding: 'controller.builds',\n      showMore: function() {\n        var id, number;\n        id = this.get('controller.repo.id');\n        number = this.get('builds.lastObject.number');\n        return this.get('builds').load(Travis.Build.olderThanNumber(id, number));\n      },\n      ShowMoreButton: Em.View.extend({\n        tagName: 'button',\n        classNameBindings: ['isLoading'],\n        attributeBindings: ['disabled'],\n        isLoadingBinding: 'controller.builds.isLoading',\n        template: Em.Handlebars.compile('{{view.label}}'),\n        disabledBinding: 'isLoading',\n        label: (function() {\n          if (this.get('isLoading')) {\n            return 'Loading';\n          } else {\n            return 'Show more';\n          }\n        }).property('isLoading'),\n        click: function() {\n          return this.get('parentView').showMore();\n        }\n      })\n    }),\n    BuildsItemView: Travis.View.extend({\n      tagName: 'tr',\n      classNameBindings: ['color'],\n      repoBinding: 'controller.repo',\n      buildBinding: 'context',\n      commitBinding: 'build.commit',\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('build.result'));\n      }).property('build.result'),\n      urlBuild: (function() {\n        return Travis.Urls.build(this.get('repo.slug'), this.get('build.id'));\n      }).property('repo.slug', 'build.id'),\n      urlGithubCommit: (function() {\n        return Travis.Urls.githubCommit(this.get('repo.slug'), this.get('commit.sha'));\n      }).property('repo.slug', 'commit.sha')\n    }),\n    BuildView: Travis.View.extend({\n      templateName: 'builds/show',\n      elementId: 'build',\n      classNameBindings: ['color', 'loading'],\n      repoBinding: 'controller.repo',\n      buildBinding: 'controller.build',\n      commitBinding: 'build.commit',\n      currentItemBinding: 'build',\n      loading: (function() {\n        return !this.get('build.isComplete');\n      }).property('build.isComplete'),\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('build.result'));\n      }).property('build.result'),\n      urlBuild: (function() {\n        return Travis.Urls.build(this.get('repo.slug'), this.get('build.id'));\n      }).property('repo.slug', 'build.id'),\n      urlGithubCommit: (function() {\n        return Travis.Urls.githubCommit(this.get('repo.slug'), this.get('commit.sha'));\n      }).property('repo.slug', 'commit.sha'),\n      urlAuthor: (function() {\n        return Travis.Urls.email(this.get('commit.authorEmail'));\n      }).property('commit.authorEmail'),\n      urlCommitter: (function() {\n        return Travis.Urls.email(this.get('commit.committerEmail'));\n      }).property('commit.committerEmail')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/build");minispade.register('views/events', "(function() {(function() {\n\n  this.Travis.reopen({\n    EventsView: Travis.View.extend({\n      templateName: 'events/list',\n      eventsBinding: 'controller.events'\n    }),\n    EventsItemView: Travis.View.extend({\n      tagName: 'tr'\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/events");minispade.register('views/flash', "(function() {(function() {\n\n  this.Travis.reopen({\n    FlashView: Travis.View.extend({\n      elementId: 'flash',\n      tagName: 'ul',\n      templateName: 'layouts/flash'\n    }),\n    FlashItemView: Travis.View.extend({\n      tagName: 'li',\n      classNameBindings: ['type'],\n      type: (function() {\n        return this.get('flash.type') || 'broadcast';\n      }).property('flash.type'),\n      close: function(event) {\n        return this.get('controller').close(this.get('flash'));\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/flash");minispade.register('views/job', "(function() {(function() {\n\n  this.Travis.reopen({\n    JobsView: Travis.View.extend({\n      templateName: 'jobs/list',\n      buildBinding: 'controller.build'\n    }),\n    JobsItemView: Travis.View.extend({\n      tagName: 'tr',\n      classNameBindings: ['color'],\n      repoBinding: 'context.repo',\n      jobBinding: 'context',\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('job.result'));\n      }).property('job.result'),\n      urlJob: (function() {\n        return Travis.Urls.job(this.get('repo.slug'), this.get('job.id'));\n      }).property('repo.slug', 'job.id')\n    }),\n    JobView: Travis.View.extend({\n      templateName: 'jobs/show',\n      repoBinding: 'controller.repo',\n      jobBinding: 'controller.job',\n      commitBinding: 'job.commit',\n      currentItemBinding: 'job',\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('job.result'));\n      }).property('job.result'),\n      urlJob: (function() {\n        return Travis.Urls.job(this.get('repo.slug'), this.get('job.id'));\n      }).property('repo.slug', 'job.id'),\n      urlGithubCommit: (function() {\n        return Travis.Urls.githubCommit(this.get('repo.slug'), this.get('commit.sha'));\n      }).property('repo.slug', 'commit.sha'),\n      urlAuthor: (function() {\n        return Travis.Urls.email(this.get('commit.authorEmail'));\n      }).property('commit.authorEmail'),\n      urlCommitter: (function() {\n        return Travis.Urls.email(this.get('commit.committerEmail'));\n      }).property('commit.committerEmail')\n    }),\n    LogView: Travis.View.extend({\n      templateName: 'jobs/log',\n      logBinding: 'job.log',\n      scrollTo: function(hash) {\n        $('#main').scrollTop(0);\n        $('html,body').scrollTop($(hash).offset().top);\n        return this.set('controller.lineNumberHash', null);\n      },\n      lineNumberHashDidChange: (function() {\n        return this.tryScrollingToHashLineNumber();\n      }).observes('controller.lineNumberHash'),\n      tryScrollingToHashLineNumber: function() {\n        var checker, hash, self;\n        if (hash = this.get('controller.lineNumberHash')) {\n          self = this;\n          checker = function() {\n            if (self.get('isDestroyed')) {\n              return;\n            }\n            if ($(hash).length) {\n              return self.scrollTo(hash);\n            } else {\n              return setTimeout(checker, 100);\n            }\n          };\n          return checker();\n        }\n      },\n      didInsertElement: function() {\n        this._super.apply(this, arguments);\n        return this.tryScrollingToHashLineNumber();\n      },\n      click: function(event) {\n        var path, target;\n        target = $(event.target);\n        target.closest('.fold').toggleClass('open');\n        if (target.is('.log-line-number')) {\n          path = target.attr('href');\n          Travis.app.get('router').route(path);\n          event.stopPropagation();\n          return false;\n        }\n      },\n      toTop: function() {\n        return $(window).scrollTop(0);\n      },\n      jobBinding: 'context',\n      toggleTailing: function(event) {\n        Travis.app.tailing.toggle();\n        return event.preventDefault();\n      },\n      logSubscriber: (function() {\n        var job, state;\n        job = this.get('job');\n        state = this.get('job.state');\n        if (job && state !== 'finished') {\n          job.subscribe();\n        }\n        return null;\n      }).property('job', 'job.state')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/job");minispade.register('views/left', "(function() {(function() {\n\n  this.Travis.reopen({\n    ReposView: Travis.View.extend({\n      templateName: 'repos/list',\n      tabBinding: 'controller.tab',\n      classRecent: (function() {\n        if (this.get('tab') === 'recent') {\n          return 'active';\n        }\n      }).property('tab'),\n      classOwned: (function() {\n        var classes;\n        classes = [];\n        if (this.get('tab') === 'owned') {\n          classes.push('active');\n        }\n        if (Travis.app.get('currentUser')) {\n          classes.push('display');\n        }\n        return classes.join(' ');\n      }).property('tab', 'Travis.currentUser'),\n      classSearch: (function() {\n        if (this.get('tab') === 'search') {\n          return 'active';\n        }\n      }).property('tab')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/left");minispade.register('views/profile', "(function() {(function() {\n\n  this.Travis.reopen({\n    ProfileView: Travis.View.extend({\n      templateName: 'profile/show',\n      accountBinding: 'controller.account',\n      name: (function() {\n        return this.get('account.name') || this.get('account.login');\n      }).property('account.name', 'account.login')\n    }),\n    ProfileTabsView: Travis.View.extend({\n      templateName: 'profile/tabs',\n      tabBinding: 'controller.tab',\n      activate: function(event) {\n        return this.get('controller').activate(event.target.name);\n      },\n      classHooks: (function() {\n        if (this.get('tab') === 'hooks') {\n          return 'active';\n        }\n      }).property('tab'),\n      classUser: (function() {\n        if (this.get('tab') === 'user') {\n          return 'active';\n        }\n      }).property('tab'),\n      accountBinding: 'controller.account',\n      displayUser: (function() {\n        return this.get('controller.account.login') === this.get('controller.user.login');\n      }).property('controller.account.login', 'controller.user.login')\n    }),\n    HooksView: Travis.View.extend({\n      templateName: 'profile/tabs/hooks',\n      userBinding: 'controller.user',\n      urlGithubAdmin: (function() {\n        return Travis.Urls.githubAdmin(this.get('hook.slug'));\n      }).property('hook.slug')\n    }),\n    UserView: Travis.View.extend({\n      templateName: 'profile/tabs/user',\n      userBinding: 'controller.user',\n      gravatarUrl: (function() {\n        return \"\" + location.protocol + \"//www.gravatar.com/avatar/\" + (this.get('user.gravatarId')) + \"?s=48&d=mm\";\n      }).property('user.gravatarId'),\n      locales: (function() {\n        return [\n          {\n            key: null,\n            name: ''\n          }, {\n            key: 'en',\n            name: 'English'\n          }, {\n            key: 'ca',\n            name: 'Catalan'\n          }, {\n            key: 'cs',\n            name: 'Čeština'\n          }, {\n            key: 'es',\n            name: 'Español'\n          }, {\n            key: 'fr',\n            name: 'Français'\n          }, {\n            key: 'ja',\n            name: '日本語'\n          }, {\n            key: 'nl',\n            name: 'Nederlands'\n          }, {\n            key: 'nb',\n            name: 'Norsk Bokmål'\n          }, {\n            key: 'pl',\n            name: 'Polski'\n          }, {\n            key: {\n              'pt-BR': {\n                name: 'Português brasileiro'\n              }\n            }\n          }, {\n            key: 'ru',\n            name: 'Русский'\n          }\n        ];\n      }).property(),\n      saveLocale: function(event) {\n        return this.get('user').updateLocale($('#locale').val());\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/profile");minispade.register('views/repo', "(function() {(function() {\nminispade.require('views/repo/list');\nminispade.require('views/repo/show');\n\n}).call(this);\n\n})();\n//@ sourceURL=views/repo");minispade.register('views/repo/list', "(function() {(function() {\n\n  this.Travis.reopen({\n    ReposView: Travis.View.extend({\n      templateName: 'repos/list',\n      toggleInfo: function(event) {\n        return $('#repos').toggleClass('open');\n      }\n    }),\n    ReposListView: Em.CollectionView.extend({\n      elementId: 'repos',\n      tagName: 'ul',\n      emptyView: Ember.View.extend({\n        template: Ember.Handlebars.compile('<div class=\"loading\"><span>Loading</span></div>')\n      }),\n      itemViewClass: Travis.View.extend({\n        repoBinding: 'content',\n        classNames: ['repo'],\n        classNameBindings: ['color', 'selected'],\n        selectedBinding: 'repo.selected',\n        color: (function() {\n          return Travis.Helpers.colorForResult(this.get('repo.lastBuildResult'));\n        }).property('repo.lastBuildResult'),\n        urlRepo: (function() {\n          return Travis.Urls.repo(this.get('repo.slug'));\n        }).property('repo.slug'),\n        urlLastBuild: (function() {\n          return Travis.Urls.build(this.get('repo.slug'), this.get('repo.lastBuildId'));\n        }).property('repo.slug', 'repo.lastBuildId')\n      })\n    }),\n    ReposListTabsView: Travis.View.extend({\n      templateName: 'repos/list/tabs',\n      tabBinding: 'controller.tab',\n      activate: function(event) {\n        return this.get('controller').activate(event.target.name);\n      },\n      classRecent: (function() {\n        if (this.get('tab') === 'recent') {\n          return 'active';\n        }\n      }).property('tab'),\n      classOwned: (function() {\n        var classes;\n        classes = [];\n        if (this.get('tab') === 'owned') {\n          classes.push('active');\n        }\n        if (Travis.app.get('currentUser')) {\n          classes.push('display-inline');\n        }\n        return classes.join(' ');\n      }).property('tab', 'Travis.app.currentUser'),\n      classSearch: (function() {\n        if (this.get('tab') === 'search') {\n          return 'active';\n        }\n      }).property('tab')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/repo/list");minispade.register('views/repo/show', "(function() {(function() {\n\n  this.Travis.reopen({\n    RepoView: Travis.View.extend({\n      templateName: 'repos/show',\n      reposBinding: 'controller.repos',\n      repoBinding: 'controller.repo',\n      \"class\": (function() {\n        if (!this.get('repo.isComplete') && !this.get('isEmpty')) {\n          return 'loading';\n        }\n      }).property('repo.isComplete'),\n      isEmpty: (function() {\n        return this.get('repos.isLoaded') && this.get('repos.length') === 0;\n      }).property('repos.length'),\n      urlGithub: (function() {\n        return Travis.Urls.githubRepo(this.get('repo.slug'));\n      }).property('repo.slug'),\n      urlGithubWatchers: (function() {\n        return Travis.Urls.githubWatchers(this.get('repo.slug'));\n      }).property('repo.slug'),\n      urlGithubNetwork: (function() {\n        return Travis.Urls.githubNetwork(this.get('repo.slug'));\n      }).property('repo.slug')\n    }),\n    ReposEmptyView: Travis.View.extend({\n      template: ''\n    }),\n    RepoShowTabsView: Travis.View.extend({\n      templateName: 'repos/show/tabs',\n      repoBinding: 'controller.repo',\n      buildBinding: 'controller.build',\n      jobBinding: 'controller.job',\n      tabBinding: 'controller.tab',\n      classCurrent: (function() {\n        if (this.get('tab') === 'current') {\n          return 'active';\n        }\n      }).property('tab'),\n      classBuilds: (function() {\n        if (this.get('tab') === 'builds') {\n          return 'active';\n        }\n      }).property('tab'),\n      classPullRequests: (function() {\n        if (this.get('tab') === 'pull_requests') {\n          return 'active';\n        }\n      }).property('tab'),\n      classBranches: (function() {\n        if (this.get('tab') === 'branches') {\n          return 'active';\n        }\n      }).property('tab'),\n      classEvents: (function() {\n        if (this.get('tab') === 'events') {\n          return 'active';\n        }\n      }).property('tab'),\n      classBuild: (function() {\n        var classes, tab;\n        tab = this.get('tab');\n        classes = [];\n        if (tab === 'build') {\n          classes.push('active');\n        }\n        if (tab === 'build' || tab === 'job') {\n          classes.push('display-inline');\n        }\n        return classes.join(' ');\n      }).property('tab'),\n      classJob: (function() {\n        if (this.get('tab') === 'job') {\n          return 'active display-inline';\n        }\n      }).property('tab')\n    }),\n    RepoShowToolsView: Travis.View.extend({\n      templateName: 'repos/show/tools',\n      repoBinding: 'controller.repo',\n      buildBinding: 'controller.build',\n      jobBinding: 'controller.job',\n      tabBinding: 'controller.tab',\n      closeMenu: function() {\n        return $('.menu').removeClass('display');\n      },\n      menu: function(event) {\n        var element;\n        this.popupCloseAll();\n        element = $('#tools .menu').toggleClass('display');\n        return event.stopPropagation();\n      },\n      requeue: function() {\n        this.closeMenu();\n        return this.get('build').requeue();\n      },\n      statusImages: function(event) {\n        this.set('active', true);\n        this.closeMenu();\n        this.popup(event);\n        return event.stopPropagation();\n      },\n      canPush: (function() {\n        return this.get('isBuildTab') && this.get('build.isFinished') && this.get('hasPushPermissions');\n      }).property('build.isFinished', 'hasPushPermissions', 'isBuildTab'),\n      isBuildTab: (function() {\n        return ['current', 'build', 'job'].indexOf(this.get('tab')) > -1;\n      }).property('tab'),\n      hasPushPermissions: (function() {\n        var permissions;\n        if (permissions = Travis.app.get('currentUser.permissions')) {\n          return permissions.indexOf(this.get('repo.id')) > -1;\n        }\n      }).property('Travis.app.currentUser.permissions.length', 'repo.id'),\n      branches: (function() {\n        if (this.get('active')) {\n          return this.get('repo.branches');\n        }\n      }).property('active', 'repo.branches'),\n      urlRepo: (function() {\n        return 'https://' + location.host + Travis.Urls.repo(this.get('repo.slug'));\n      }).property('repo.slug'),\n      urlStatusImage: (function() {\n        return Travis.Urls.statusImage(this.get('repo.slug'), this.get('branch.commit.branch'));\n      }).property('repo.slug', 'branch'),\n      markdownStatusImage: (function() {\n        return \"[![Build Status](\" + (this.get('urlStatusImage')) + \")](\" + (this.get('urlRepo')) + \")\";\n      }).property('urlStatusImage'),\n      textileStatusImage: (function() {\n        return \"!\" + (this.get('urlStatusImage')) + \"!:\" + (this.get('urlRepo'));\n      }).property('urlStatusImage'),\n      rdocStatusImage: (function() {\n        return \"{<img src=\\\"\" + (this.get('urlStatusImage')) + \"\\\" alt=\\\"Build Status\\\" />}[\" + (this.get('urlRepo')) + \"]\";\n      }).property('urlStatusImage')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/repo/show");minispade.register('views/sidebar', "(function() {(function() {\n\n  this.Travis.reopen({\n    SidebarView: Travis.View.extend({\n      templateName: 'layouts/sidebar',\n      DecksView: Em.View.extend({\n        templateName: \"sponsors/decks\",\n        controller: Travis.SponsorsController.create({\n          perPage: 1\n        }),\n        didInsertElement: function() {\n          var controller;\n          controller = this.get('controller');\n          if (!controller.get('content')) {\n            Travis.app.get('router.sidebarController').tickables.push(controller);\n            controller.set('content', Travis.Sponsor.decks());\n          }\n          return this._super.apply(this, arguments);\n        }\n      }),\n      LinksView: Em.View.extend({\n        templateName: \"sponsors/links\",\n        controller: Travis.SponsorsController.create({\n          perPage: 6\n        }),\n        didInsertElement: function() {\n          var controller;\n          controller = this.get('controller');\n          if (!controller.get('content')) {\n            controller.set('content', Travis.Sponsor.links());\n            Travis.app.get('router.sidebarController').tickables.push(controller);\n          }\n          return this._super.apply(this, arguments);\n        }\n      }),\n      WorkersView: Em.View.extend({\n        templateName: 'workers/list',\n        controller: Travis.WorkersController.create(),\n        didInsertElement: function() {\n          this.set('controller.content', Travis.Worker.find());\n          return this._super.apply(this, arguments);\n        }\n      }),\n      QueuesView: Em.View.extend({\n        templateName: 'queues/list',\n        controller: Em.ArrayController.create(),\n        didInsertElement: function() {\n          var queue, queues;\n          queues = (function() {\n            var _i, _len, _ref, _results;\n            _ref = Travis.QUEUES;\n            _results = [];\n            for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n              queue = _ref[_i];\n              _results.push(Em.ArrayController.create({\n                content: Travis.Job.queued(queue.name),\n                id: \"queue_\" + queue.name,\n                name: queue.display\n              }));\n            }\n            return _results;\n          })();\n          this.set('controller.content', queues);\n          return this._super.apply(this, arguments);\n        }\n      })\n    }),\n    WorkersView: Travis.View.extend({\n      toggleWorkers: function(event) {\n        var handle;\n        handle = $(event.target).toggleClass('open');\n        if (handle.hasClass('open')) {\n          return $('#workers li').addClass('open');\n        } else {\n          return $('#workers li').removeClass('open');\n        }\n      }\n    }),\n    WorkersListView: Travis.View.extend({\n      toggle: function(event) {\n        return $(event.target).closest('li').toggleClass('open');\n      }\n    }),\n    WorkersItemView: Travis.View.extend({\n      display: (function() {\n        var name, number, payload, repo, state;\n        name = (this.get('worker.name') || '').replace('travis-', '');\n        state = this.get('worker.state');\n        payload = this.get('worker.payload');\n        if (state === 'working' && (payload != null ? payload.repository : void 0) && (payload != null ? payload.build : void 0)) {\n          repo = this.get('worker.repoSlug');\n          number = ' #' + payload.build.number;\n          return (\"<span class='name'>\" + name + \": \" + repo + \"</span> \" + number).htmlSafe();\n        } else {\n          return \"\" + name + \": \" + state;\n        }\n      }).property('worker.state')\n    }),\n    QueueItemView: Travis.View.extend({\n      tagName: 'li'\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/sidebar");minispade.register('views/signin', "(function() {(function() {\n\n  this.Travis.reopen({\n    SigninView: Travis.View.extend({\n      templateName: 'auth/signin',\n      signingIn: (function() {\n        return Travis.app.get('authState') === 'signing-in';\n      }).property('Travis.app.authState')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/signin");minispade.register('views/stats', "(function() {(function() {\n\n  this.Travis.reopen({\n    StatsView: Travis.View.extend({\n      templateName: 'stats/show',\n      didInsertElement: function() {},\n      renderChart: function(config) {\n        var chart;\n        chart = new Highcharts.Chart(config);\n        return this.fetch(config.source, function(data) {\n          var stats;\n          stats = (function() {\n            var _i, _len, _ref, _results;\n            _ref = data.stats;\n            _results = [];\n            for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n              stats = _ref[_i];\n              _results.push(config.map(stats));\n            }\n            return _results;\n          })();\n          return chart.series[0].setData(stats);\n        });\n      },\n      fetch: function(url, callback) {\n        return $.ajax({\n          type: 'GET',\n          url: url,\n          accepts: {\n            json: 'application/vnd.travis-ci.2+json'\n          },\n          success: callback\n        });\n      },\n      CHARTS: {\n        repos: {\n          source: '/api/stats/repos',\n          total: 0,\n          map: function(data) {\n            return [Date.parse(data.date), this.total += parseInt(data.count)];\n          },\n          chart: {\n            renderTo: \"repos_stats\"\n          },\n          title: {\n            text: \"Total Projects/Repositories\"\n          },\n          xAxis: {\n            type: \"datetime\",\n            dateTimeLabelFormats: {\n              month: \"%e. %b\",\n              year: \"%b\"\n            }\n          },\n          yAxis: {\n            title: {\n              text: \"Count\"\n            },\n            min: 0\n          },\n          tooltip: {\n            formatter: function() {\n              return Highcharts.dateFormat(\"%e. %b\", this.x) + \": \" + this.y + \" repos\";\n            }\n          },\n          series: [\n            {\n              name: \"Repository Growth\",\n              data: []\n            }\n          ]\n        },\n        builds: {\n          source: '/api/stats/tests',\n          map: function(data) {\n            return [Date.parse(data.date), parseInt(data.count)];\n          },\n          chart: {\n            renderTo: \"tests_stats\",\n            type: \"column\"\n          },\n          title: {\n            text: \"Build Count\"\n          },\n          subtitle: {\n            text: \"last month\"\n          },\n          xAxis: {\n            type: \"datetime\",\n            dateTimeLabelFormats: {\n              month: \"%e. %b\",\n              year: \"%b\"\n            }\n          },\n          yAxis: {\n            title: {\n              text: \"Count\"\n            },\n            min: 0\n          },\n          tooltip: {\n            formatter: function() {\n              return Highcharts.dateFormat(\"%e. %b\", this.x) + \": \" + this.y + \" builds\";\n            }\n          },\n          series: [\n            {\n              name: \"Total Builds\",\n              data: []\n            }\n          ]\n        }\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/stats");minispade.register('views/top', "(function() {(function() {\n\n  this.Travis.reopen({\n    TopView: Travis.View.extend({\n      templateName: 'layouts/top',\n      tabBinding: 'controller.tab',\n      userBinding: 'controller.user',\n      gravatarUrl: (function() {\n        return \"\" + location.protocol + \"//www.gravatar.com/avatar/\" + (this.get('user.gravatarId')) + \"?s=24&d=mm\";\n      }).property('user.gravatarId'),\n      classHome: (function() {\n        if (this.get('tab') === 'home') {\n          return 'active';\n        }\n      }).property('tab'),\n      classStats: (function() {\n        if (this.get('tab') === 'stats') {\n          return 'active';\n        }\n      }).property('tab'),\n      classProfile: (function() {\n        var classes;\n        classes = ['profile'];\n        if (this.get('tab') === 'profile') {\n          classes.push('active');\n        }\n        classes.push(Travis.app.get('authState'));\n        return classes.join(' ');\n      }).property('tab', 'Travis.app.authState'),\n      showProfile: function() {\n        return $('#top .profile ul').show();\n      },\n      hideProfile: function() {\n        return $('#top .profile ul').hide();\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/top");minispade.register('config/emoij', "(function() {(function() {\n\n  this.EmojiDictionary = ['-1', '0', '1', '109', '2', '3', '4', '5', '6', '7', '8', '8ball', '9', 'a', 'ab', 'airplane', 'alien', 'ambulance', 'angel', 'anger', 'angry', 'apple', 'aquarius', 'aries', 'arrow_backward', 'arrow_down', 'arrow_forward', 'arrow_left', 'arrow_lower_left', 'arrow_lower_right', 'arrow_right', 'arrow_up', 'arrow_upper_left', 'arrow_upper_right', 'art', 'astonished', 'atm', 'b', 'baby', 'baby_chick', 'baby_symbol', 'balloon', 'bamboo', 'bank', 'barber', 'baseball', 'basketball', 'bath', 'bear', 'beer', 'beers', 'beginner', 'bell', 'bento', 'bike', 'bikini', 'bird', 'birthday', 'black_square', 'blue_car', 'blue_heart', 'blush', 'boar', 'boat', 'bomb', 'book', 'boot', 'bouquet', 'bow', 'bowtie', 'boy', 'bread', 'briefcase', 'broken_heart', 'bug', 'bulb', 'bullettrain_front', 'bullettrain_side', 'bus', 'busstop', 'cactus', 'cake', 'calling', 'camel', 'camera', 'cancer', 'capricorn', 'car', 'cat', 'cd', 'chart', 'checkered_flag', 'cherry_blossom', 'chicken', 'christmas_tree', 'church', 'cinema', 'city_sunrise', 'city_sunset', 'clap', 'clapper', 'clock1', 'clock10', 'clock11', 'clock12', 'clock2', 'clock3', 'clock4', 'clock5', 'clock6', 'clock7', 'clock8', 'clock9', 'closed_umbrella', 'cloud', 'clubs', 'cn', 'cocktail', 'coffee', 'cold_sweat', 'computer', 'confounded', 'congratulations', 'construction', 'construction_worker', 'convenience_store', 'cool', 'cop', 'copyright', 'couple', 'couple_with_heart', 'couplekiss', 'cow', 'crossed_flags', 'crown', 'cry', 'cupid', 'currency_exchange', 'curry', 'cyclone', 'dancer', 'dancers', 'dango', 'dart', 'dash', 'de', 'department_store', 'diamonds', 'disappointed', 'dog', 'dolls', 'dolphin', 'dress', 'dvd', 'ear', 'ear_of_rice', 'egg', 'eggplant', 'egplant', 'eight_pointed_black_star', 'eight_spoked_asterisk', 'elephant', 'email', 'es', 'european_castle', 'exclamation', 'eyes', 'factory', 'fallen_leaf', 'fast_forward', 'fax', 'fearful', 'feelsgood', 'feet', 'ferris_wheel', 'finnadie', 'fire', 'fire_engine', 'fireworks', 'fish', 'fist', 'flags', 'flushed', 'football', 'fork_and_knife', 'fountain', 'four_leaf_clover', 'fr', 'fries', 'frog', 'fuelpump', 'gb', 'gem', 'gemini', 'ghost', 'gift', 'gift_heart', 'girl', 'goberserk', 'godmode', 'golf', 'green_heart', 'grey_exclamation', 'grey_question', 'grin', 'guardsman', 'guitar', 'gun', 'haircut', 'hamburger', 'hammer', 'hamster', 'hand', 'handbag', 'hankey', 'hash', 'headphones', 'heart', 'heart_decoration', 'heart_eyes', 'heartbeat', 'heartpulse', 'hearts', 'hibiscus', 'high_heel', 'horse', 'hospital', 'hotel', 'hotsprings', 'house', 'hurtrealbad', 'icecream', 'id', 'ideograph_advantage', 'imp', 'information_desk_person', 'iphone', 'it', 'jack_o_lantern', 'japanese_castle', 'joy', 'jp', 'key', 'kimono', 'kiss', 'kissing_face', 'kissing_heart', 'koala', 'koko', 'kr', 'leaves', 'leo', 'libra', 'lips', 'lipstick', 'lock', 'loop', 'loudspeaker', 'love_hotel', 'mag', 'mahjong', 'mailbox', 'man', 'man_with_gua_pi_mao', 'man_with_turban', 'maple_leaf', 'mask', 'massage', 'mega', 'memo', 'mens', 'metal', 'metro', 'microphone', 'minidisc', 'mobile_phone_off', 'moneybag', 'monkey', 'monkey_face', 'moon', 'mortar_board', 'mount_fuji', 'mouse', 'movie_camera', 'muscle', 'musical_note', 'nail_care', 'necktie', 'new', 'no_good', 'no_smoking', 'nose', 'notes', 'o', 'o2', 'ocean', 'octocat', 'octopus', 'oden', 'office', 'ok', 'ok_hand', 'ok_woman', 'older_man', 'older_woman', 'open_hands', 'ophiuchus', 'palm_tree', 'parking', 'part_alternation_mark', 'pencil', 'penguin', 'pensive', 'persevere', 'person_with_blond_hair', 'phone', 'pig', 'pill', 'pisces', 'plus1', 'point_down', 'point_left', 'point_right', 'point_up', 'point_up_2', 'police_car', 'poop', 'post_office', 'postbox', 'pray', 'princess', 'punch', 'purple_heart', 'question', 'rabbit', 'racehorse', 'radio', 'rage', 'rage1', 'rage2', 'rage3', 'rage4', 'rainbow', 'raised_hands', 'ramen', 'red_car', 'red_circle', 'registered', 'relaxed', 'relieved', 'restroom', 'rewind', 'ribbon', 'rice', 'rice_ball', 'rice_cracker', 'rice_scene', 'ring', 'rocket', 'roller_coaster', 'rose', 'ru', 'runner', 'sa', 'sagittarius', 'sailboat', 'sake', 'sandal', 'santa', 'satellite', 'satisfied', 'saxophone', 'school', 'school_satchel', 'scissors', 'scorpius', 'scream', 'seat', 'secret', 'shaved_ice', 'sheep', 'shell', 'ship', 'shipit', 'shirt', 'shit', 'shoe', 'signal_strength', 'six_pointed_star', 'ski', 'skull', 'sleepy', 'slot_machine', 'smile', 'smiley', 'smirk', 'smoking', 'snake', 'snowman', 'sob', 'soccer', 'space_invader', 'spades', 'spaghetti', 'sparkler', 'sparkles', 'speaker', 'speedboat', 'squirrel', 'star', 'star2', 'stars', 'station', 'statue_of_liberty', 'stew', 'strawberry', 'sunflower', 'sunny', 'sunrise', 'sunrise_over_mountains', 'surfer', 'sushi', 'suspect', 'sweat', 'sweat_drops', 'swimmer', 'syringe', 'tada', 'tangerine', 'taurus', 'taxi', 'tea', 'telephone', 'tennis', 'tent', 'thumbsdown', 'thumbsup', 'ticket', 'tiger', 'tm', 'toilet', 'tokyo_tower', 'tomato', 'tongue', 'top', 'tophat', 'traffic_light', 'train', 'trident', 'trophy', 'tropical_fish', 'truck', 'trumpet', 'tshirt', 'tulip', 'tv', 'u5272', 'u55b6', 'u6307', 'u6708', 'u6709', 'u6e80', 'u7121', 'u7533', 'u7a7a', 'umbrella', 'unamused', 'underage', 'unlock', 'up', 'us', 'v', 'vhs', 'vibration_mode', 'virgo', 'vs', 'walking', 'warning', 'watermelon', 'wave', 'wc', 'wedding', 'whale', 'wheelchair', 'white_square', 'wind_chime', 'wink', 'wink2', 'wolf', 'woman', 'womans_hat', 'womens', 'x', 'yellow_heart', 'zap', 'zzz'];\n\n}).call(this);\n\n})();\n//@ sourceURL=config/emoij");minispade.register('data/sponsors', "(function() {(function() {\n\n  this.Travis.SPONSORS = [\n    {\n      type: 'platinum',\n      url: \"http://www.wooga.com\",\n      image: \"wooga-205x130.png\"\n    }, {\n      type: 'platinum',\n      url: \"http://bendyworks.com\",\n      image: \"bendyworks-205x130.png\"\n    }, {\n      type: 'platinum',\n      url: \"http://cloudcontrol.com\",\n      image: \"cloudcontrol-205x130.png\"\n    }, {\n      type: 'platinum',\n      url: \"http://xing.de\",\n      image: \"xing-205x130.png\"\n    }, {\n      type: 'gold',\n      url: \"http://heroku.com\",\n      image: \"heroku-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://soundcloud.com\",\n      image: \"soundcloud-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://nedap.com\",\n      image: \"nedap-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://mongohq.com\",\n      image: \"mongohq-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://zweitag.de\",\n      image: \"zweitag-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://kanbanery.com\",\n      image: \"kanbanery-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://ticketevolution.com\",\n      image: \"ticketevolution-205x60.jpg\"\n    }, {\n      type: 'gold',\n      url: \"http://plan.io/travis\",\n      image: \"planio-205x60.png\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://cobot.me\\\">Cobot</a><span>: The one tool to run your coworking space</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://jumpstartlab.com\\\">JumpstartLab</a><span>: We build developers</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://evilmartians.com\\\">Evil Martians</a><span>: Agile Ruby on Rails development</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://zendesk.com\\\">Zendesk</a><span>: Love your helpdesk</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://stripe.com\\\">Stripe</a><span>: Payments for developers</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://basho.com\\\">Basho</a><span>: We make Riak!</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://thinkrelevance.com\\\">Relevance</a><span>: We deliver software solutions</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://mindmatters.de\\\">Mindmatters</a><span>: Software für Menschen</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://amenhq.com\\\">Amen</a><span>: The best and worst of everything</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://site5.com\\\">Site5</a><span>: Premium Web Hosting Solutions</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.crowdint.com\\\">Crowd Interactive</a><span>: Leading Rails consultancy in Mexico</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.atomicobject.com/detroit\\\">Atomic Object</a><span>: Work with really smart people</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://codeminer.com.br\\\">Codeminer</a><span>: smart services for your startup</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://cloudant.com\\\">Cloudant</a><span>: grow into your data layer, not out of it</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://gidsy.com\\\">Gidsy</a><span>: Explore, organize &amp; book unique things to do!</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://5apps.com\\\">5apps</a><span>: Package &amp; deploy HTML5 apps automatically</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://meltmedia.com\\\">Meltmedia</a><span>: We are Interactive Superheroes</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.fngtps.com\\\">Fingertips</a><span> offers design and development services</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.engineyard.com\\\">Engine Yard</a><span>: Build epic apps, let us handle the rest</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://malwarebytes.org\\\">Malwarebytes</a><span>: Defeat Malware once and for all.</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://readmill.com\\\">Readmill</a><span>: The best reading app on the iPad.</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.mdsol.com\\\">Medidata</a><span>: clinical tech improving quality of life</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://coderwall.com/teams/4f27194e973bf000040005f0\\\">ESM</a><span>: Japan's best agile Ruby/Rails consultancy</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://twitter.com\\\">Twitter</a><span>: instantly connects people everywhere</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://agileanimal.com\\\">AGiLE ANiMAL</a><span>: we <3 Travis CI.</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://tupalo.com\\\">Tupalo</a><span>: Discover, review &amp; share local businesses.</span>\"\n    }\n  ];\n\n  this.Travis.WORKERS = {\n    \"jvm-otp1.worker.travis-ci.org\": {\n      name: \"Travis Pro\",\n      url: \"http://travis-ci.com\"\n    },\n    \"jvm-otp2.worker.travis-ci.org\": {\n      name: \"Transloadit\",\n      url: \"http://transloadit.com\"\n    },\n    \"ppp1.worker.travis-ci.org\": {\n      name: \"Travis Pro\",\n      url: \"http://beta.travis-ci.com\"\n    },\n    \"ppp2.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    },\n    \"ppp3.worker.travis-ci.org\": {\n      name: \"Alchemy CMS\",\n      url: \"http://alchemy-cms.com/\"\n    },\n    \"rails1.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    },\n    \"ruby1.worker.travis-ci.org\": {\n      name: \"Engine Yard\",\n      url: \"http://www.engineyard.com\"\n    },\n    \"ruby2.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    },\n    \"ruby3.worker.travis-ci.org\": {\n      name: \"Railslove\",\n      url: \"http://railslove.de\"\n    },\n    \"ruby4.worker.travis-ci.org\": {\n      name: \"Engine Yard\",\n      url: \"http://www.engineyard.com\"\n    },\n    \"spree.worker.travis-ci.org\": {\n      name: \"Spree\",\n      url: \"http://spreecommerce.com\"\n    },\n    \"staging.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=data/sponsors");minispade.register('ext/jquery', "(function() {(function() {\n\n  $.fn.extend({\n    outerHtml: function() {\n      return $(this).wrap('<div></div>').parent().html();\n    },\n    outerElement: function() {\n      return $($(this).outerHtml()).empty();\n    },\n    flash: function() {\n      return Utils.flash(this);\n    },\n    unflash: function() {\n      return Utils.unflash(this);\n    },\n    filterLog: function() {\n      this.deansi();\n      return this.foldLog();\n    },\n    deansi: function() {\n      return this.html(Utils.deansi(this.html()));\n    },\n    foldLog: function() {\n      return this.html(Utils.foldLog(this.html()));\n    },\n    unfoldLog: function() {\n      return this.html(Utils.unfoldLog(this.html()));\n    },\n    updateTimes: function() {\n      return Utils.updateTimes(this);\n    },\n    activateTab: function(tab) {\n      return Utils.activateTab(this, tab);\n    },\n    timeInWords: function() {\n      return $(this).each(function() {\n        return $(this).text(Utils.timeInWords(parseInt($(this).attr('title'))));\n      });\n    },\n    updateGithubStats: function(repo) {\n      return Utils.updateGithubStats(repo, $(this));\n    }\n  });\n\n  $.extend({\n    isEmpty: function(obj) {\n      if ($.isArray(obj)) {\n        return !obj.length;\n      } else if ($.isObject(obj)) {\n        return !$.keys(obj).length;\n      } else {\n        return !obj;\n      }\n    },\n    isObject: function(obj) {\n      return Object.prototype.toString.call(obj) === '[object Object]';\n    },\n    keys: function(obj) {\n      var keys;\n      keys = [];\n      $.each(obj, function(key) {\n        return keys.push(key);\n      });\n      return keys;\n    },\n    values: function(obj) {\n      var values;\n      values = [];\n      $.each(obj, function(key, value) {\n        return values.push(value);\n      });\n      return values;\n    },\n    underscore: function(string) {\n      return string[0].toLowerCase() + string.substring(1).replace(/([A-Z])?/g, function(match, chr) {\n        if (chr) {\n          return \"_\" + (chr.toUpperCase());\n        } else {\n          return '';\n        }\n      });\n    },\n    camelize: function(string, uppercase) {\n      string = uppercase === false ? $.underscore(string) : $.capitalize(string);\n      return string.replace(/_(.)?/g, function(match, chr) {\n        if (chr) {\n          return chr.toUpperCase();\n        } else {\n          return '';\n        }\n      });\n    },\n    capitalize: function(string) {\n      return string[0].toUpperCase() + string.substring(1);\n    },\n    compact: function(object) {\n      return $.grep(object, function(value) {\n        return !!value;\n      });\n    },\n    all: function(array, callback) {\n      var args, i;\n      args = Array.prototype.slice.apply(arguments);\n      callback = args.pop();\n      array = args.pop() || this;\n      i = 0;\n      while (i < array.length) {\n        if (callback(array[i])) {\n          return false;\n        }\n        i++;\n      }\n      return true;\n    },\n    detect: function(array, callback) {\n      var args, i;\n      args = Array.prototype.slice.apply(arguments);\n      callback = args.pop();\n      array = args.pop() || this;\n      i = 0;\n      while (i < array.length) {\n        if (callback(array[i])) {\n          return array[i];\n        }\n        i++;\n      }\n    },\n    select: function(array, callback) {\n      var args, i, result;\n      args = Array.prototype.slice.apply(arguments);\n      callback = args.pop();\n      array = args.pop() || this;\n      result = [];\n      i = 0;\n      while (i < array.length) {\n        if (callback(array[i])) {\n          result.push(array[i]);\n        }\n        i++;\n      }\n      return result;\n    },\n    slice: function(object, key) {\n      var keys, result;\n      keys = Array.prototype.slice.apply(arguments);\n      object = (typeof keys[0] === 'object' ? keys.shift() : this);\n      result = {};\n      for (key in object) {\n        if (keys.indexOf(key) > -1) {\n          result[key] = object[key];\n        }\n      }\n      return result;\n    },\n    only: function(object) {\n      var key, keys, result;\n      keys = Array.prototype.slice.apply(arguments);\n      object = (typeof keys[0] === 'object' ? keys.shift() : this);\n      result = {};\n      for (key in object) {\n        if (keys.indexOf(key) !== -1) {\n          result[key] = object[key];\n        }\n      }\n      return result;\n    },\n    except: function(object) {\n      var key, keys, result;\n      keys = Array.prototype.slice.apply(arguments);\n      object = (typeof keys[0] === 'object' ? keys.shift() : this);\n      result = {};\n      for (key in object) {\n        if (keys.indexOf(key) === -1) {\n          result[key] = object[key];\n        }\n      }\n      return result;\n    },\n    intersect: function(array, other) {\n      return array.filter(function(element) {\n        return other.indexOf(element) !== -1;\n      });\n    },\n    map: function(elems, callback, arg) {\n      var i, isArray, key, length, ret, value;\n      value = void 0;\n      key = void 0;\n      ret = [];\n      i = 0;\n      length = elems.length;\n      isArray = elems instanceof jQuery || length !== void 0 && typeof length === 'number' && (length > 0 && elems[0] && elems[length - 1]) || length === 0 || jQuery.isArray(elems);\n      if (isArray) {\n        while (i < length) {\n          value = callback(elems[i], i, arg);\n          if (value != null) {\n            ret[ret.length] = value;\n          }\n          i++;\n        }\n      } else {\n        for (key in elems) {\n          value = callback(elems[key], key, arg);\n          if (value != null) {\n            ret[ret.length] = value;\n          }\n        }\n      }\n      return ret.concat.apply([], ret);\n    },\n    shuffle: function(array) {\n      var current, tmp, top;\n      array = array.slice();\n      top = array.length;\n      while (top && --top) {\n        current = Math.floor(Math.random() * (top + 1));\n        tmp = array[current];\n        array[current] = array[top];\n        array[top] = tmp;\n      }\n      return array;\n    },\n    truncate: function(string, length) {\n      if (string.length > length) {\n        return string.trim().substring(0, length) + '...';\n      } else {\n        return string;\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=ext/jquery");minispade.register('travis/ajax', "(function() {(function() {\n\n  jQuery.support.cors = true;\n\n  this.Travis.ajax = Em.Object.create({\n    DEFAULT_OPTIONS: {\n      accepts: {\n        json: 'application/vnd.travis-ci.2+json'\n      }\n    },\n    get: function(url, callback) {\n      return this.ajax(url, 'get', {\n        success: callback\n      });\n    },\n    post: function(url, data, callback) {\n      return this.ajax(url, 'post', {\n        data: data,\n        success: callback\n      });\n    },\n    ajax: function(url, method, options) {\n      var endpoint, success, token, _base,\n        _this = this;\n      endpoint = Travis.config.api_endpoint || '';\n      options = options || {};\n      if (token = sessionStorage.getItem('travis.token')) {\n        options.headers || (options.headers = {});\n        (_base = options.headers)['Authorization'] || (_base['Authorization'] = \"token \" + token);\n      }\n      options.url = \"\" + endpoint + url;\n      options.type = method;\n      options.dataType = 'json';\n      options.contentType = 'application/json; charset=utf-8';\n      options.context = this;\n      if (options.data && method !== 'GET' && method !== 'get') {\n        options.data = JSON.stringify(options.data);\n      }\n      success = options.success || (function() {});\n      options.success = function(data) {\n        var _ref;\n        if (((_ref = Travis.app) != null ? _ref.router : void 0) && data.flash) {\n          Travis.app.router.flashController.loadFlashes(data.flash);\n        }\n        delete data.flash;\n        return success.call(_this, data);\n      };\n      options.error = function(data) {\n        if (data.flash) {\n          return Travis.app.router.flashController.pushObject(data.flash);\n        }\n      };\n      return $.ajax($.extend(options, Travis.ajax.DEFAULT_OPTIONS));\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/ajax");minispade.register('travis/expandable_record_array', "(function() {(function() {\n\n  Travis.ExpandableRecordArray = DS.RecordArray.extend({\n    isLoaded: false,\n    isLoading: false,\n    load: function(array) {\n      var observer, self;\n      this.set('isLoading', true);\n      self = this;\n      observer = function() {\n        var content;\n        if (this.get('isLoaded')) {\n          content = self.get('content');\n          array.removeObserver('isLoaded', observer);\n          array.forEach(function(record) {\n            return self.pushObject(record);\n          });\n          self.set('isLoading', false);\n          return self.set('isLoaded', true);\n        }\n      };\n      return array.addObserver('isLoaded', observer);\n    },\n    pushObject: function(record) {\n      var clientId, id, ids;\n      ids = this.get('content');\n      id = record.get('id');\n      clientId = record.get('clientId');\n      if (ids.contains(clientId)) {\n        return;\n      }\n      return ids.pushObject(clientId);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/expandable_record_array");minispade.register('travis/limited_array', "(function() {(function() {\n\n  Travis.LimitedArray = Em.ArrayProxy.extend({\n    limit: 10,\n    init: function() {\n      return this._super.apply(this, arguments);\n    },\n    arrangedContent: (function() {\n      var content;\n      if (content = this.get('content')) {\n        return content.slice(0, this.get('limit'));\n      }\n    }).property('content'),\n    contentArrayDidChange: function(array, index, removedCount, addedCount) {\n      var addedObjects, arrangedContent, length, limit, object, _i, _len;\n      this._super.apply(this, arguments);\n      if (addedCount > 0) {\n        addedObjects = array.slice(index, index + addedCount);\n        arrangedContent = this.get('arrangedContent');\n        for (_i = 0, _len = addedObjects.length; _i < _len; _i++) {\n          object = addedObjects[_i];\n          arrangedContent.unshiftObject(object);\n        }\n        limit = this.get('limit');\n        length = arrangedContent.get('length');\n        if (length > limit) {\n          return arrangedContent.replace(limit, length - limit);\n        }\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/limited_array");minispade.register('travis/location', "(function() {(function() {\n\n  Travis.Location = Ember.HistoryLocation.extend({\n    onUpdateURL: function(callback) {\n      var guid;\n      guid = Ember.guidFor(this);\n      return Ember.$(window).bind('popstate.ember-location-' + guid, function(e) {\n        return callback(location.pathname + location.hash);\n      });\n    },\n    getURL: function() {\n      var location;\n      location = this.get('location');\n      return location.pathname + location.hash;\n    },\n    initState: function() {\n      this.replaceState(this.getURL());\n      return Ember.set(this, 'history', window.history);\n    }\n  });\n\n  Ember.Location.implementations['travis'] = Travis.Location;\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/location");minispade.register('travis/log', "(function() {(function() {\n\n  this.Travis.Log = {\n    FOLDS: {\n      schema: /(<p.*?\\/a>\\$ (?:bundle exec )?rake( db:create)? db:schema:load[\\s\\S]*?<p.*?\\/a>-- assume_migrated_upto_version[\\s\\S]*?<\\/p>\\n<p.*?\\/a>.*<\\/p>)/g,\n      migrate: /(<p.*?\\/a>\\$ (?:bundle exec )?rake( db:create)? db:migrate[\\s\\S]*== +\\w+: migrated \\(.*\\) =+)/g,\n      bundle: /(<p.*?\\/a>\\$ bundle install.*<\\/p>\\n(<p.*?\\/a>(Updating|Using|Installing|Fetching|remote:|Receiving|Resolving).*?<\\/p>\\n|<p.*?\\/a><\\/p>\\n)*)/g,\n      exec: /(<p.*?\\/a>[\\/\\w]*.rvm\\/rubies\\/[\\S]*?\\/(ruby|rbx|jruby) .*?<\\/p>)/g\n    },\n    filter: function(log, path) {\n      log = this.escape(log);\n      log = this.deansi(log);\n      log = log.replace(/\\r/g, '');\n      log = this.number(log, path);\n      log = this.fold(log);\n      log = log.replace(/\\n/g, '');\n      return log;\n    },\n    stripPaths: function(log) {\n      return log.replace(/\\/home\\/vagrant\\/builds(\\/[^\\/\\n]+){2}\\//g, '');\n    },\n    escape: function(log) {\n      return Handlebars.Utils.escapeExpression(log);\n    },\n    escapeRuby: function(log) {\n      return log.replace(/#<(\\w+.*?)>/, '#&lt;$1&gt;');\n    },\n    number: function(log, path) {\n      var result;\n      path = \"\" + path + \"/\";\n      result = '';\n      $.each(log.trim().split('\\n'), function(ix, line) {\n        var number, pathWithNumber;\n        number = ix + 1;\n        pathWithNumber = \"\" + path + \"#L\" + number;\n        return result += '<p><a href=\"%@\" id=\"L%@\" class=\"log-line-number\" name=\"L%@\">%@</a>%@</p>\\n'.fmt(pathWithNumber, number, number, number, line);\n      });\n      return result.trim();\n    },\n    deansi: function(log) {\n      var ansi, text;\n      log = log.replace(/\\r\\r/g, '\\r').replace(/\\033\\[K\\r/g, '\\r').replace(/^.*\\r(?!$)/gm, '').replace(/\u001b\\[2K/g, '').replace(/\\033\\(B/g, \"\");\n      ansi = ansiparse(log);\n      text = '';\n      ansi.forEach(function(part) {\n        var classes;\n        classes = [];\n        part.foreground && classes.push(part.foreground);\n        part.background && classes.push('bg-' + part.background);\n        part.bold && classes.push('bold');\n        part.italic && classes.push('italic');\n        return text += (classes.length ? '<span class=\\'' + classes.join(' ') + '\\'>' + part.text + '</span>' : part.text);\n      });\n      return text.replace(/\\033/g, '');\n    },\n    fold: function(log) {\n      log = this.unfold(log);\n      $.each(Travis.Log.FOLDS, function(name, pattern) {\n        return log = log.replace(pattern, function() {\n          return '<div class=\\'fold ' + name + '\\'>' + arguments[1].trim() + '</div>';\n        });\n      });\n      return log;\n    },\n    unfold: function(log) {\n      return log.replace(/<div class='fold[^']*'>([\\s\\S]*?)<\\/div>/g, '$1\\n');\n    },\n    location: function() {\n      return window.location.hash;\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/log");minispade.register('travis/model', "(function() {(function() {\n\n  this.Travis.Model = DS.Model.extend({\n    primaryKey: 'id',\n    id: DS.attr('number'),\n    init: function() {\n      this.loadedAttributes = [];\n      return this._super.apply(this, arguments);\n    },\n    get: function(name) {\n      if (this.constructor.isAttribute(name) && this.get('incomplete') && !this.isAttributeLoaded(name)) {\n        this.loadTheRest();\n      }\n      return this._super.apply(this, arguments);\n    },\n    refresh: function() {\n      var id, store;\n      if (id = this.get('id')) {\n        store = this.get('store');\n        return store.adapter.find(store, this.constructor, id);\n      }\n    },\n    update: function(attrs) {\n      var _this = this;\n      $.each(attrs, function(key, value) {\n        if (key !== 'id') {\n          return _this.set(key, value);\n        }\n      });\n      return this;\n    },\n    isAttributeLoaded: function(name) {\n      var meta;\n      if (meta = Ember.get(this.constructor, 'attributes').get(name)) {\n        name = meta.key(this.constructor);\n        return this.get('store').isDataLoadedFor(this.constructor, this.get('clientId'), name);\n      }\n    },\n    isComplete: (function() {\n      if (this.get('incomplete')) {\n        this.loadTheRest();\n        return false;\n      } else {\n        this.set('isCompleting', false);\n        return this.get('isLoaded');\n      }\n    }).property('incomplete', 'isLoaded'),\n    loadTheRest: function() {\n      if (this.get('isCompleting')) {\n        return;\n      }\n      this.set('isCompleting', true);\n      return this.refresh();\n    },\n    select: function() {\n      return this.constructor.select(this.get('id'));\n    },\n    loadedAsIncomplete: function() {\n      return this.set('incomplete', true);\n    }\n  });\n\n  this.Travis.Model.reopenClass({\n    find: function() {\n      if (arguments.length === 0) {\n        return Travis.app.store.findAll(this);\n      } else {\n        return this._super.apply(this, arguments);\n      }\n    },\n    filter: function(callback) {\n      return Travis.app.store.filter(this, callback);\n    },\n    load: function(attrs) {\n      return Travis.app.store.load(this, attrs);\n    },\n    select: function(id) {\n      return this.find().forEach(function(record) {\n        return record.set('selected', record.get('id') === id);\n      });\n    },\n    buildURL: function(suffix) {\n      var base, url;\n      base = this.url || this.pluralName();\n      Ember.assert('Base URL (' + base + ') must not start with slash', !base || base.toString().charAt(0) !== '/');\n      Ember.assert('URL suffix (' + suffix + ') must not start with slash', !suffix || suffix.toString().charAt(0) !== '/');\n      url = [base];\n      if (suffix !== void 0) {\n        url.push(suffix);\n      }\n      return url.join('/');\n    },\n    singularName: function() {\n      var name, parts;\n      parts = this.toString().split('.');\n      name = parts[parts.length - 1];\n      return name.replace(/([A-Z])/g, '_$1').toLowerCase().slice(1);\n    },\n    pluralName: function() {\n      return Travis.app.store.adapter.pluralize(this.singularName());\n    },\n    isAttribute: function(name) {\n      return Ember.get(this, 'attributes').has(name);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/model");minispade.register('travis/ticker', "(function() {(function() {\n\n  this.Travis.Ticker = Ember.Object.extend({\n    init: function() {\n      if (this.get('interval') !== -1) {\n        return this.schedule();\n      }\n    },\n    tick: function() {\n      var context, target, targets, _i, _len;\n      context = this.get('context');\n      targets = this.get('targets') || [this.get('target')];\n      for (_i = 0, _len = targets.length; _i < _len; _i++) {\n        target = targets[_i];\n        if (context) {\n          target = context.get(target);\n        }\n        if (target) {\n          target.tick();\n        }\n      }\n      return this.schedule();\n    },\n    schedule: function() {\n      var _this = this;\n      return Ember.run.later((function() {\n        return _this.tick();\n      }), this.get('interval') || Travis.app.TICK_INTERVAL);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/ticker");minispade.register('travis', "(function() {(function() {\nminispade.require('ext/jquery');\nminispade.require('ext/ember/namespace');\n\n  this.Travis = Em.Namespace.create({\n    config: {\n      api_endpoint: $('meta[rel=\"travis.api_endpoint\"]').attr('href'),\n      pusher_key: $('meta[name=\"travis.pusher_key\"]').attr('value')\n    },\n    CONFIG_KEYS: ['rvm', 'gemfile', 'env', 'jdk', 'otp_release', 'php', 'node_js', 'perl', 'python', 'scala'],\n    ROUTES: {\n      'profile/:login/me': ['profile', 'user'],\n      'profile/:login': ['profile', 'hooks'],\n      'profile': ['profile', 'hooks'],\n      'stats': ['stats', 'show'],\n      ':owner/:name/jobs/:id/:line': ['home', 'job'],\n      ':owner/:name/jobs/:id': ['home', 'job'],\n      ':owner/:name/builds/:id': ['home', 'build'],\n      ':owner/:name/builds': ['home', 'builds'],\n      ':owner/:name/pull_requests': ['home', 'pullRequests'],\n      ':owner/:name/branches': ['home', 'branches'],\n      ':owner/:name': ['home', 'current'],\n      '': ['home', 'index'],\n      '#': ['home', 'index']\n    },\n    QUEUES: [\n      {\n        name: 'common',\n        display: 'Common'\n      }, {\n        name: 'php',\n        display: 'PHP, Perl and Python'\n      }, {\n        name: 'node_js',\n        display: 'Node.js'\n      }, {\n        name: 'jvmotp',\n        display: 'JVM and Erlang'\n      }, {\n        name: 'rails',\n        display: 'Rails'\n      }, {\n        name: 'spree',\n        display: 'Spree'\n      }\n    ],\n    INTERVALS: {\n      sponsors: -1,\n      times: -1,\n      updateTimes: 1000\n    },\n    setLocale: function(locale) {\n      if (!locale) {\n        return;\n      }\n      I18n.locale = locale;\n      return localStorage.setItem('travis.locale', locale);\n    },\n    needsLocaleChange: function(locale) {\n      return I18n.locale !== locale;\n    },\n    run: function(attrs) {\n      if (location.hash.slice(0, 2) === '#!') {\n        location.href = location.href.replace('#!/', '');\n      }\n      this.setLocale(localStorage.getItem('travis.locale') || 'en');\n      return Ember.run.next(this, function() {\n        var app,\n          _this = this;\n        app = Travis.App.create(attrs || {});\n        $.each(Travis, function(key, value) {\n          if (value && value.isClass && key !== 'constructor') {\n            return app[key] = value;\n          }\n        });\n        this.app = app;\n        this.store = app.store;\n        return $(function() {\n          return app.initialize();\n        });\n      });\n    }\n  });\nminispade.require('travis/ajax');\nminispade.require('app');\n\n}).call(this);\n\n})();\n//@ sourceURL=travis");minispade.register('templates', "(function() {\nEmber.TEMPLATES['auth/signin'] = Ember.Handlebars.compile(\"{{#if view.signingIn}}\\n  <h1>Signing in ...</h1>\\n  <p>\\n    Trying to authenticate with GitHub.\\n  </p>\\n{{else}}\\n  <h1>Sign in</h1>\\n  <p>\\n    <a href=\\\"#\\\" {{action signIn target=\\\"Travis.app\\\"}}>Please sign in with GitHub.</a>\\n  </p>\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['builds/list'] = Ember.Handlebars.compile(\"{{#if builds.isLoaded}}\\n  <table id=\\\"builds\\\" class=\\\"list\\\">\\n    <thead>\\n      <tr>\\n        <th>{{t builds.name}}</th>\\n        <th>{{t builds.commit}}</th>\\n        <th>{{t builds.message}}</th>\\n        <th>{{t builds.duration}}</th>\\n        <th>{{t builds.finished_at}}</th>\\n      </tr>\\n    </thead>\\n\\n    <tbody>\\n      {{#each build in builds}}\\n        {{#view Travis.BuildsItemView contextBinding=\\\"build\\\"}}\\n          <td class=\\\"number\\\">\\n            <span class=\\\"status\\\"></span>\\n            {{#if id}}\\n              <a {{action showBuild repo this href=true}}>\\n                {{number}}\\n              </a>\\n            {{/if}}\\n          </td>\\n          <td class=\\\"commit\\\">\\n            <a {{bindAttr href=\\\"view.urlGithubCommit\\\"}}>\\n              {{formatCommit commit}}\\n            </a>\\n          </td>\\n          <td class=\\\"message\\\">\\n            {{{formatMessage commit.message short=\\\"true\\\"}}}\\n          </td>\\n          <td class=\\\"duration\\\" {{bindAttr title=\\\"duration\\\"}}>\\n            {{formatDuration duration}}\\n          </td>\\n          <td class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>\\n            {{formatTime finishedAt}}\\n          </td>\\n        {{/view}}\\n      {{/each}}\\n    </tbody>\\n  </table>\\n  <p>\\n    {{view view.ShowMoreButton}}\\n  </p>\\n{{else}}\\n  <div class=\\\"loading\\\"><span>Loading</span></div>\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['builds/show'] = Ember.Handlebars.compile(\"{{#with view}}\\n  {{#if loading}}\\n    <span>Loading</span>\\n  {{else}}\\n    <dl id=\\\"summary\\\">\\n      <div class=\\\"left\\\">\\n        <dt>{{t builds.name}}</dt>\\n        <dd class=\\\"number\\\">\\n          <span class=\\\"status\\\"></span>\\n          {{#if build.id}}\\n            <a {{action showBuild repo build href=true}}>{{build.number}}</a>\\n          {{/if}}\\n        </dd>\\n        <dt class=\\\"finished_at_label\\\">{{t builds.finished_at}}</dt>\\n        <dd class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>{{formatTime build.finishedAt}}</dd>\\n        <dt>{{t builds.duration}}</dt>\\n        <dd class=\\\"duration\\\" {{bindAttr title=\\\"startedAt\\\"}}>{{formatDuration build.duration}}</dd>\\n      </div>\\n\\n      <div class=\\\"right\\\">\\n        <dt>{{t builds.commit}}</dt>\\n        <dd class=\\\"commit\\\"><a href=\\\"{{unbound urlGithubCommit}}\\\">{{formatCommit build.commit}}</a></dd>\\n        {{#if commit.compareUrl}}\\n          <dt>{{t builds.compare}}</dt>\\n          <dd class=\\\"compare\\\"><a href=\\\"{{unbound commit.compareUrl}}\\\">{{pathFrom build.commit.compareUrl}}</a></dd>\\n        {{/if}}\\n        {{#if commit.authorName}}\\n          <dt>{{t builds.author}}</dt>\\n          <dd class=\\\"author\\\"><a href=\\\"{{unbound urlAuthor}}\\\">{{build.commit.authorName}}</a></dd>\\n        {{/if}}\\n        {{#if commit.committerName}}\\n          <dt>{{t builds.committer}}</dt>\\n          <dd class=\\\"committer\\\"><a href=\\\"{{unbound urlCommitter}}\\\">{{build.commit.committerName}}</a></dd>\\n        {{/if}}\\n      </div>\\n\\n      <dt>{{t builds.message}}</dt>\\n      <dd class=\\\"message\\\">{{{formatMessage build.commit.message}}}</dd>\\n\\n      {{#unless isMatrix}}\\n        <dt>{{t builds.config}}</dt>\\n        <dd class=\\\"config\\\">{{formatConfig build.config}}</dd>\\n      {{/unless}}\\n    </dl>\\n\\n    {{#if build.isMatrix}}\\n      {{view Travis.JobsView jobsBinding=\\\"build.requiredJobs\\\" required=\\\"true\\\"}}\\n      {{view Travis.JobsView jobsBinding=\\\"build.allowedFailureJobs\\\"}}\\n    {{else}}\\n      {{view Travis.LogView contextBinding=\\\"build.jobs.firstObject\\\"}}\\n    {{/if}}\\n  {{/if}}\\n{{/with}}\\n\");\n\nEmber.TEMPLATES['events/list'] = Ember.Handlebars.compile(\"{{#if view.events.isLoaded}}\\n  <table id=\\\"events\\\" class=\\\"list\\\">\\n    <thead>\\n      <tr>\\n        <th>Time</th>\\n        <th>Event</th>\\n        <th>Result</th>\\n        <th>Message</th>\\n      </tr>\\n    </thead>\\n\\n    <tbody>\\n      {{#each event in view.events}}\\n        {{#view Travis.EventsItemView contextBinding=\\\"event\\\"}}\\n          <td class=\\\"created_at\\\">\\n            {{formatTime createdAt}}\\n          </td>\\n          <td class=\\\"event\\\">\\n            {{event.event_}}\\n          </td>\\n          <td class=\\\"result\\\">\\n            {{event.result}}\\n          </td>\\n          <td class=\\\"message\\\">\\n            {{event.message}}\\n          </td>\\n        {{/view}}\\n      {{/each}}\\n    </tbody>\\n  </table>\\n{{else}}\\n  <div class=\\\"loading\\\"><span>Loading</span></div>\\n{{/if}}\\n\\n\");\n\nEmber.TEMPLATES['jobs/list'] = Ember.Handlebars.compile(\"{{#if view.jobs.length}}\\n  {{#if view.required}}\\n    <table id=\\\"jobs\\\" class=\\\"list\\\">\\n      <caption>\\n        {{t jobs.build_matrix}}\\n      </caption>\\n  {{else}}\\n    <table id=\\\"allowed_failure_jobs\\\" class=\\\"list\\\">\\n      <caption>\\n        {{t jobs.allowed_failures}}\\n        <a title=\\\"What's this?\\\" class=\\\"help open-popup\\\" name=\\\"help-allowed_failures\\\" {{action popup target=\\\"view\\\"}}></a>\\n      </caption>\\n  {{/if}}\\n    <thead>\\n      <tr>\\n        {{#each key in view.build.configKeys}}\\n          <th>{{key}}</th>\\n        {{/each}}\\n      </tr>\\n    </thead>\\n    <tbody>\\n      {{#each job in view.jobs}}\\n        {{#view Travis.JobsItemView contextBinding=\\\"job\\\"}}\\n          <td class=\\\"number\\\">\\n            <span class=\\\"status\\\"></span>\\n            {{#if job.id}}\\n              <a {{action showJob repo job href=true}}>{{number}}</a>\\n            {{/if}}\\n          </td>\\n          <td class=\\\"duration\\\" {{bindAttr title=\\\"startedAt\\\"}}>\\n            {{formatDuration duration}}\\n          </td>\\n          <td class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>\\n            {{formatTime finishedAt}}\\n          </td>\\n          {{#each value in configValues}}\\n            <td>{{value}}</td>\\n          {{/each}}\\n        {{/view}}\\n      {{/each}}\\n    </tbody>\\n  </table>\\n\\n  {{#unless view.required}}\\n    <div id=\\\"help-allowed_failures\\\" class=\\\"popup\\\">\\n      <a href=\\\"#\\\" class=\\\"close\\\" {{action popupClose target=\\\"view\\\"}}></a>\\n      <h4>{{t \\\"jobs.allowed_failures\\\"}}</h4>\\n      <p>\\n        Allowed Failures are items in your build matrix that are allowed to\\n        fail without causing the entire build to be shown as failed.\\n      </p>\\n      <p>\\n        You can define allowed failures in the build matrix as follows:\\n      </p>\\n      <pre>matrix:\\n  allow_failures:\\n    - rvm: ruby-head</pre>\\n      <p>\\n        This lets you add in experimental and preparatory builds to test against versions or\\n        configurations that you are not ready to officially support.\\n      </p>\\n    </div>\\n  {{/unless}}\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['jobs/log'] = Ember.Handlebars.compile(\"{{view.logSubscriber}}\\n\\n{{#if view.job.log.isLoaded}}\\n  <pre id=\\\"log\\\" class=\\\"ansi\\\"><a href=\\\"#\\\" id=\\\"tail\\\" {{action toggleTailing target=\\\"view\\\"}}>\\n    <span class=\\\"status\\\"></span>\\n    <label>Follow logs</label>\\n  </a>{{{formatLog log.body repo=\\\"repository\\\" item=\\\"parentView.currentItem\\\"}}}</pre>\\n\\n  {{#if sponsor.name}}\\n    <p class=\\\"sponsor\\\">\\n    {{t builds.messages.sponsored_by}}\\n      <a {{bindAttr href=\\\"sponsor.url\\\"}}>{{sponsor.name}}</a>\\n    </p>\\n  {{/if}}\\n\\n  <a href='#' class=\\\"to-top\\\" {{action toTop target=\\\"view\\\"}}>To top</a>\\n{{else}}\\n  <div id=\\\"log\\\" class=\\\"loading\\\">\\n    <span>Loading</span>\\n  </div>\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['jobs/show'] = Ember.Handlebars.compile(\"{{#with view}}\\n  {{#if job.isComplete}}\\n    <div {{bindAttr class=\\\"view.color\\\"}}>\\n      <dl id=\\\"summary\\\">\\n        <div class=\\\"left\\\">\\n          <dt>Job</dt>\\n          <dd class=\\\"number\\\">\\n            <span class=\\\"status\\\"></span>\\n            {{#if job.id}}\\n              <a {{action showJob repo job href=true}}>{{job.number}}</a>\\n            {{/if}}\\n          </dd>\\n          <dt class=\\\"finished_at_label\\\">{{t jobs.finished_at}}</dt>\\n          <dd class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>{{formatTime job.finishedAt}}</dd>\\n          <dt>{{t jobs.duration}}</dt>\\n          <dd class=\\\"duration\\\" {{bindAttr title=\\\"startedAt\\\"}}>{{formatDuration job.duration}}</dd>\\n        </div>\\n\\n        <div class=\\\"right\\\">\\n          <dt>{{t jobs.commit}}</dt>\\n          <dd class=\\\"commit\\\"><a {{bindAttr href=\\\"urlGithubCommit\\\"}}>{{formatCommit commit}}</a></dd>\\n          {{#if commit.compareUrl}}\\n            <dt>{{t jobs.compare}}</dt>\\n            <dd class=\\\"compare\\\"><a {{bindAttr href=\\\"commit.compareUrl\\\"}}>{{pathFrom commit.compareUrl}}</a></dd>\\n          {{/if}}\\n          {{#if commit.authorName}}\\n            <dt>{{t jobs.author}}</dt>\\n            <dd class=\\\"author\\\"><a {{bindAttr href=\\\"urlAuthor\\\"}}>{{commit.authorName}}</a></dd>\\n          {{/if}}\\n          {{#if commit.committerName}}\\n            <dt>{{t jobs.committer}}</dt>\\n            <dd class=\\\"committer\\\"><a {{bindAttr href=\\\"urlCommitter\\\"}}>{{commit.committerName}}</a></dd>\\n          {{/if}}\\n        </div>\\n\\n        <dt>{{t jobs.message}}</dt>\\n        <dd class=\\\"message\\\">{{formatMessage commit.message}}</dd>\\n        <dt>{{t jobs.config}}</dt>\\n        <dd class=\\\"config\\\">{{formatConfig job.config}}</dd>\\n      </dl>\\n\\n      {{view Travis.LogView contextBinding=\\\"job\\\"}}}\\n    </div>\\n  {{else}}\\n    <div id=\\\"job\\\" class=\\\"loading\\\">\\n      <span>Loading</span>\\n    </div>\\n  {{/if}}\\n{{/with}}\\n\");\n\nEmber.TEMPLATES['layouts/flash'] = Ember.Handlebars.compile(\"{{#each flash in controller}}\\n  {{#view Travis.FlashItemView flashBinding=\\\"flash\\\"}}\\n    <p>{{{flash.message}}}</p>\\n    <a class=\\\"close\\\" {{action close target=\\\"view\\\"}}></a>\\n  {{/view}}\\n{{/each}}\\n\");\n\nEmber.TEMPLATES['layouts/home'] = Ember.Handlebars.compile(\"<div id=\\\"top\\\">\\n  {{outlet top}}\\n</div>\\n\\n<div id=\\\"left\\\">\\n  {{outlet left}}\\n</div>\\n\\n<div id=\\\"main\\\">\\n  {{outlet flash}}\\n  {{outlet main}}\\n</div>\\n\\n<div id=\\\"right\\\">\\n  {{outlet right}}\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/profile'] = Ember.Handlebars.compile(\"<div id=\\\"top\\\">\\n  {{outlet top}}\\n</div>\\n\\n<div id=\\\"left\\\">\\n  {{outlet left}}\\n</div>\\n\\n<div id=\\\"main\\\">\\n  {{outlet flash}}\\n  {{outlet main}}\\n</div>\\n\\n<div id=\\\"right\\\">\\n  <div id=\\\"github-wrapper\\\">\\n    <a id=\\\"github\\\" href=\\\"https://github.com/travis-ci\\\" title=\\\"Fork me on GitHub\\\">\\n      {{t layouts.application.fork_me}}\\n    </a>\\n  </div>\\n\\n  <div id=\\\"slider\\\" {{action toggle target=\\\"Travis.app.slider\\\"}}>\\n    <div class='icon'></div>&nbsp;\\n  </div>\\n\\n  <div class=\\\"box\\\">\\n    <h4>Getting started?</h4>\\n    <p>\\n      Please read our <a href=\\\"http://about.travis-ci.org/docs/user/getting-started\\\">guide</a>.\\n      It will only take a few minutes :)\\n    </p>\\n    <p>\\n      You can find detailled docs on our <a href=\\\"http://about.travis-ci.org/\\\">about</a> site.\\n    </p>\\n    <p>\\n      If you need help please don&rsquo;t hesitate to join\\n      <a href=\\\"irc://irc.freenode.net#travis\\\">#travis</a> on irc.freenode.net\\n      or our <a href=\\\"http://groups.google.com/group/travis-ci\\\">mailinglist</a>.\\n    </p>\\n  </div>\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/sidebar'] = Ember.Handlebars.compile(\"<div id=\\\"github-wrapper\\\">\\n  <a id=\\\"github\\\" href=\\\"https://github.com/travis-ci\\\" title=\\\"Fork me on GitHub\\\">\\n    {{t layouts.application.fork_me}}\\n  </a>\\n</div>\\n\\n<div id=\\\"slider\\\" {{action toggle target=\\\"Travis.app.slider\\\"}}>\\n  <div class='icon'></div>&nbsp;\\n</div>\\n\\n{{view view.DecksView}}\\n{{view view.WorkersView}}\\n{{view view.QueuesView}}\\n{{view view.LinksView}}\\n\\n<div id=\\\"about\\\" class=\\\"box\\\">\\n  <h4>{{t layouts.about.join}}</h4>\\n  <ul>\\n    <li>{{t layouts.about.repository}}: <a href=\\\"http://github.com/travis-ci\\\">Github</a></li>\\n    <li>{{t layouts.about.twitter}}: <a href=\\\"http://twitter.com/travisci\\\">@travisci</a></li>\\n    <li>{{t layouts.about.mailing_list}}: <a href=\\\"http://groups.google.com/group/travis-ci\\\">travis-ci</a></li>\\n    <li><a href=\\\"irc://irc.freenode.net#travis\\\">irc.freenode.net#travis</a></li>\\n  </ul>\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/simple'] = Ember.Handlebars.compile(\"<div id=\\\"top\\\">\\n  {{outlet top}}\\n</div>\\n\\n<div id=\\\"main\\\">\\n  {{outlet flash}}\\n  {{outlet main}}\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/top'] = Ember.Handlebars.compile(\"<a {{action showRoot href=true}}>\\n  <h1>Travis</h1>\\n</a>\\n\\n<ul id=\\\"navigation\\\">\\n  <li class=\\\"home\\\">\\n    <a {{action showRoot href=true}}>Home</a>\\n  </li>\\n  <li class=\\\"stats\\\">\\n    <a {{action showStats href=true}}>Stats</a>\\n  </li>\\n  <li>\\n    <a href=\\\"http://about.travis-ci.org/blog\\\">Blog</a>\\n  </li>\\n  <li>\\n    <a href=\\\"http://about.travis-ci.org/docs\\\">Docs</a>\\n  </li>\\n  <li {{bindAttr class=\\\"view.classProfile\\\"}}>\\n    <p class=\\\"handle\\\">\\n      <a class=\\\"signed-out\\\" href=\\\"#\\\" {{action signIn target=\\\"Travis.app\\\"}}>{{t layouts.top.github_login}}</a>\\n      <a class=\\\"signed-in\\\" {{action showProfile href=true}}><img {{bindAttr src=\\\"view.gravatarUrl\\\"}}>{{user.name}}</a>\\n      <span class=\\\"signing-in\\\">Signing in</span>\\n    </p>\\n    <ul>\\n      <li>\\n        <a {{action showProfile href=true}}>Accounts</a>\\n      </li>\\n      <li>\\n        <a href=\\\"/\\\" {{action signOut target=\\\"Travis.app\\\"}}>{{t layouts.top.sign_out}}</a>\\n      </li>\\n    </ul>\\n  </li>\\n</ul>\\n\");\n\nEmber.TEMPLATES['profile/accounts'] = Ember.Handlebars.compile(\"<div id=\\\"search_box\\\">\\n</div>\\n\\n<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_accounts\\\" {{bindAttr class=\\\"view.classAccounts\\\"}}>\\n    <h5><a name=\\\"accounts\\\" href=\\\"\\\">Accounts</a></h5>\\n  </li>\\n</ul>\\n\\n<div class=\\\"tab\\\">\\n  {{#collection Travis.AccountsListView contentBinding=\\\"controller\\\"}}\\n    <a {{action showAccount view.account href=true}} class=\\\"name\\\">{{view.name}}</a>\\n    <p class=\\\"summary\\\">\\n      <span class=\\\"repos_label\\\">Repositories:</span>\\n      <abbr class=\\\"repos\\\">{{view.account.reposCount}}</abbr>\\n    </p>\\n    <div class=\\\"indicator\\\"><span></span></div>\\n  {{/collection}}\\n</div>\\n\");\n\nEmber.TEMPLATES['profile/show'] = Ember.Handlebars.compile(\"<h3>{{view.name}}</h3>\\n\\n{{view Travis.ProfileTabsView}}\\n\\n<div class=\\\"tab\\\">\\n  {{outlet pane}}\\n</div>\\n\\n\");\n\nEmber.TEMPLATES['profile/tabs'] = Ember.Handlebars.compile(\"<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_hooks\\\" {{bindAttr class=\\\"view.classHooks\\\"}}>\\n    <h5>\\n      <a {{action showAccount view.account href=true}}>Repositories</a>\\n    </h5>\\n  </li>\\n  {{#if view.displayUser}}\\n    <li id=\\\"tab_user\\\" {{bindAttr class=\\\"view.classUser\\\"}}>\\n      <h5>\\n        <a {{action showUserProfile view.account href=true}}>Profile</a>\\n      </h5>\\n    </li>\\n  {{/if}}\\n</ul>\\n\");\n\nEmber.TEMPLATES['profile/tabs/hooks'] = Ember.Handlebars.compile(\"<p class=\\\"tip\\\">\\n  {{{t profiles.show.message.your_repos}}}\\n</p>\\n\\n{{#if hooks.isLoaded}}\\n  {{#if user.isSyncing}}\\n    <p class=\\\"message loading\\\">\\n      <span>Please wait while we sync from GitHub</span>\\n    </p>\\n  {{else}}\\n    <p class=\\\"message\\\">\\n      Last synchronized from GitHub: {{formatTime user.syncedAt}}\\n      <a class=\\\"sync_now button\\\" {{action sync target=\\\"user\\\"}}>\\n        Sync now\\n      </a>\\n    </p>\\n\\n    <ul id=\\\"hooks\\\">\\n      {{#each hook in hooks}}\\n        <li {{bindAttr class=\\\"hook.active:active\\\"}}>\\n          <a {{bindAttr href=\\\"hook.urlGithub\\\"}} rel=\\\"nofollow\\\">{{hook.slug}}</a>\\n          <p class=\\\"description\\\">{{hook.description}}</p>\\n\\n          <div class=\\\"controls\\\">\\n            <a {{bindAttr href=\\\"hook.urlGithubAdmin\\\"}} class=\\\"github-admin tool-tip\\\" title=\\\"Github service hooks admin page\\\"></a>\\n            <a {{action toggle target=\\\"hook\\\"}} class=\\\"switch\\\">\\n              {{#if hook.active}}\\n                ON\\n              {{else}}\\n                OFF\\n              {{/if}}\\n            </a>\\n          </div>\\n        </li>\\n      {{else}}\\n        <li>\\n          You do not seem to have any repositories that we could sync.\\n        </li>\\n      {{/each}}\\n    </ul>\\n  {{/if}}\\n{{else}}\\n  <p class=\\\"message loading\\\">\\n    <span>Loading</span>\\n  </p>\\n{{/if}}\\n\\n\\n\");\n\nEmber.TEMPLATES['profile/tabs/user'] = Ember.Handlebars.compile(\"<img {{bindAttr src=\\\"view.gravatarUrl\\\"}}>\\n\\n<dl class=\\\"profile\\\">\\n  <dt>\\n    {{t profiles.show.github}}:\\n  </dt>\\n  <dd>\\n    <a {{bindAttr href=\\\"urlGithub\\\"}}>{{user.login}}</a>\\n  </dd>\\n  <dt>\\n    {{t profiles.show.email}}:\\n  </dt>\\n  <dd>\\n    {{user.email}}\\n  </dd>\\n  <dt>\\n    {{t profiles.show.token}}:\\n  </dt>\\n  <dd>\\n    {{user.token}}\\n  </dd>\\n</dl>\\n\\n<form>\\n  {{view Ember.Select id=\\\"locale\\\"\\n     contentBinding=\\\"view.locales\\\"\\n     valueBinding=\\\"Travis.app.currentUser.locale\\\"\\n     optionLabelPath=\\\"content.name\\\"\\n     optionValuePath=\\\"content.key\\\"}}\\n\\n  <button name=\\\"commit\\\" {{action saveLocale target=\\\"view\\\"}}>\\n    {{t profiles.show.update_locale}}\\n  </button>\\n</form>\\n\\n\\n\");\n\nEmber.TEMPLATES['queues/list'] = Ember.Handlebars.compile(\"<ul id=\\\"queues\\\">\\n{{#each queue in controller}}\\n  <li class=\\\"queue\\\">\\n    <h4>{{t queue}}: {{queue.name}}</h4>\\n    <ul {{bindAttr id=\\\"queue.id\\\"}}>\\n      {{#each job in queue}}\\n        {{#view Travis.QueueItemView jobBinding=\\\"job\\\"}}\\n\\n          {{#if job.repo.slug}}\\n            <a {{action showJob job.repo job target=\\\"Travis.app.router\\\" href=true}}>\\n              <span class=\\\"slug\\\">\\n                {{job.repo.slug}}\\n              </span>\\n              #{{job.number}}\\n            </a>\\n          {{/if}}\\n        {{/view}}\\n      {{else}}\\n        {{t no_job}}\\n      {{/each}}\\n    </ul>\\n  </li>\\n{{/each}}\\n</ul>\\n\");\n\nEmber.TEMPLATES['repos/list'] = Ember.Handlebars.compile(\"<div id=\\\"search_box\\\">\\n  {{view Ember.TextField valueBinding=\\\"controller.search\\\"}}\\n</div>\\n\\n{{view Travis.ReposListTabsView}}\\n\\n<a {{action toggleInfo target=\\\"view\\\"}} class=\\\"toggle-info\\\"></a>\\n\\n<div class=\\\"tab\\\">\\n  {{#collection Travis.ReposListView contentBinding=\\\"controller\\\"}}\\n    {{#with view.repo}}\\n      <div class=\\\"slug-and-status\\\">\\n        <span class=\\\"status\\\"></span>\\n        {{#if slug}}\\n          <a {{action showRepo this href=true}} class=\\\"slug\\\">{{slug}}</a>\\n        {{/if}}\\n      </div>\\n      {{#if lastBuildId}}\\n        <a {{action showBuild this lastBuildId href=true}} class=\\\"last_build\\\">{{lastBuildNumber}}</a>\\n      {{/if}}\\n\\n      <p class=\\\"summary\\\">\\n        <span class=\\\"duration_label\\\">{{t repositories.duration}}:</span>\\n        <abbr class=\\\"duration\\\" {{bindAttr title=\\\"lastBuildStartedAt\\\"}}>{{formatDuration lastBuildDuration}}</abbr>,\\n        <span class=\\\"finished_at_label\\\">{{t repositories.finished_at}}:</span>\\n        <abbr class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"lastBuildFinishedAt\\\"}}>{{formatTime lastBuildFinishedAt}}</abbr>\\n      </p>\\n\\n      <div class=\\\"indicator\\\"><span></span></div>\\n\\n      {{#if description}}\\n        <div class=\\\"info\\\">\\n          <p class=\\\"description\\\">{{description}}</p>\\n        </div>\\n      {{/if}}\\n    {{/with}}\\n  {{else}}\\n    <p class=\\\"empty\\\"></p>\\n  {{/collection}}\\n</div>\\n\");\n\nEmber.TEMPLATES['repos/list/tabs'] = Ember.Handlebars.compile(\"<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_recent\\\" {{bindAttr class=\\\"view.classRecent\\\"}}>\\n    <h5><a name=\\\"recent\\\" {{action activate target=\\\"view\\\"}}>{{t layouts.application.recent}}</a></h5>\\n  </li>\\n  <li id=\\\"tab_owned\\\" {{bindAttr class=\\\"view.classOwned\\\"}}>\\n    <h5><a name=\\\"owned\\\" {{action activate target=\\\"view\\\"}}>{{t layouts.application.my_repositories}}</a></h5>\\n  </li>\\n  <li id=\\\"tab_search\\\" {{bindAttr class=\\\"view.classSearch\\\"}}>\\n    <h5><a name=\\\"search\\\" {{action activate target=\\\"view\\\"}}>{{t layouts.application.search}}</a></h5>\\n  </li>\\n</ul>\\n\\n\");\n\nEmber.TEMPLATES['repos/show'] = Ember.Handlebars.compile(\"<div id=\\\"repo\\\" {{bindAttr class=\\\"view.class\\\"}}>\\n  {{#if view.isEmpty}}\\n    {{view Travis.ReposEmptyView}}\\n  {{else}}\\n    {{#if view.repo.isComplete}}\\n      {{#with view.repo}}\\n        <h3>\\n          <a {{bindAttr href=\\\"view.urlGithub\\\"}}>{{slug}}</a>\\n        </h3>\\n\\n        <p class=\\\"description\\\">{{description}}</p>\\n\\n        <ul class=\\\"github-stats\\\">\\n          <li class=\\\"language\\\">\\n            {{lastBuildLanguage}}\\n          </li>\\n          <li>\\n            <a class=\\\"watchers\\\" title=\\\"Watchers\\\" {{bindAttr href=\\\"view.urlGithubWatchers\\\"}}>\\n              {{stats.watchers}}\\n            </a>\\n          </li>\\n          <li>\\n            <a class=\\\"forks\\\" title=\\\"Forks\\\" {{bindAttr href=\\\"view.urlGithubNetwork\\\"}}>\\n              {{stats.forks}}\\n            </a>\\n          </li>\\n        </ul>\\n\\n        {{view Travis.RepoShowTabsView}}\\n        {{view Travis.RepoShowToolsView}}\\n      {{/with}}\\n\\n    {{else}}\\n      <span>Loading</span>\\n    {{/if}}\\n\\n    <div class=\\\"tab\\\">\\n      {{outlet pane}}\\n    </div>\\n  {{/if}}\\n</div>\\n\\n\");\n\nEmber.TEMPLATES['repos/show/tabs'] = Ember.Handlebars.compile(\"<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_current\\\" {{bindAttr class=\\\"view.classCurrent\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showRepo view.repo href=true}}>\\n        {{t repositories.tabs.current}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_builds\\\" {{bindAttr class=\\\"view.classBuilds\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showBuilds view.repo href=true}}>\\n        {{t repositories.tabs.build_history}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_pull_requests\\\" {{bindAttr class=\\\"view.classPullRequests\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showPullRequests view.repo href=true}}>\\n        {{t repositories.tabs.pull_requests}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_branches\\\" {{bindAttr class=\\\"view.classBranches\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showBranches view.repo href=true}}>\\n        {{t repositories.tabs.branches}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_events\\\" {{bindAttr class=\\\"view.classEvents\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showEvents view.repo href=true}}>\\n        Events\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_build\\\" {{bindAttr class=\\\"view.classBuild\\\"}}>\\n    <h5>\\n      {{#if view.build.id}}\\n      <a {{action showBuild view.repo view.build href=true}}>\\n        {{t repositories.tabs.build}} #{{view.build.number}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_job\\\" {{bindAttr class=\\\"view.classJob\\\"}}>\\n    <h5>\\n      {{#if view.job.id}}\\n      <a {{action showJob view.repo view.job href=true}}>\\n        {{t repositories.tabs.job}} #{{view.job.number}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n</ul>\\n\");\n\nEmber.TEMPLATES['repos/show/tools'] = Ember.Handlebars.compile(\"<div id=\\\"tools\\\">\\n  <a href=\\\"#\\\" {{action menu target=\\\"view\\\"}}></a>\\n  <ul class=\\\"menu\\\">\\n    <li>\\n      <a href=\\\"#\\\" name=\\\"status-images\\\" class=\\\"open-popup\\\" {{action statusImages target=\\\"view\\\"}}>Status Images</a>\\n    </li>\\n    {{#if view.canPush}}\\n      <li>\\n        <a href=\\\"#\\\" {{action requeue target=\\\"view\\\"}}>Rebuild</a>\\n      </li>\\n    {{/if}}\\n  </ul>\\n</div>\\n\\n<div id=\\\"status-images\\\" class=\\\"popup\\\">\\n  <a href=\\\"#\\\" class=\\\"close\\\" {{action popupClose target=\\\"view\\\"}}></a>\\n  <p>\\n    <label>{{t repositories.branch}}:</label>\\n    {{#if view.branches.isLoaded}}\\n      {{view Ember.Select contentBinding=\\\"view.branches\\\" selectionBinding=\\\"view.branch\\\" optionLabelPath=\\\"content.commit.branch\\\" optionValuePath=\\\"content.commit.branch\\\"}}\\n    {{else}}\\n      <span class=\\\"loading\\\"></span>\\n    {{/if}}\\n  </p>\\n  <p>\\n    <label>{{t repositories.image_url}}:</label>\\n    <input type=\\\"text\\\" class=\\\"url\\\" {{bindAttr value=\\\"view.urlStatusImage\\\"}}></input>\\n  </p>\\n  <p>\\n    <label>{{t repositories.markdown}}:</label>\\n    <input type=\\\"text\\\" class=\\\"markdown\\\" {{bindAttr value=\\\"view.markdownStatusImage\\\"}}></input>\\n  </p>\\n  <p>\\n    <label>{{t repositories.textile}}:</label>\\n    <input type=\\\"text\\\" class=\\\"textile\\\" {{bindAttr value=\\\"view.textileStatusImage\\\"}}></input>\\n  </p>\\n  <p>\\n    <label>{{t repositories.rdoc}}:</label>\\n    <input type=\\\"text\\\" class=\\\"rdoc\\\" {{bindAttr value=\\\"view.rdocStatusImage\\\"}}></input>\\n  </p>\\n</div>\\n\");\n\nEmber.TEMPLATES['sponsors/decks'] = Ember.Handlebars.compile(\"<h4>{{t layouts.application.sponsers}}</h4>\\n\\n<ul class=\\\"sponsors top\\\">\\n  {{#each deck in controller}}\\n    {{#each deck}}\\n      <li {{bindAttr class=\\\"type\\\"}}>\\n        <a {{bindAttr href=\\\"url\\\"}}>\\n          <img {{bindAttr src=\\\"image\\\"}}>\\n        </a>\\n      </li>\\n    {{/each}}\\n  {{/each}}\\n</ul>\\n\\n<p class=\\\"hint\\\">\\n  <a href=\\\"https://love.travis-ci.org/sponsors\\\">\\n    {{{t layouts.application.sponsors_link}}}\\n  </a>\\n</p>\\n\");\n\nEmber.TEMPLATES['sponsors/links'] = Ember.Handlebars.compile(\"<div class=\\\"box\\\">\\n  <h4>{{t layouts.application.sponsers}}</h4>\\n\\n  <ul class=\\\"sponsors bottom\\\">\\n    {{#each controller}}\\n      <li>\\n        {{{link}}}\\n      </li>\\n    {{/each}}\\n  </ul>\\n\\n  <p class=\\\"hint\\\">\\n    <a href=\\\"https://love.travis-ci.org/sponsors\\\">\\n      {{{t layouts.application.sponsors_link}}}\\n    </a>\\n  </p>\\n</div>\\n\\n\");\n\nEmber.TEMPLATES['stats/show'] = Ember.Handlebars.compile(\"<h3>Sorry</h3>\\n<p>Statistics are disabled for now.</p>\\n<p> We're looking into a solution. If you want to help, please ping us!</p>\\n\");\n\nEmber.TEMPLATES['workers/list'] = Ember.Handlebars.compile(\"{{#view Travis.WorkersView}}\\n  <h4>\\n    {{t workers}}\\n    <a id=\\\"toggle-workers\\\" {{action toggleWorkers target=\\\"parentView.parentView\\\"}}></a>\\n  </h4>\\n  <ul id=\\\"workers\\\">\\n    {{#each group in controller.groups}}\\n      {{#view Travis.WorkersListView}}\\n        <li class=\\\"group\\\">\\n          <h5 {{action toggle target=\\\"view\\\"}}>\\n            {{group.firstObject.host}}\\n          </h5>\\n          <ul>\\n          {{#each worker in group}}\\n            {{#view Travis.WorkersItemView workerBinding=\\\"worker\\\"}}\\n              <li class=\\\"worker\\\">\\n                <div class=\\\"status\\\"></div>\\n                {{#if worker.isWorking}}\\n                  {{#if worker.jobId}}\\n                    <a {{action showJob worker.repoSlug worker.jobId target=\\\"Travis.app.router\\\" href=true}} {{bindAttr title=\\\"worker.lastSeenAt\\\"}}>\\n                      {{view.display}}\\n                    </a>\\n                  {{/if}}\\n                {{else}}\\n                  {{view.display}}\\n                {{/if}}\\n              </li>\\n            {{/view}}\\n          {{/each}}\\n          </ul>\\n        </li>\\n      {{/view}}\\n    {{else}}\\n      No workers\\n    {{/each}}\\n  </ul>\\n{{/view}}\\n\");\n\n})();\n//@ sourceURL=templates");minispade.register('config/locales', "(function() {window.I18n = window.I18n || {}\nwindow.I18n.translations = {\"ca\":{\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"nl\":\"Nederlands\",\"pl\":\"Polski\",\"pt-BR\":\"português brasileiro\",\"ru\":\"Русский\"}},\"en\":{\"errors\":{\"messages\":{\"not_found\":\"not found\",\"already_confirmed\":\"was already confirmed\",\"not_locked\":\"was not locked\"}},\"devise\":{\"failure\":{\"unauthenticated\":\"You need to sign in or sign up before continuing.\",\"unconfirmed\":\"You have to confirm your account before continuing.\",\"locked\":\"Your account is locked.\",\"invalid\":\"Invalid email or password.\",\"invalid_token\":\"Invalid authentication token.\",\"timeout\":\"Your session expired, please sign in again to continue.\",\"inactive\":\"Your account was not activated yet.\"},\"sessions\":{\"signed_in\":\"Signed in successfully.\",\"signed_out\":\"Signed out successfully.\"},\"passwords\":{\"send_instructions\":\"You will receive an email with instructions about how to reset your password in a few minutes.\",\"updated\":\"Your password was changed successfully. You are now signed in.\"},\"confirmations\":{\"send_instructions\":\"You will receive an email with instructions about how to confirm your account in a few minutes.\",\"confirmed\":\"Your account was successfully confirmed. You are now signed in.\"},\"registrations\":{\"signed_up\":\"You have signed up successfully. If enabled, a confirmation was sent to your e-mail.\",\"updated\":\"You updated your account successfully.\",\"destroyed\":\"Bye! Your account was successfully cancelled. We hope to see you again soon.\"},\"unlocks\":{\"send_instructions\":\"You will receive an email with instructions about how to unlock your account in a few minutes.\",\"unlocked\":\"Your account was successfully unlocked. You are now signed in.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Confirmation instructions\"},\"reset_password_instructions\":{\"subject\":\"Reset password instructions\"},\"unlock_instructions\":{\"subject\":\"Unlock Instructions\"}}},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} hour\",\"other\":\"%{count} hours\"},\"minutes_exact\":{\"one\":\"%{count} minute\",\"other\":\"%{count} minutes\"},\"seconds_exact\":{\"one\":\"%{count} second\",\"other\":\"%{count} seconds\"}}},\"workers\":\"Workers\",\"queue\":\"Queue\",\"no_job\":\"There are no jobs\",\"repositories\":{\"branch\":\"Branch\",\"image_url\":\"Image URL\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Started\",\"duration\":\"Duration\",\"finished_at\":\"Finished\",\"tabs\":{\"current\":\"Current\",\"build_history\":\"Build History\",\"branches\":\"Branch Summary\",\"pull_requests\":\"Pull Requests\",\"build\":\"Build\",\"job\":\"Job\"}},\"build\":{\"job\":\"Job\",\"duration\":\"Duration\",\"finished_at\":\"Finished\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"This test suite was run on a worker box sponsored by\"},\"build_matrix\":\"Build Matrix\",\"allowed_failures\":\"Allowed Failures\",\"author\":\"Author\",\"config\":\"Config\",\"compare\":\"Compare\",\"committer\":\"Committer\",\"branch\":\"Branch\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Started\",\"duration\":\"Duration\",\"finished_at\":\"Finished\"},\"builds\":{\"name\":\"Build\",\"messages\":{\"sponsored_by\":\"This test suite was run on a worker box sponsored by\"},\"build_matrix\":\"Build Matrix\",\"allowed_failures\":\"Allowed Failures\",\"author\":\"Author\",\"config\":\"Config\",\"compare\":\"Compare\",\"committer\":\"Committer\",\"branch\":\"Branch\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Started\",\"duration\":\"Duration\",\"finished_at\":\"Finished\",\"show_more\":\"Show more\"},\"layouts\":{\"top\":{\"home\":\"Home\",\"blog\":\"Blog\",\"docs\":\"Docs\",\"stats\":\"Stats\",\"github_login\":\"Sign in with Github\",\"profile\":\"Profile\",\"sign_out\":\"Sign Out\",\"admin\":\"Admin\"},\"application\":{\"fork_me\":\"Fork me on Github\",\"recent\":\"Recent\",\"search\":\"Search\",\"sponsers\":\"Sponsors\",\"sponsors_link\":\"See all of our amazing sponsors &rarr;\",\"my_repositories\":\"My Repositories\"},\"about\":{\"alpha\":\"This stuff is alpha.\",\"messages\":{\"alpha\":\"Please do <strong>not</strong> consider this a stable service. We're still far from that! More info <a href='https://github.com/travis-ci'>here.</a>\"},\"join\":\"Join us and help!\",\"mailing_list\":\"Mailing List\",\"repository\":\"Repository\",\"twitter\":\"Twitter\"},\"mobile\":{\"author\":\"Author\",\"build\":\"Build\",\"build_matrix\":\"Build Matrix\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Compare\",\"config\":\"Config\",\"duration\":\"Duration\",\"finished_at\":\"Finished at\",\"job\":\"Job\",\"log\":\"Log\"}},\"profiles\":{\"show\":{\"email\":\"Email\",\"github\":\"Github\",\"message\":{\"your_repos\":\"  Flick the switches below to turn on the Travis service hook for your projects, then push to GitHub.\",\"config\":\"how to configure custom build options\"},\"messages\":{\"notice\":\"To get started, please read our <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Getting Started guide</a>.\\n  <small>It will only take a couple of minutes.</small>\"},\"token\":\"Token\",\"your_repos\":\"Your Repositories\",\"update\":\"Update\",\"update_locale\":\"Update\",\"your_locale\":\"Your Locale\"}},\"statistics\":{\"index\":{\"count\":\"Count\",\"repo_growth\":\"Repository Growth\",\"total_projects\":\"Total Projects/Repositories\",\"build_count\":\"Build Count\",\"last_month\":\"last month\",\"total_builds\":\"Total Builds\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"es\":{\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} hora\",\"other\":\"%{count} horas\"},\"minutes_exact\":{\"one\":\"%{count} minuto\",\"other\":\"%{count} minutos\"},\"seconds_exact\":{\"one\":\"%{count} segundo\",\"other\":\"%{count} segundos\"}}},\"workers\":\"Procesos\",\"queue\":\"Cola\",\"no_job\":\"No hay trabajos\",\"repositories\":{\"branch\":\"Rama\",\"image_url\":\"Imagen URL\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Mensaje\",\"started_at\":\"Iniciado\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\",\"tabs\":{\"current\":\"Actual\",\"build_history\":\"Histórico\",\"branches\":\"Ramas\",\"build\":\"Builds\",\"job\":\"Trabajo\"}},\"build\":{\"job\":\"Trabajo\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"Esta serie de tests han sido ejecutados en una caja de Proceso patrocinada por\"},\"build_matrix\":\"Matriz de Builds\",\"allowed_failures\":\"Fallos Permitidos\",\"author\":\"Autor\",\"config\":\"Configuración\",\"compare\":\"Comparar\",\"committer\":\"Committer\",\"branch\":\"Rama\",\"commit\":\"Commit\",\"message\":\"Mensaje\",\"started_at\":\"Iniciado\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\",\"sponsored_by\":\"Patrocinado por\"},\"builds\":{\"name\":\"Build\",\"messages\":{\"sponsored_by\":\"Esta serie de tests han sido ejecutados en una caja de Proceso patrocinada por\"},\"build_matrix\":\"Matriz de Builds\",\"allowed_failures\":\"Fallos Permitidos\",\"author\":\"Autor\",\"config\":\"Configuración\",\"compare\":\"Comparar\",\"committer\":\"Committer\",\"branch\":\"Rama\",\"commit\":\"Commit\",\"message\":\"Mensaje\",\"started_at\":\"Iniciado\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\"},\"layouts\":{\"top\":{\"home\":\"Inicio\",\"blog\":\"Blog\",\"docs\":\"Documentación\",\"stats\":\"Estadísticas\",\"github_login\":\"Iniciar sesión con Github\",\"profile\":\"Perfil\",\"sign_out\":\"Desconectar\",\"admin\":\"Admin\"},\"application\":{\"fork_me\":\"Hazme un Fork en Github\",\"recent\":\"Reciente\",\"search\":\"Buscar\",\"sponsers\":\"Patrocinadores\",\"sponsors_link\":\"Ver todos nuestros patrocinadores &rarr;\",\"my_repositories\":\"Mis Repositorios\"},\"about\":{\"alpha\":\"Esto es alpha.\",\"messages\":{\"alpha\":\"Por favor <strong>no</strong> considereis esto un servicio estable. Estamos estamos aún lejos de ello! Más información <a href='https://github.com/travis-ci'>aquí.</a>\"},\"join\":\"Únetenos y ayudanos!\",\"mailing_list\":\"Lista de Correos\",\"repository\":\"Repositorio\",\"twitter\":\"Twitter\"}},\"profiles\":{\"show\":{\"email\":\"Correo electrónico\",\"github\":\"Github\",\"message\":{\"your_repos\":\"  Activa los interruptores para inicial el  Travis service hook para tus proyectos, y haz un Push en GitHub.<br />\\n  Para probar varias versiones de ruby, mira\",\"config\":\"como configurar tus propias opciones para el Build\"},\"messages\":{\"notice\":\"Para comenzar, por favor lee nuestra <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Guía de Inicio </a>.\\n  <small>Solo tomará unos pocos minutos.</small>\"},\"token\":\"Token\",\"your_repos\":\"Tus repositorios\",\"update\":\"Actualizar\",\"update_locale\":\"Actualizar\",\"your_locale\":\"Tu Idioma\"}},\"statistics\":{\"index\":{\"count\":\"Número\",\"repo_growth\":\"Crecimiento de Repositorios\",\"total_projects\":\"Total de Proyectos/Repositorios\",\"build_count\":\"Número de Builds\",\"last_month\":\"mes anterior\",\"total_builds\":\"Total de Builds\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"fr\":{\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} heure\",\"other\":\"%{count} heures\"},\"minutes_exact\":{\"one\":\"%{count} minute\",\"other\":\"%{count} minutes\"},\"seconds_exact\":{\"one\":\"%{count} seconde\",\"other\":\"%{count} secondes\"}}},\"workers\":\"Processus\",\"queue\":\"File\",\"no_job\":\"Pas de tâches\",\"repositories\":{\"branch\":\"Branche\",\"image_url\":\"Image\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Commencé\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\",\"tabs\":{\"current\":\"Actuel\",\"build_history\":\"Historique des tâches\",\"branches\":\"Résumé des branches\",\"build\":\"Construction\",\"job\":\"Tâche\"}},\"build\":{\"job\":\"Tâche\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"Cette série de tests a été exécutée sur une machine sponsorisée par\"},\"build_matrix\":\"Matrice des versions\",\"allowed_failures\":\"Échecs autorisés\",\"author\":\"Auteur\",\"config\":\"Config\",\"compare\":\"Comparer\",\"committer\":\"Committeur\",\"branch\":\"Branche\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Commencé\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\",\"sponsored_by\":\"Cette série de tests a été exécutée sur une machine sponsorisée par\"},\"builds\":{\"name\":\"Version\",\"messages\":{\"sponsored_by\":\"Cette série de tests a été exécutée sur une machine sponsorisée par\"},\"build_matrix\":\"Matrice des versions\",\"allowed_failures\":\"Échecs autorisés\",\"author\":\"Auteur\",\"config\":\"Config\",\"compare\":\"Comparer\",\"committer\":\"Committeur\",\"branch\":\"Branche\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Commencé\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\"},\"layouts\":{\"top\":{\"home\":\"Accueil\",\"blog\":\"Blog\",\"docs\":\"Documentation\",\"stats\":\"Statistiques\",\"github_login\":\"Connection Github\",\"profile\":\"Profil\",\"sign_out\":\"Déconnection\",\"admin\":\"Admin\"},\"application\":{\"fork_me\":\"Faites un Fork sur Github\",\"recent\":\"Récent\",\"search\":\"Chercher\",\"sponsers\":\"Sponsors\",\"sponsors_link\":\"Voir tous nos extraordinaire sponsors &rarr;\",\"my_repositories\":\"Mes dépôts\"},\"about\":{\"alpha\":\"Ceci est en alpha.\",\"messages\":{\"alpha\":\"S'il vous plaît ne considérez <strong>pas</strong> ce service comme étant stable. Nous sommes loin de ça! Plus d'infos <a href='https://github.com/travis-ci'>ici.</a>\"},\"join\":\"Joignez-vous à nous et aidez-nous!\",\"mailing_list\":\"Liste de distribution\",\"repository\":\"Dépôt\",\"twitter\":\"Twitter\"},\"mobile\":{\"author\":\"Auteur\",\"build\":\"Version\",\"build_matrix\":\"Matrice des versions\",\"commit\":\"Commit\",\"committer\":\"Committeur\",\"compare\":\"Comparer\",\"config\":\"Config\",\"duration\":\"Durée\",\"finished_at\":\"Terminé à\",\"job\":\"Tâche\",\"log\":\"Journal\"}},\"profiles\":{\"show\":{\"github\":\"Github\",\"message\":{\"your_repos\":\"Utilisez les boutons ci-dessous pour activer Travis sur vos projets puis déployez sur GitHub.<br />\\nPour tester sur plus de versions de ruby, voir\",\"config\":\"comment configurer des options de version personnalisées\"},\"messages\":{\"notice\":\"Pour commencer, veuillez lire notre <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">guide de démarrage</a>.\\n <small>Cela ne vous prendra que quelques minutes.</small>\"},\"token\":\"Jeton\",\"your_repos\":\"Vos dépôts\",\"email\":\"Courriel\",\"update\":\"Modifier\",\"update_locale\":\"Modifier\",\"your_locale\":\"Votre langue\"}},\"statistics\":{\"index\":{\"count\":\"Décompte\",\"repo_growth\":\"Croissance de dépôt\",\"total_projects\":\"Total des projets/dépôts\",\"build_count\":\"Décompte des versions\",\"last_month\":\"mois dernier\",\"total_builds\":\"Total des versions\"}},\"admin\":{\"actions\":{\"create\":\"créer\",\"created\":\"créé\",\"delete\":\"supprimer\",\"deleted\":\"supprimé\",\"update\":\"mise à jour\",\"updated\":\"mis à jour\"},\"credentials\":{\"log_out\":\"Déconnection\"},\"delete\":{\"confirmation\":\"Oui, je suis sure\",\"flash_confirmation\":\"%{name} a été détruit avec succès\"},\"flash\":{\"error\":\"%{name} n'a pas pu être %{action}\",\"noaction\":\"Aucune action n'a été entreprise\",\"successful\":\"%{name} a réussi à %{action}\"},\"history\":{\"name\":\"Historique\",\"no_activity\":\"Aucune activité\",\"page_name\":\"Historique pour %{name}\"},\"list\":{\"add_new\":\"Ajouter un nouveau\",\"delete_action\":\"Supprimer\",\"delete_selected\":\"Supprimer la sélection\",\"edit_action\":\"Modifier\",\"search\":\"Rechercher\",\"select\":\"Sélectionner le %{name} à modifier\",\"select_action\":\"Sélectionner\",\"show_all\":\"Montrer tout\"},\"new\":{\"basic_info\":\"Information de base\",\"cancel\":\"Annuler\",\"chosen\":\"%{name} choisi\",\"chose_all\":\"Choisir tout\",\"clear_all\":\"Déselectionner tout\",\"many_chars\":\"caractères ou moins\",\"one_char\":\"caractère.\",\"optional\":\"Optionnel\",\"required\":\"Requis\",\"save\":\"Sauvegarder\",\"save_and_add_another\":\"Sauvegarder et en ajouter un autre\",\"save_and_edit\":\"Sauvegarder et modifier\",\"select_choice\":\"Faites vos choix et cliquez\"},\"dashboard\":{\"add_new\":\"Ajouter un nouveau\",\"last_used\":\"Dernière utilisation\",\"model_name\":\"Nom du modèle\",\"modify\":\"Modification\",\"name\":\"Tableau de bord\",\"pagename\":\"Administration du site\",\"records\":\"Enregistrements\",\"show\":\"Voir\",\"ago\":\"plus tôt\"}},\"home\":{\"name\":\"accueil\"},\"repository\":{\"duration\":\"Durée\"},\"devise\":{\"confirmations\":{\"confirmed\":\"Votre compte a été crée avec succès. Vous être maintenant connecté.\",\"send_instructions\":\"Vous allez recevoir un courriel avec les instructions de confirmation de votre compte dans quelques minutes.\"},\"failure\":{\"inactive\":\"Votre compte n'a pas encore été activé.\",\"invalid\":\"Adresse courriel ou mot de passe invalide.\",\"invalid_token\":\"Jeton d'authentification invalide.\",\"locked\":\"Votre compte est bloqué.\",\"timeout\":\"Votre session est expirée, veuillez vous reconnecter pour continuer.\",\"unauthenticated\":\"Vous devez vous connecter ou vous enregistrer afin de continuer\",\"unconfirmed\":\"Vous devez confirmer votre compte avant de continuer.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Instructions de confirmations\"},\"reset_password_instructions\":{\"subject\":\"Instruction de remise à zéro du mot de passe\"},\"unlock_instructions\":{\"subject\":\"Instruction de débloquage\"}},\"passwords\":{\"send_instructions\":\"Vous recevrez un courriel avec les instructions de remise à zéro du mot de passe dans quelques minutes.\",\"updated\":\"Votre mot de passe a été changé avec succès. Vous êtes maintenant connecté.\"},\"registrations\":{\"destroyed\":\"Au revoir! Votre compte a été annulé avec succès. Nous espérons vous revoir bientôt.\",\"signed_up\":\"Vous êtes enregistré avec succès. Si activé, une confirmation vous a été envoyé par courriel.\",\"updated\":\"Votre compte a été mis a jour avec succès\"},\"sessions\":{\"signed_in\":\"Connecté avec succès\",\"signed_out\":\"Déconnecté avec succès\"},\"unlocks\":{\"send_instructions\":\"Vous recevrez un courriel contenant les instructions pour débloquer votre compte dans quelques minutes.\",\"unlocked\":\"Votre compte a été débloqué avec succès.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"étais déja confirmé\",\"not_found\":\"n'a pas été trouvé\",\"not_locked\":\"n'étais pas bloqué\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"ja\":{\"workers\":\"ワーカー\",\"queue\":\"キュー\",\"no_job\":\"ジョブはありません\",\"repositories\":{\"branch\":\"ブランチ\",\"image_url\":\"画像URL\",\"markdown\":\".md\",\"textile\":\".textile\",\"rdoc\":\".rdoc\",\"commit\":\"コミット\",\"message\":\"メッセージ\",\"started_at\":\"開始時刻\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\",\"tabs\":{\"current\":\"最新\",\"build_history\":\"ビルド履歴\",\"branches\":\"ブランチまとめ\",\"build\":\"ビルド\",\"job\":\"ジョブ\"}},\"build\":{\"job\":\"ジョブ\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"このテストは以下のスポンサーの協力で行いました。\"},\"build_matrix\":\"ビルドマトリクス\",\"allowed_failures\":\"失敗許容範囲内\",\"author\":\"制作者\",\"config\":\"設定\",\"compare\":\"比較\",\"committer\":\"コミット者\",\"branch\":\"ブランチ\",\"commit\":\"コミット\",\"message\":\"メッセージ\",\"started_at\":\"開始時刻\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\"},\"builds\":{\"name\":\"ビルド\",\"messages\":{\"sponsored_by\":\"このテストは以下のスポンサーの協力で行いました。\"},\"build_matrix\":\"失敗許容範囲外\",\"allowed_failures\":\"失敗許容範囲内\",\"author\":\"制作者\",\"config\":\"設定\",\"compare\":\"比較\",\"committer\":\"コミット者\",\"branch\":\"ブランチ\",\"commit\":\"コミット\",\"message\":\"メッセージ\",\"started_at\":\"開始時刻\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\"},\"layouts\":{\"about\":{\"alpha\":\"まだアルファですよ！\",\"join\":\"参加してみよう！\",\"mailing_list\":\"メールリスト\",\"messages\":{\"alpha\":\"Travis-ciは安定したサービスまで後一歩！詳しくは<a href='https://github.com/travis-ci'>こちら</a>\"},\"repository\":\"リポジトリ\",\"twitter\":\"ツイッター\"},\"application\":{\"fork_me\":\"Githubでフォークしよう\",\"my_repositories\":\"マイリポジトリ\",\"recent\":\"最近\",\"search\":\"検索\",\"sponsers\":\"スポンサー\",\"sponsors_link\":\"スポンサーをもっと見る &rarr;\"},\"top\":{\"blog\":\"ブログ\",\"docs\":\"Travisとは？\",\"github_login\":\"Githubでログイン\",\"home\":\"ホーム\",\"profile\":\"プロフィール\",\"sign_out\":\"ログアウト\",\"stats\":\"統計\",\"admin\":\"管理\"},\"mobile\":{\"author\":\"制作者\",\"build\":\"ビルド\",\"build_matrix\":\"ビルドマトリクス\",\"commit\":\"コミット\",\"committer\":\"コミット者\",\"compare\":\"比較\",\"config\":\"設定\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\",\"job\":\"ジョブ\",\"log\":\"ログ\"}},\"profiles\":{\"show\":{\"github\":\"Github\",\"email\":\"メール\",\"message\":{\"config\":\"詳細設定\",\"your_repos\":\"以下のスイッチを設定し、Travis-ciを有効にします。Githubへプッシュしたらビルドは自動的に開始します。複数バーションや細かい設定はこちらへ：\"},\"messages\":{\"notice\":\"まずは<a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Travisのはじめ方</a>を参照してください。\"},\"token\":\"トークン\",\"your_repos\":\"リポジトリ\",\"update\":\"更新\",\"update_locale\":\"更新\",\"your_locale\":\"言語設定\"}},\"statistics\":{\"index\":{\"build_count\":\"ビルド数\",\"count\":\"数\",\"last_month\":\"先月\",\"repo_growth\":\"リポジトリ\",\"total_builds\":\"合計ビルド数\",\"total_projects\":\"合計リポジトリ\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"nb\":{\"admin\":{\"actions\":{\"create\":\"opprett\",\"created\":\"opprettet\",\"delete\":\"slett\",\"deleted\":\"slettet\",\"update\":\"oppdater\",\"updated\":\"oppdatert\"},\"credentials\":{\"log_out\":\"Logg ut\"},\"dashboard\":{\"add_new\":\"Legg til ny\",\"ago\":\"siden\",\"last_used\":\"Sist brukt\",\"model_name\":\"Modell\",\"modify\":\"Rediger\",\"name\":\"Dashbord\",\"pagename\":\"Nettstedsadministrasjon\",\"records\":\"Oppføringer\",\"show\":\"Vis\"},\"delete\":{\"confirmation\":\"Ja, jeg er sikker\",\"flash_confirmation\":\"%{name} ble slettet\"},\"flash\":{\"error\":\"%{name} kunne ikke bli %{action}\",\"noaction\":\"Ingen handlinger ble utført\",\"successful\":\"%{name} ble %{action}\"},\"history\":{\"name\":\"Logg\",\"no_activity\":\"Ingen aktivitet\",\"page_name\":\"Logg for %{name}\"},\"list\":{\"add_new\":\"Legg til ny\",\"delete_action\":\"Slett\",\"delete_selected\":\"Slett valgte\",\"edit_action\":\"Rediger\",\"search\":\"Søk\",\"select\":\"Velg %{name} for å redigere\",\"select_action\":\"Velg\",\"show_all\":\"Vis alle \"},\"new\":{\"basic_info\":\"Basisinformasjon\",\"cancel\":\"Avbryt\",\"chosen\":\"Valgt %{name}\",\"chose_all\":\"Velg alle\",\"clear_all\":\"Fjern alle\",\"many_chars\":\"eller færre tegn.\",\"one_char\":\"tegn.\",\"optional\":\"Valgfri\",\"required\":\"Påkrevd\",\"save\":\"Lagre\",\"save_and_add_another\":\"Lagre og legg til ny\",\"save_and_edit\":\"Lagre og rediger\",\"select_choice\":\"Kryss av for dine valg og klikk\"}},\"build\":{\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"job\":\"Jobb\"},\"builds\":{\"allowed_failures\":\"Tillatte feil\",\"author\":\"Forfatter\",\"branch\":\"Gren\",\"build_matrix\":\"Jobbmatrise\",\"commit\":\"Innsending\",\"committer\":\"Innsender\",\"compare\":\"Sammenlign\",\"config\":\"Oppsett\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"message\":\"Beskrivelse\",\"messages\":{\"sponsored_by\":\"Denne testen ble kjørt på en maskin sponset av\"},\"name\":\"Jobb\",\"started_at\":\"Startet\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} time\",\"other\":\"%{count} timer\"},\"minutes_exact\":{\"one\":\"%{count} minutt\",\"other\":\"%{count} minutter\"},\"seconds_exact\":{\"one\":\"%{count} sekund\",\"other\":\"%{count} sekunder\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Din konto er aktivert og du er nå innlogget.\",\"send_instructions\":\"Om noen få minutter så vil du få en e-post med informasjon om hvordan du bekrefter kontoen din.\"},\"failure\":{\"inactive\":\"Kontoen din har ikke blitt aktivert enda.\",\"invalid\":\"Ugyldig e-post eller passord.\",\"invalid_token\":\"Ugyldig autentiseringskode.\",\"locked\":\"Kontoen din er låst.\",\"timeout\":\"Du ble logget ut siden på grunn av mangel på aktivitet, vennligst logg inn på nytt.\",\"unauthenticated\":\"Du må logge inn eller registrere deg for å fortsette.\",\"unconfirmed\":\"Du må bekrefte kontoen din før du kan fortsette.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Bekreftelsesinformasjon\"},\"reset_password_instructions\":{\"subject\":\"Instruksjoner for å få nytt passord\"},\"unlock_instructions\":{\"subject\":\"Opplåsningsinstruksjoner\"}},\"passwords\":{\"send_instructions\":\"Om noen få minutter så vil du få en epost med informasjon om hvordan du kan få et nytt passord.\",\"updated\":\"Passordet ditt ble endret, og du er logget inn.\"},\"registrations\":{\"destroyed\":\"Adjø! Kontoen din ble kansellert. Vi håper vi ser deg igjen snart.\",\"signed_up\":\"Du er nå registrert.\",\"updated\":\"Kontoen din ble oppdatert.\"},\"sessions\":{\"signed_in\":\"Du er nå logget inn.\",\"signed_out\":\"Du er nå logget ut.\"},\"unlocks\":{\"send_instructions\":\"Om noen få minutter så kommer du til å få en e-post med informasjon om hvordan du kan låse opp kontoen din.\",\"unlocked\":\"Kontoen din ble låst opp, og du er nå logget inn igjen.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"har allerede blitt bekreftet\",\"not_found\":\"ikke funnnet\",\"not_locked\":\"var ikke låst\"}},\"home\":{\"name\":\"hjem\"},\"jobs\":{\"allowed_failures\":\"Tillatte feil\",\"author\":\"Forfatter\",\"branch\":\"Gren\",\"build_matrix\":\"Jobbmatrise\",\"commit\":\"Innsending\",\"committer\":\"Innsender\",\"compare\":\"Sammenlign\",\"config\":\"Oppsett\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"message\":\"Beskrivelse\",\"messages\":{\"sponsored_by\":\"Denne testserien ble kjørt på en maskin sponset av\"},\"started_at\":\"Startet\"},\"layouts\":{\"about\":{\"alpha\":\"Dette er alfa-greier.\",\"join\":\"Bli med og hjelp oss!\",\"mailing_list\":\"E-postliste\",\"messages\":{\"alpha\":\"Dette er <strong>ikke</strong> en stabil tjeneste. Vi har fremdeles et stykke igjen! Mer informasjon finner du <a href=\\\"https://github.com/travis-ci\\\">her</a>.\"},\"repository\":\"Kodelager\",\"twitter\":\"Twitter.\"},\"application\":{\"fork_me\":\"Se koden på Github\",\"my_repositories\":\"Mine kodelagre\",\"recent\":\"Nylig\",\"search\":\"Søk\",\"sponsers\":\"Sponsorer\",\"sponsors_link\":\"Se alle de flotte sponsorene våre &rarr;\"},\"mobile\":{\"author\":\"Forfatter\",\"build\":\"Jobb\",\"build_matrix\":\"Jobbmatrise\",\"commit\":\"Innsending\",\"committer\":\"Innsender\",\"compare\":\"Sammenlign\",\"config\":\"Oppsett\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"job\":\"Jobb\",\"log\":\"Logg\"},\"top\":{\"admin\":\"Administrator\",\"blog\":\"Blogg\",\"docs\":\"Dokumentasjon\",\"github_login\":\"Logg inn med Github\",\"home\":\"Hjem\",\"profile\":\"Profil\",\"sign_out\":\"Logg ut\",\"stats\":\"Statistikk\"}},\"no_job\":\"Ingen jobber finnnes\",\"profiles\":{\"show\":{\"email\":\"E-post\",\"github\":\"Github\",\"message\":{\"config\":\"hvordan sette opp egne jobbinnstillinger\",\"your_repos\":\"Slå\\u0010 på Travis for prosjektene dine ved å dra i bryterne under, og send koden til Github.<br />\\nFor å teste mot flere ruby-versjoner, se dokumentasjonen for\"},\"messages\":{\"notice\":\"For å komme i gang, vennligst les <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">kom-i-gang-veivisereren</a> vår. <small>Det tar bare et par minutter.</small>\"},\"token\":\"Kode\",\"update\":\"Oppdater\",\"update_locale\":\"Oppdater\",\"your_locale\":\"Ditt språk\",\"your_repos\":\"Dine kodelagre\"}},\"queue\":\"Kø\",\"repositories\":{\"branch\":\"Gren\",\"commit\":\"Innsender\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"image_url\":\"Bilde-URL\",\"markdown\":\"Markdown\",\"message\":\"Beskrivelse\",\"rdoc\":\"RDOC\",\"started_at\":\"Startet\",\"tabs\":{\"branches\":\"Grensammendrag\",\"build\":\"Jobb\",\"build_history\":\"Jobblogg\",\"current\":\"Siste\",\"job\":\"Jobb\"},\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Varighet\"},\"statistics\":{\"index\":{\"build_count\":\"Antall jobber\",\"count\":\"Antall\",\"last_month\":\"siste måned\",\"repo_growth\":\"Vekst i kodelager\",\"total_builds\":\"Totale jobber\",\"total_projects\":\"Antall prosjekter/kodelagre\"}},\"workers\":\"Arbeidere\",\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"nl\":{\"admin\":{\"actions\":{\"create\":\"aanmaken\",\"created\":\"aangemaakt\",\"delete\":\"verwijderen\",\"deleted\":\"verwijderd\",\"update\":\"bijwerken\",\"updated\":\"bijgewerkt\"},\"credentials\":{\"log_out\":\"Afmelden\"},\"dashboard\":{\"add_new\":\"Nieuwe toevoegen\",\"ago\":\"geleden\",\"last_used\":\"Laatst gebruikt\",\"model_name\":\"Model naam\",\"modify\":\"Wijzigen\",\"pagename\":\"Site administratie\",\"show\":\"Laten zien\",\"records\":\"Gegevens\"},\"delete\":{\"confirmation\":\"Ja, ik ben zeker\",\"flash_confirmation\":\"%{name} is vernietigd\"},\"flash\":{\"error\":\"%{name} kon niet worden %{action}\",\"noaction\":\"Er zijn geen acties genomen\",\"successful\":\"%{name} is %{action}\"},\"history\":{\"name\":\"Geschiedenis\",\"no_activity\":\"Geen activiteit\",\"page_name\":\"Geschiedenis van %{name}\"},\"list\":{\"add_new\":\"Nieuwe toevoegen\",\"delete_action\":\"Verwijderen\",\"delete_selected\":\"Verwijder geselecteerden\",\"edit_action\":\"Bewerken\",\"search\":\"Zoeken\",\"select\":\"Selecteer %{name} om te bewerken\",\"select_action\":\"Selecteer\",\"show_all\":\"Laat allen zien\"},\"new\":{\"basic_info\":\"Basisinfo\",\"cancel\":\"Annuleren\",\"chosen\":\"%{name} gekozen\",\"chose_all\":\"Kies allen\",\"clear_all\":\"Deselecteer allen\",\"many_chars\":\"tekens of minder.\",\"one_char\":\"teken.\",\"optional\":\"Optioneel\",\"required\":\"Vereist\",\"save\":\"Opslaan\",\"save_and_add_another\":\"Opslaan en een nieuwe toevoegen\",\"save_and_edit\":\"Opslaan en bewerken\",\"select_choice\":\"Selecteer uw keuzes en klik\"}},\"build\":{\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"job\":\"Taak\"},\"builds\":{\"allowed_failures\":\"Toegestane mislukkingen\",\"author\":\"Auteur\",\"branch\":\"Tak\",\"build_matrix\":\"Bouw Matrix\",\"compare\":\"Vergelijk\",\"config\":\"Configuratie\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"message\":\"Bericht\",\"messages\":{\"sponsored_by\":\"Deze tests zijn gedraaid op een machine gesponsord door\"},\"name\":\"Bouw\",\"started_at\":\"Gestart\",\"commit\":\"Commit\",\"committer\":\"Committer\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} uur\",\"other\":\"%{count} uren\"},\"minutes_exact\":{\"one\":\"%{count} minuut\",\"other\":\"%{count} minuten\"},\"seconds_exact\":{\"one\":\"%{count} seconde\",\"other\":\"%{count} seconden\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Uw account is bevestigd. U wordt nu ingelogd.\",\"send_instructions\":\"Binnen enkele minuten zal u een email ontvangen met instructies om uw account te bevestigen.\"},\"failure\":{\"inactive\":\"Uw account is nog niet geactiveerd.\",\"invalid\":\"Ongeldig email adres of wachtwoord.\",\"invalid_token\":\"Ongeldig authenticatie token.\",\"locked\":\"Uw account is vergrendeld.\",\"timeout\":\"Uw sessie is verlopen, gelieve opnieuw in te loggen om verder te gaan.\",\"unauthenticated\":\"U moet inloggen of u registeren voordat u verder gaat.\",\"unconfirmed\":\"U moet uw account bevestigen voordat u verder gaat.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Bevestigings-instructies\"},\"reset_password_instructions\":{\"subject\":\"Wachtwoord herstel instructies\"},\"unlock_instructions\":{\"subject\":\"Ontgrendel-instructies\"}},\"passwords\":{\"send_instructions\":\"Binnen enkele minuten zal u een email krijgen met instructies om uw wachtwoord opnieuw in te stellen.\",\"updated\":\"Uw wachtwoord is veranderd. U wordt nu ingelogd.\"},\"registrations\":{\"destroyed\":\"Dag! Uw account is geannuleerd. We hopen u vlug terug te zien.\",\"signed_up\":\"Uw registratie is voltooid. Als het ingeschakeld is wordt een bevestiging naar uw email adres verzonden.\",\"updated\":\"Het bijwerken van uw account is gelukt.\"},\"sessions\":{\"signed_in\":\"Inloggen gelukt.\",\"signed_out\":\"Uitloggen gelukt.\"},\"unlocks\":{\"send_instructions\":\"Binnen enkele minuten zal u een email krijgen met instructies om uw account te ontgrendelen.\",\"unlocked\":\"Uw account is ontgrendeld. U wordt nu ingelogd.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"was al bevestigd\",\"not_found\":\"niet gevonden\",\"not_locked\":\"was niet vergrendeld\"}},\"jobs\":{\"allowed_failures\":\"Toegestane mislukkingen\",\"author\":\"Auteur\",\"branch\":\"Tak\",\"build_matrix\":\"Bouw matrix\",\"compare\":\"Vergelijk\",\"config\":\"Configuratie\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"message\":\"Bericht\",\"messages\":{\"sponsored_by\":\"Deze testen zijn uitgevoerd op een machine gesponsord door\"},\"started_at\":\"Gestart\",\"commit\":\"Commit\",\"committer\":\"Committer\"},\"layouts\":{\"about\":{\"alpha\":\"Dit is in alfa-stadium.\",\"join\":\"Doe met ons mee en help!\",\"mailing_list\":\"Mailing lijst\",\"messages\":{\"alpha\":\"Gelieve deze service <strong>niet</strong> te beschouwen als stabiel. Daar zijn we nog lang niet! Meer info <a href='https://github.com/travis-ci'>hier.</a>\"},\"repository\":\"Repository\",\"twitter\":\"Twitter\"},\"application\":{\"fork_me\":\"Maak een fork op Github\",\"my_repositories\":\"Mijn repositories\",\"recent\":\"Recent\",\"search\":\"Zoeken\",\"sponsers\":\"Sponsors\",\"sponsors_link\":\"Bekijk al onze geweldige sponsors &rarr;\"},\"mobile\":{\"author\":\"Auteur\",\"build\":\"Bouw\",\"build_matrix\":\"Bouw matrix\",\"compare\":\"Vergelijk\",\"config\":\"Configuratie\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid op\",\"job\":\"Taak\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"log\":\"Logboek\"},\"top\":{\"admin\":\"Administratie\",\"blog\":\"Blog\",\"docs\":\"Documentatie\",\"github_login\":\"Inloggen met Github\",\"home\":\"Home\",\"profile\":\"Profiel\",\"sign_out\":\"Uitloggen\",\"stats\":\"Statistieken\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"nl\":\"Nederlands\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"pt-BR\":\"português brasileiro\"},\"no_job\":\"Er zijn geen taken\",\"profiles\":{\"show\":{\"email\":\"Email adres\",\"github\":\"Github\",\"message\":{\"config\":\"hoe eigen bouw-opties in te stellen\",\"your_repos\":\"Zet de schakelaars hieronder aan om de Travis hook voor uw projecten te activeren en push daarna naar Github<br />\\nOm te testen tegen meerdere rubies, zie\"},\"messages\":{\"notice\":\"Om te beginnen kunt u onze <a href=\\\\\\\"http://about.travis-ci.org/docs/user/getting-started/\\\\\\\">startersgids</a> lezen.\\\\n  <small>Het zal maar enkele minuten van uw tijd vergen.</small>\"},\"update\":\"Bijwerken\",\"update_locale\":\"Bijwerken\",\"your_locale\":\"Uw taal\",\"your_repos\":\"Uw repositories\",\"token\":\"Token\"}},\"queue\":\"Wachtrij\",\"repositories\":{\"branch\":\"Tak\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"image_url\":\"Afbeeldings URL\",\"message\":\"Bericht\",\"started_at\":\"Gestart\",\"tabs\":{\"branches\":\"Tak samenvatting\",\"build\":\"Bouw\",\"build_history\":\"Bouw geschiedenis\",\"current\":\"Huidig\",\"job\":\"Taak\"},\"commit\":\"Commit\",\"markdown\":\"Markdown\",\"rdoc\":\"RDOC\",\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Duur\"},\"statistics\":{\"index\":{\"build_count\":\"Bouw aantal\",\"count\":\"Aantal\",\"last_month\":\"voorbije maand\",\"repo_growth\":\"Repository groei\",\"total_builds\":\"Bouw totaal\",\"total_projects\":\"Projecten/Repository totaal\"}},\"workers\":\"Machines\",\"home\":{\"name\":\"Hoofdpagina\"}},\"pl\":{\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} godzina\",\"other\":\"%{count} godziny\"},\"minutes_exact\":{\"one\":\"%{count} minuta\",\"other\":\"%{count} minuty\"},\"seconds_exact\":{\"one\":\"%{count} sekunda\",\"other\":\"%{count} sekundy\"}}},\"workers\":\"Workers\",\"queue\":\"Kolejka\",\"no_job\":\"Brak zadań\",\"repositories\":{\"branch\":\"Gałąź\",\"image_url\":\"URL obrazka\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Opis\",\"started_at\":\"Rozpoczęto\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\",\"tabs\":{\"current\":\"Aktualny\",\"build_history\":\"Historia Buildów\",\"branches\":\"Wszystkie Gałęzie\",\"build\":\"Build\",\"job\":\"Zadanie\"}},\"build\":{\"job\":\"Zadanie\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"Te testy zostały uruchomione na maszynie sponsorowanej przez\"},\"build_matrix\":\"Macierz Buildów\",\"allowed_failures\":\"Dopuszczalne Niepowodzenia\",\"author\":\"Autor\",\"config\":\"Konfiguracja\",\"compare\":\"Porównanie\",\"committer\":\"Committer\",\"branch\":\"Gałąź\",\"commit\":\"Commit\",\"message\":\"Opis\",\"started_at\":\"Rozpoczęto\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\",\"sponsored_by\":\"Te testy zostały uruchomione na maszynie sponsorowanej przez\"},\"builds\":{\"name\":\"Build\",\"messages\":{\"sponsored_by\":\"Te testy zostały uruchomione na maszynie sponsorowanej przez\"},\"build_matrix\":\"Macierz Buildów\",\"allowed_failures\":\"Dopuszczalne Niepowodzenia\",\"author\":\"Autor\",\"config\":\"Konfiguracja\",\"compare\":\"Porównanie\",\"committer\":\"Komitujący\",\"branch\":\"Gałąź\",\"commit\":\"Commit\",\"message\":\"Opis\",\"started_at\":\"Rozpoczęto\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\"},\"layouts\":{\"top\":{\"home\":\"Start\",\"blog\":\"Blog\",\"docs\":\"Dokumentacja\",\"stats\":\"Statystki\",\"github_login\":\"Zaloguj się przy pomocy Githuba\",\"profile\":\"Profil\",\"sign_out\":\"Wyloguj się\"},\"application\":{\"fork_me\":\"Fork me on Github\",\"recent\":\"Ostatnie\",\"search\":\"Wyniki\",\"sponsers\":\"Sponsorzy\",\"sponsors_link\":\"Zobacz naszych wszystkich wspaniałych sponsorów &rarr;\",\"my_repositories\":\"Moje repozytoria\"},\"about\":{\"alpha\":\"To wciąż jest wersja alpha.\",\"messages\":{\"alpha\":\"Proszę <strong>nie</strong> traktuj tego jako stabilnej usługi. Wciąż nam wiele do tego brakuje! Więcej informacji znajdziesz <a href='https://github.com/travis-ci'>tutaj.</a>\"},\"join\":\"Pomóż i dołącz do nas!\",\"mailing_list\":\"Lista mailingowa\",\"repository\":\"Repozytorium\",\"twitter\":\"Twitter\"},\"mobile\":{\"author\":\"Autor\",\"build\":\"Build\",\"build_matrix\":\"Macierz Buildów\",\"commit\":\"Commit\",\"committer\":\"Komitujący\",\"compare\":\"Porównianie\",\"config\":\"Konfiguracja\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\",\"job\":\"Zadanie\",\"log\":\"Log\"}},\"profiles\":{\"show\":{\"email\":\"Email\",\"github\":\"Github\",\"message\":{\"your_repos\":\"  Przesuń suwak poniżej, aby włączyć Travisa, dla twoich projektów, a następnie umieść swój kod na GitHubie.<br />\\n Aby testować swój kod przy użyciu wielu wersji Rubiego, zobacz\",\"config\":\"jak skonfigurować niestandardowe opcje builda\"},\"messages\":{\"notice\":\"Aby zacząć, przeczytaj nasz <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Przewodnik </a>.\\n  <small>Zajmie ci to tylko kilka minut.</small>\"},\"token\":\"Token\",\"your_repos\":\"Twoje repozytoria\"}},\"statistics\":{\"index\":{\"count\":\"Ilość\",\"repo_growth\":\"Przyrost repozytoriów\",\"total_projects\":\"Łącznie projektów/repozytoriów\",\"build_count\":\"Liczba buildów\",\"last_month\":\"ostatni miesiąc\",\"total_builds\":\"Łącznie Buildów\"}},\"date\":{\"abbr_day_names\":[\"nie\",\"pon\",\"wto\",\"śro\",\"czw\",\"pią\",\"sob\"],\"abbr_month_names\":[\"sty\",\"lut\",\"mar\",\"kwi\",\"maj\",\"cze\",\"lip\",\"sie\",\"wrz\",\"paź\",\"lis\",\"gru\"],\"day_names\":[\"niedziela\",\"poniedziałek\",\"wtorek\",\"środa\",\"czwartek\",\"piątek\",\"sobota\"],\"formats\":{\"default\":\"%d-%m-%Y\",\"long\":\"%B %d, %Y\",\"short\":\"%d %b\"},\"month_names\":[\"styczeń\",\"luty\",\"marzec\",\"kwiecień\",\"maj\",\"czerwiec\",\"lipiec\",\"sierpień\",\"wrzesień\",\"październik\",\"listopad\",\"grudzień\"],\"order\":[\"day\",\"month\",\"year\"]},\"errors\":{\"format\":\"%{attribute} %{message}\",\"messages\":{\"accepted\":\"musi zostać zaakceptowane\",\"blank\":\"nie może być puste\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"pt-BR\":{\"admin\":{\"actions\":{\"create\":\"criar\",\"created\":\"criado\",\"delete\":\"deletar\",\"deleted\":\"deletado\",\"update\":\"atualizar\",\"updated\":\"atualizado\"},\"credentials\":{\"log_out\":\"Deslogar\"},\"dashboard\":{\"add_new\":\"Adicionar novo\",\"ago\":\"atrás\",\"last_used\":\"Última utilização\",\"model_name\":\"Nome do modelo\",\"modify\":\"Modificar\",\"name\":\"Dashboard\",\"pagename\":\"Administração do site\",\"records\":\"Registros\",\"show\":\"Mostrar\"},\"delete\":{\"confirmation\":\"Sim, tenho certeza\",\"flash_confirmation\":\"%{name} foi destruído com sucesso\"},\"flash\":{\"error\":\"%{name} falhou ao %{action}\",\"noaction\":\"Nenhuma ação foi tomada\",\"successful\":\"%{name} foi %{action} com sucesso\"},\"history\":{\"name\":\"Histórico\",\"no_activity\":\"Nenhuma Atividade\",\"page_name\":\"Histórico para %{name}\"},\"list\":{\"add_new\":\"Adicionar novo\",\"delete_action\":\"Deletar\",\"delete_selected\":\"Deletar selecionados\",\"edit_action\":\"Editar\",\"search\":\"Buscar\",\"select\":\"Selecionar %{name} para editar\",\"select_action\":\"Selecionar\",\"show_all\":\"Mostrar todos\"},\"new\":{\"basic_info\":\"Informações básicas\",\"cancel\":\"Cancelar\",\"chosen\":\"Escolhido %{name}\",\"chose_all\":\"Escolher todos\",\"clear_all\":\"Limpar todos\",\"many_chars\":\"caracteres ou menos.\",\"one_char\":\"caractere.\",\"optional\":\"Opcional\",\"required\":\"Requerido\",\"save\":\"Salvar\",\"save_and_add_another\":\"Salvar e adicionar outro\",\"save_and_edit\":\"Salvar e alterar\",\"select_choice\":\"Selecione e clique\"}},\"build\":{\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"job\":\"Trabalho\"},\"builds\":{\"allowed_failures\":\"Falhas Permitidas\",\"author\":\"Autor\",\"branch\":\"Branch\",\"build_matrix\":\"Matriz de Build\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Comparar\",\"config\":\"Config\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"message\":\"Mensagem\",\"messages\":{\"sponsored_by\":\"Esta série de testes foi executada em uma caixa de processos patrocinada por\"},\"name\":\"Build\",\"started_at\":\"Iniciou em\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} hora\",\"other\":\"%{count} horas\"},\"minutes_exact\":{\"one\":\"%{count} minuto\",\"other\":\"%{count} minutos\"},\"seconds_exact\":{\"one\":\"%{count} segundo\",\"other\":\"%{count} segundos\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Sua conta foi confirmada com sucesso. Você agora está logado.\",\"send_instructions\":\"Você receberá um email com instruções de como confirmar sua conta em alguns minutos.\"},\"failure\":{\"inactive\":\"Sua conta ainda não foi ativada.\",\"invalid\":\"Email ou senha inválidos.\",\"invalid_token\":\"Token de autenticação inválido.\",\"locked\":\"Sua conta está trancada.\",\"timeout\":\"Sua sessão expirou, por favor faça seu login novamente.\",\"unauthenticated\":\"Você precisa fazer o login ou cadastrar-se antes de continuar.\",\"unconfirmed\":\"Você precisa confirmar sua conta antes de continuar.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Instruções de confirmação\"},\"reset_password_instructions\":{\"subject\":\"Instruções de atualização de senha\"},\"unlock_instructions\":{\"subject\":\"Instruções de destrancamento\"}},\"passwords\":{\"send_instructions\":\"Você receberá um email com instruções de como atualizar sua senha em alguns minutos.\",\"updated\":\"Sua senha foi alterada com sucesso. Você agora está logado.\"},\"registrations\":{\"destroyed\":\"Tchau! Sua conta foi cancelada com sucesso. Esperamos vê-lo novamente em breve!\",\"signed_up\":\"Você se cadastrou com sucesso. Se ativada, uma confirmação foi enviada para seu email.\",\"updated\":\"Você atualizou sua conta com sucesso.\"},\"sessions\":{\"signed_in\":\"Logado com sucesso.\",\"signed_out\":\"Deslogado com sucesso.\"},\"unlocks\":{\"send_instructions\":\"Você receberá um email com instruções de como destrancar sua conta em alguns minutos.\",\"unlocked\":\"Sua conta foi destrancada com sucesso. Você agora está logado.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"já foi confirmado\",\"not_found\":\"não encontrado\",\"not_locked\":\"não estava trancado\"}},\"home\":{\"name\":\"home\"},\"jobs\":{\"allowed_failures\":\"Falhas Permitidas\",\"author\":\"Autor\",\"branch\":\"Branch\",\"build_matrix\":\"Matriz de Build\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Comparar\",\"config\":\"Config\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"message\":\"Mensagem\",\"messages\":{\"sponsored_by\":\"Esta série de testes foi executada em uma caixa de processos patrocinada por\"},\"started_at\":\"Iniciou em\"},\"layouts\":{\"about\":{\"alpha\":\"Isto é um alpha.\",\"join\":\"Junte-se à nós e ajude!\",\"mailing_list\":\"Lista de email\",\"messages\":{\"alpha\":\"Por favor, <strong>não</strong> considere isto um serviço estável. Estamos muito longe disso! Mais informações <a href='https://github.com/travis-ci'>aqui.</a>\"},\"repository\":\"Repositório\",\"twitter\":\"Twitter\"},\"application\":{\"fork_me\":\"Faça fork no Github\",\"my_repositories\":\"Meus Repositórios\",\"recent\":\"Recentes\",\"search\":\"Buscar\",\"sponsers\":\"Patrocinadores\",\"sponsors_link\":\"Conheça todos os nossos patrocinadores &rarr;\"},\"mobile\":{\"author\":\"Autor\",\"build\":\"Build\",\"build_matrix\":\"Matriz de Build\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Comparar\",\"config\":\"Config\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"job\":\"Trabalho\",\"log\":\"Log\"},\"top\":{\"admin\":\"Admin\",\"blog\":\"Blog\",\"docs\":\"Documentação\",\"github_login\":\"Logue com o Github\",\"home\":\"Home\",\"profile\":\"Perfil\",\"sign_out\":\"Sair\",\"stats\":\"Estatísticas\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"nl\":\"Nederlands\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"pt-BR\":\"português brasileiro\"},\"no_job\":\"Não há trabalhos\",\"profiles\":{\"show\":{\"email\":\"Email\",\"github\":\"Github\",\"message\":{\"config\":\"como configurar opções de build\",\"your_repos\":\"Use os botões abaixo para ligar ou desligar o hook de serviço do Travis para seus projetos, e então, faça um push para o Github.<br />Para testar com múltiplas versões do Ruby, leia\"},\"messages\":{\"notice\":\"Para começar, leia nosso <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Guia de início</a>. <small>Só leva alguns minutinhos.</small>\"},\"token\":\"Token\",\"update\":\"Atualizar\",\"update_locale\":\"Atualizar\",\"your_locale\":\"Sua língua\",\"your_repos\":\"Seus Repositórios\"}},\"queue\":\"Fila\",\"repositories\":{\"branch\":\"Branch\",\"commit\":\"Commit\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"image_url\":\"URL da imagem\",\"markdown\":\"Markdown\",\"message\":\"Mensagem\",\"rdoc\":\"RDOC\",\"started_at\":\"Iniciou em\",\"tabs\":{\"branches\":\"Sumário do Branch\",\"build\":\"Build\",\"build_history\":\"Histórico de Build\",\"current\":\"Atual\",\"job\":\"Trabalho\"},\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Duração\"},\"statistics\":{\"index\":{\"build_count\":\"Número de Builds\",\"count\":\"Número\",\"last_month\":\"último mês\",\"repo_growth\":\"Crescimento de Repositório\",\"total_builds\":\"Total de Builds\",\"total_projects\":\"Total de Projetos/Repositórios\"}},\"workers\":\"Processos\"},\"ru\":{\"admin\":{\"actions\":{\"create\":\"создать\",\"created\":\"создано\",\"delete\":\"удалить\",\"deleted\":\"удалено\",\"update\":\"обновить\",\"updated\":\"обновлено\"},\"credentials\":{\"log_out\":\"Выход\"},\"dashboard\":{\"add_new\":\"Добавить\",\"ago\":\"назад\",\"last_used\":\"Использовалось в последний раз\",\"model_name\":\"Имя модели\",\"modify\":\"Изменить\",\"name\":\"Панель управления\",\"pagename\":\"Управление сайтом\",\"records\":\"Записи\",\"show\":\"Показать\"},\"delete\":{\"confirmation\":\"Да, я уверен\",\"flash_confirmation\":\"%{name} успешно удалено\"},\"history\":{\"name\":\"История\",\"no_activity\":\"Нет активности\",\"page_name\":\"История %{name}\"},\"list\":{\"add_new\":\"Добавить\",\"delete_action\":\"Удалить\",\"delete_selected\":\"Удалить выбранные\",\"edit_action\":\"Редактировать\",\"search\":\"Поиск\",\"select\":\"Для редактирования выберите %{name}\",\"select_action\":\"Выбрать\",\"show_all\":\"Показать все\"},\"new\":{\"basic_info\":\"Основная информация\",\"cancel\":\"Отмена\",\"chosen\":\"Выбрано %{name}\",\"chose_all\":\"Выбрать все\",\"clear_all\":\"Очистить все\",\"one_char\":\"символ.\",\"optional\":\"Необязательно\",\"required\":\"Обязательно\",\"save\":\"Сохранить\",\"save_and_add_another\":\"Сохранить и добавить другое\",\"save_and_edit\":\"Сохранить и продолжить редактирование\",\"select_choice\":\"Выберите и кликните\",\"many_chars\":\"символов или меньше.\"},\"flash\":{\"error\":\"%{name} не удалось %{action}\",\"noaction\":\"Никаких действий не произведено\",\"successful\":\"%{name} было успешно %{action}\"}},\"build\":{\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"job\":\"Задача\"},\"builds\":{\"allowed_failures\":\"Допустимые неудачи\",\"author\":\"Автор\",\"branch\":\"Ветка\",\"build_matrix\":\"Матрица\",\"commit\":\"Коммит\",\"committer\":\"Коммитер\",\"compare\":\"Дифф\",\"config\":\"Конфигурация\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"message\":\"Комментарий\",\"messages\":{\"sponsored_by\":\"Эта серия тестов была запущена на машине, спонсируемой\"},\"name\":\"Билд\",\"started_at\":\"Начало\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} час\",\"few\":\"%{count} часа\",\"many\":\"%{count} часов\",\"other\":\"%{count} часа\"},\"minutes_exact\":{\"one\":\"%{count} минута\",\"few\":\"%{count} минуты\",\"many\":\"%{count} минут\",\"other\":\"%{count} минуты\"},\"seconds_exact\":{\"one\":\"%{count} секунда\",\"few\":\"%{count} секунды\",\"many\":\"%{count} секунд\",\"other\":\"%{count} секунды\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Ваш аккаунт успешно подтвержден. Приветствуем!\",\"send_instructions\":\"В течении нескольких минут вы получите электронное письмо с инструкциями для прохождения процедуры подтверждения аккаунта.\"},\"failure\":{\"inactive\":\"Ваш аккаунт еще не активирован.\",\"invalid\":\"Ошибка в адресе почты или пароле.\",\"invalid_token\":\"Неправильный токен аутентификации.\",\"locked\":\"Ваш аккаунт заблокирован.\",\"timeout\":\"Сессия окончена. Для продолжения работы войдите снова.\",\"unauthenticated\":\"Вам нужно войти или зарегистрироваться.\",\"unconfirmed\":\"Вы должны сначала подтвердить свой аккаунт.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Инструкции для подтверждению аккаунта\"},\"reset_password_instructions\":{\"subject\":\"Инструкции для сброса пароля\"},\"unlock_instructions\":{\"subject\":\"Инструкции для разблокирования аккаунта\"}},\"passwords\":{\"send_instructions\":\"В течении нескольких минут вы получите электронное письмо с инструкциями для сброса пароля.\",\"updated\":\"Ваш пароль успешно изменен. Приветствуем!\"},\"registrations\":{\"destroyed\":\"Ваш аккаунт был успешно удален. Живите долго и процветайте!\",\"signed_up\":\"Вы успешно прошли регистрацию. Инструкции для подтверждения аккаунта отправлены на ваш электронный адрес.\",\"updated\":\"Аккаунт успешно обновлен.\"},\"sessions\":{\"signed_in\":\"Приветствуем!\",\"signed_out\":\"Удачи!\"},\"unlocks\":{\"send_instructions\":\"В течении нескольких минут вы получите электронное письмо с инструкциям для разблокировния аккаунта.\",\"unlocked\":\"Ваш аккаунт успешно разблокирован. Приветствуем!\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"уже подтвержден\",\"not_found\":\"не найден\",\"not_locked\":\"не заблокирован\"}},\"home\":{\"name\":\"Главная\"},\"jobs\":{\"allowed_failures\":\"Допустимые неудачи\",\"author\":\"Автор\",\"branch\":\"Ветка\",\"build_matrix\":\"Матрица\",\"commit\":\"Коммит\",\"committer\":\"Коммитер\",\"compare\":\"Сравнение\",\"config\":\"Конфигурация\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"message\":\"Комментарий\",\"messages\":{\"sponsored_by\":\"Эта серия тестов была запущена на машине спонсируемой\"},\"started_at\":\"Начало\"},\"layouts\":{\"about\":{\"alpha\":\"Это альфа-версия\",\"join\":\"Присоединяйтесь к нам и помогайте!\",\"mailing_list\":\"Лист рассылки\",\"messages\":{\"alpha\":\"Пожалуйста, <strong>не</strong> считайте данный сервис стабильным. Мы еще очень далеки от стабильности! <a href='https://github.com/travis-ci'>Подробности</a>\"},\"repository\":\"Репозиторий\",\"twitter\":\"Twitter\"},\"application\":{\"fork_me\":\"Fork me on Github\",\"my_repositories\":\"Мои репозитории\",\"recent\":\"Недавние\",\"search\":\"Поиск\",\"sponsers\":\"Спонсоры\",\"sponsors_link\":\"Список всех наших замечательных спонсоров &rarr;\"},\"mobile\":{\"author\":\"Автор\",\"build\":\"Сборка\",\"build_matrix\":\"Матрица сборок\",\"commit\":\"Коммит\",\"committer\":\"Коммитер\",\"compare\":\"Сравнение\",\"config\":\"Конфигурация\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"job\":\"Задача\",\"log\":\"Журнал\"},\"top\":{\"admin\":\"Управление\",\"blog\":\"Блог\",\"docs\":\"Документация\",\"github_login\":\"Войти через Github\",\"home\":\"Главная\",\"profile\":\"Профиль\",\"sign_out\":\"Выход\",\"stats\":\"Статистика\"}},\"no_job\":\"Очередь пуста\",\"profiles\":{\"show\":{\"email\":\"Электронная почта\",\"github\":\"Github\",\"message\":{\"config\":\"как настроить специальные опции билда\",\"your_repos\":\"Используйте переключатели, чтобы включить Travis service hook для вашего проекта, а потом отправьте код на GitHub.<br />\\nДля тестирования на нескольких версиях Ruby смотрите\"},\"messages\":{\"notice\":\"Перед началом, пожалуйста, прочтите <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Руководство для быстрого старта</a>. <small>Это займет всего несколько минут.</small>\"},\"token\":\"Токен\",\"update\":\"Обновить\",\"update_locale\":\"Обновить\",\"your_locale\":\"Ваш язык\",\"your_repos\":\"Ваши репозитории\"}},\"queue\":\"Очередь\",\"repositories\":{\"branch\":\"Ветка\",\"commit\":\"Коммит\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"image_url\":\"URL изображения\",\"markdown\":\"Markdown\",\"message\":\"Комментарий\",\"rdoc\":\"RDOC\",\"started_at\":\"Начало\",\"tabs\":{\"branches\":\"Статус веток\",\"build\":\"Билд\",\"build_history\":\"История\",\"current\":\"Текущий\",\"job\":\"Задача\"},\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Длительность\"},\"statistics\":{\"index\":{\"build_count\":\"Количество билдов\",\"count\":\"Количество\",\"last_month\":\"прошлый месяц\",\"repo_growth\":\"Рост числа репозиториев\",\"total_builds\":\"Всего билдов\",\"total_projects\":\"Всего проектов/репозиториев\"}},\"workers\":\"Машины\",\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}}};\n\n\n})();\n//@ sourceURL=config/locales");minispade.register('ext/ember/bound_helper', "(function() {// https://gist.github.com/2018185\n// For reference: https://github.com/wagenet/ember.js/blob/ac66dcb8a1cbe91d736074441f853e0da474ee6e/packages/ember-handlebars/lib/views/bound_property_view.js\nvar BoundHelperView = Ember.View.extend(Ember._Metamorph, {\n\n  context: null,\n  options: null,\n  property: null,\n  // paths of the property that are also observed\n  propertyPaths: [],\n\n  value: Ember.K,\n\n  valueForRender: function() {\n    var value = this.value(Ember.get(this.context, this.property), this.options);\n    if (this.options.escaped) { value = Handlebars.Utils.escapeExpression(value); }\n    return value;\n  },\n\n  render: function(buffer) {\n    buffer.push(this.valueForRender());\n  },\n\n  valueDidChange: function() {\n    if (this.morph.isRemoved()) { return; }\n    this.morph.html(this.valueForRender());\n  },\n\n  didInsertElement: function() {\n    this.valueDidChange();\n  },\n\n  init: function() {\n    this._super();\n    Ember.addObserver(this.context, this.property, this, 'valueDidChange');\n    this.get('propertyPaths').forEach(function(propName) {\n        Ember.addObserver(this.context, this.property + '.' + propName, this, 'valueDidChange');\n    }, this);\n  },\n\n  destroy: function() {\n    Ember.removeObserver(this.context, this.property, this, 'valueDidChange');\n    this.get('propertyPaths').forEach(function(propName) {\n        this.context.removeObserver(this.property + '.' + propName, this, 'valueDidChange');\n    }, this);\n    this._super();\n  }\n\n});\n\nEmber.registerBoundHelper = function(name, func) {\n  var propertyPaths = Array.prototype.slice.call(arguments, 2);\n  Ember.Handlebars.registerHelper(name, function(property, options) {\n    var data = options.data,\n        view = data.view,\n        ctx  = this;\n\n    var bindView = view.createChildView(BoundHelperView, {\n      property: property,\n      propertyPaths: propertyPaths,\n      context: ctx,\n      options: options.hash,\n      value: func\n    });\n\n    view.appendChild(bindView);\n  });\n};\n\n\n})();\n//@ sourceURL=ext/ember/bound_helper");minispade.register('ext/ember/namespace', "(function() {Em.Namespace.reopen = Em.Namespace.reopenClass\n\n\n\n})();\n//@ sourceURL=ext/ember/namespace");
+;minispade.register('app', "(function() {(function() {\nminispade.require('auth');\nminispade.require('controllers');\nminispade.require('helpers');\nminispade.require('models');\nminispade.require('pusher');\nminispade.require('routes');\nminispade.require('slider');\nminispade.require('store');\nminispade.require('tailing');\nminispade.require('templates');\nminispade.require('views');\nminispade.require('config/locales');\nminispade.require('data/sponsors');\n\n  Travis.reopen({\n    App: Em.Application.extend({\n      autoinit: false,\n      currentUserBinding: 'auth.user',\n      authStateBinding: 'auth.state',\n      init: function() {\n        this._super.apply(this, arguments);\n        this.store = Travis.Store.create();\n        this.store.loadMany(Travis.Sponsor, Travis.SPONSORS);\n        this.slider = new Travis.Slider();\n        this.pusher = new Travis.Pusher(Travis.config.pusher_key);\n        this.tailing = new Travis.Tailing();\n        return this.set('auth', Travis.Auth.create({\n          app: this,\n          endpoint: Travis.config.api_endpoint\n        }));\n      },\n      storeAfterSignInPath: function(path) {\n        return this.get('auth').storeAfterSignInPath(path);\n      },\n      autoSignIn: function(path) {\n        return this.get('auth').autoSignIn(path);\n      },\n      signIn: function() {\n        return this.get('auth').signIn();\n      },\n      signOut: function() {\n        this.get('auth').signOut();\n        return this.get('router').send('afterSignOut');\n      },\n      receive: function() {\n        return this.store.receive.apply(this.store, arguments);\n      },\n      toggleSidebar: function() {\n        var element;\n        $('body').toggleClass('maximized');\n        element = $('<span></span>');\n        $('#top .profile').append(element);\n        Em.run.later((function() {\n          return element.remove();\n        }), 10);\n        element = $('<span></span>');\n        $('#repo').append(element);\n        return Em.run.later((function() {\n          return element.remove();\n        }), 10);\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=app");minispade.register('auth', "(function() {(function() {\n\n  this.Travis.Auth = Ember.Object.extend({\n    iframe: $('<iframe id=\"auth-frame\" />').hide(),\n    timeout: 10000,\n    state: 'signed-out',\n    receivingEnd: \"\" + location.protocol + \"//\" + location.host,\n    init: function() {\n      var _this = this;\n      this.iframe.appendTo('body');\n      return window.addEventListener('message', function(e) {\n        return _this.receiveMessage(e);\n      });\n    },\n    accessToken: (function() {\n      return sessionStorage.getItem('travis.token');\n    }).property(),\n    autoSignIn: function(path) {\n      var user;\n      if (user = sessionStorage.getItem('travis.user')) {\n        return this.setData({\n          user: JSON.parse(user)\n        });\n      } else if (localStorage.getItem('travis.auto_signin')) {\n        return this.signIn();\n      }\n    },\n    signIn: function() {\n      this.set('state', 'signing-in');\n      this.trySignIn();\n      return Ember.run.later(this, this.checkSignIn.bind(this), this.timeout);\n    },\n    signOut: function() {\n      localStorage.removeItem('travis.auto_signin');\n      localStorage.removeItem('travis.locale');\n      sessionStorage.clear();\n      return this.setData();\n    },\n    trySignIn: function() {\n      return this.iframe.attr('src', \"\" + this.endpoint + \"/auth/post_message?origin=\" + this.receivingEnd);\n    },\n    checkSignIn: function() {\n      if (this.get('state') === 'signing-in') {\n        return this.forceSignIn();\n      }\n    },\n    forceSignIn: function() {\n      localStorage.setItem('travis.auto_signin', 'true');\n      return window.location = \"\" + this.endpoint + \"/auth/handshake?redirect_uri=\" + location;\n    },\n    setData: function(data) {\n      var user;\n      if (typeof data === 'string') {\n        data = JSON.parse(data);\n      }\n      if (data != null ? data.token : void 0) {\n        this.storeToken(data.token);\n      }\n      if (data != null ? data.user : void 0) {\n        user = this.storeUser(data.user);\n      }\n      this.set('state', user ? 'signed-in' : 'signed-out');\n      this.set('user', user ? user : void 0);\n      return this.afterSignIn();\n    },\n    afterSignIn: function() {\n      return this.get('app.router').send('afterSignIn', this.readAfterSignInPath());\n    },\n    storeToken: function(token) {\n      sessionStorage.setItem('travis.token', token);\n      return this.notifyPropertyChange('accessToken');\n    },\n    storeUser: function(user) {\n      localStorage.setItem('travis.auto_signin', 'true');\n      sessionStorage.setItem('travis.user', JSON.stringify(user));\n      this.app.store.load(Travis.User, user);\n      user = this.app.store.find(Travis.User, user.id);\n      user.get('permissions');\n      return user;\n    },\n    storeAfterSignInPath: function(path) {\n      return sessionStorage.setItem('travis.after_signin_path', path);\n    },\n    readAfterSignInPath: function() {\n      var path;\n      path = sessionStorage.getItem('travis.after_signin_path');\n      sessionStorage.removeItem('travis.after_signin_path');\n      return path;\n    },\n    receiveMessage: function(event) {\n      if (event.origin === this.expectedOrigin()) {\n        if (event.data.token) {\n          event.data.user.token = event.data.token;\n        }\n        this.setData(event.data);\n        return console.log(\"signed in as \" + event.data.user.login);\n      } else {\n        return console.log(\"unexpected message \" + event.origin + \": \" + event.data);\n      }\n    },\n    expectedOrigin: function() {\n      if (this.endpoint[0] === '/') {\n        return this.receivingEnd;\n      } else {\n        return this.endpoint;\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=auth");minispade.register('controllers', "(function() {(function() {\nminispade.require('helpers');\nminispade.require('travis/ticker');\n\n  Travis.reopen({\n    Controller: Em.Controller.extend(),\n    TopController: Em.Controller.extend({\n      userBinding: 'Travis.app.currentUser'\n    }),\n    ApplicationController: Em.Controller.extend(),\n    MainController: Em.Controller.extend(),\n    StatsLayoutController: Em.Controller.extend(),\n    ProfileLayoutController: Em.Controller.extend(),\n    AuthLayoutController: Em.Controller.extend()\n  });\nminispade.require('controllers/accounts');\nminispade.require('controllers/builds');\nminispade.require('controllers/flash');\nminispade.require('controllers/home');\nminispade.require('controllers/profile');\nminispade.require('controllers/repos');\nminispade.require('controllers/repo');\nminispade.require('controllers/sidebar');\nminispade.require('controllers/stats');\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers");minispade.register('controllers/accounts', "(function() {(function() {\n\n  Travis.AccountsController = Ember.ArrayController.extend({\n    tab: 'accounts',\n    init: function() {\n      return this._super();\n    },\n    findByLogin: function(login) {\n      return this.find(function(account) {\n        return account.get('login') === login;\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/accounts");minispade.register('controllers/builds', "(function() {(function() {\n\n  Travis.BuildsController = Em.ArrayController.extend({\n    repo: 'parent.repo',\n    contentBinding: 'parent.builds'\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/builds");minispade.register('controllers/flash', "(function() {(function() {\n\n  Travis.FlashController = Ember.ArrayController.extend({\n    broadcastBinding: 'Travis.app.currentUser.broadcasts',\n    init: function() {\n      this.set('flashes', Ember.A());\n      return this._super.apply(this, arguments);\n    },\n    content: (function() {\n      return this.get('unseenBroadcasts').concat(this.get('flashes'));\n    }).property('unseenBroadcasts.length', 'flashes.length'),\n    unseenBroadcasts: (function() {\n      return this.get('broadcasts').filterProperty('isSeen', false);\n    }).property('broadcasts.isLoaded', 'broadcasts.length'),\n    broadcasts: (function() {\n      if (Travis.app.get('currentUser')) {\n        return Travis.Broadcast.find();\n      } else {\n        return Ember.A();\n      }\n    }).property('Travis.app.currentUser'),\n    loadFlashes: function(msgs) {\n      var msg, type, _i, _len, _results;\n      _results = [];\n      for (_i = 0, _len = msgs.length; _i < _len; _i++) {\n        msg = msgs[_i];\n        type = Ember.keys(msg)[0];\n        msg = {\n          type: type,\n          message: msg[type]\n        };\n        this.get('flashes').pushObject(msg);\n        _results.push(Ember.run.later(this, (function() {\n          return this.get('flashes').removeObject(msg);\n        }), 15000));\n      }\n      return _results;\n    },\n    close: function(msg) {\n      if (msg instanceof Travis.Broadcast) {\n        msg.setSeen();\n        return this.notifyPropertyChange('unseenBroadcasts');\n      } else {\n        return this.get('flashes').removeObject(msg);\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/flash");minispade.register('controllers/home', "(function() {(function() {\n\n  Travis.HomeLayoutController = Travis.Controller.extend();\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/home");minispade.register('controllers/profile', "(function() {(function() {\n\n  Travis.ProfileController = Travis.Controller.extend({\n    name: 'profile',\n    userBinding: 'Travis.app.currentUser',\n    accountsBinding: 'Travis.app.router.accountsController',\n    account: (function() {\n      var account, login;\n      login = this.get('params.login') || Travis.app.get('currentUser.login');\n      account = this.get('accounts').filter(function(account) {\n        if (account.get('login') === login) {\n          return account;\n        }\n      })[0];\n      if (account) {\n        account.select();\n      }\n      return account;\n    }).property('accounts.length', 'params.login'),\n    activate: function(action, params) {\n      this.setParams(params || this.get('params'));\n      return this[\"view\" + ($.camelize(action))]();\n    },\n    viewHooks: function() {\n      this.connectTab('hooks');\n      return this.set('hooks', Travis.Hook.find({\n        owner_name: this.get('params.login') || Travis.app.get('currentUser.login')\n      }));\n    },\n    viewUser: function() {\n      return this.connectTab('user');\n    },\n    connectTab: function(tab) {\n      var viewClass;\n      viewClass = Travis[\"\" + ($.camelize(tab)) + \"View\"];\n      this.set('tab', tab);\n      return this.connectOutlet({\n        outletName: 'pane',\n        controller: this,\n        viewClass: viewClass\n      });\n    },\n    setParams: function(params) {\n      var key, value, _results;\n      this.set('params', {});\n      _results = [];\n      for (key in params) {\n        value = params[key];\n        _results.push(this.set(\"params.\" + key, params[key]));\n      }\n      return _results;\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/profile");minispade.register('controllers/repo', "(function() {(function() {\n\n  Travis.RepoController = Travis.Controller.extend({\n    bindings: [],\n    init: function() {\n      this._super.apply(this, arguments);\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    updateTimes: function() {\n      var build, builds, jobs;\n      if (builds = this.get('builds')) {\n        builds.forEach(function(b) {\n          return b.updateTimes();\n        });\n      }\n      if (build = this.get('build')) {\n        build.updateTimes();\n      }\n      if (build && (jobs = build.get('jobs'))) {\n        jobs.forEach(function(j) {\n          return j.updateTimes();\n        });\n      }\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    activate: function(action) {\n      this._unbind();\n      return this[\"view\" + ($.camelize(action))]();\n    },\n    viewIndex: function() {\n      this._bind('repo', 'controllers.reposController.firstObject');\n      this._bind('build', 'repo.lastBuild');\n      return this.connectTab('current');\n    },\n    viewCurrent: function() {\n      this.connectTab('current');\n      return this._bind('build', 'repo.lastBuild');\n    },\n    viewBuilds: function() {\n      this.connectTab('builds');\n      return this._bind('builds', 'repo.builds');\n    },\n    viewPullRequests: function() {\n      this.connectTab('pull_requests');\n      return this._bind('builds', 'repo.pullRequests');\n    },\n    viewBranches: function() {\n      this.connectTab('branches');\n      return this._bind('builds', 'repo.branches');\n    },\n    viewEvents: function() {\n      this.connectTab('events');\n      return this._bind('events', 'repo.events');\n    },\n    viewBuild: function() {\n      return this.connectTab('build');\n    },\n    viewJob: function() {\n      this._bind('build', 'job.build');\n      return this.connectTab('job');\n    },\n    repoObserver: (function() {\n      var repo;\n      repo = this.get('repo');\n      if (repo) {\n        return repo.select();\n      }\n    }).observes('repo.id'),\n    connectTab: function(tab) {\n      var name, viewClass;\n      name = tab === 'current' ? 'build' : tab;\n      viewClass = name === 'builds' || name === 'branches' || name === 'pull_requests' ? Travis.BuildsView : Travis[\"\" + ($.camelize(name)) + \"View\"];\n      this.set('tab', tab);\n      return this.connectOutlet({\n        outletName: 'pane',\n        controller: this,\n        viewClass: viewClass\n      });\n    },\n    _bind: function(to, from) {\n      return this.bindings.push(Ember.oneWay(this, to, from));\n    },\n    _unbind: function() {\n      var binding, _i, _len, _ref;\n      _ref = this.bindings;\n      for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n        binding = _ref[_i];\n        binding.disconnect(this);\n      }\n      return this.bindings.length = 0;\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/repo");minispade.register('controllers/repos', "(function() {(function() {\nminispade.require('travis/limited_array');\n\n  Travis.ReposController = Ember.ArrayController.extend({\n    defaultTab: 'recent',\n    sortProperties: ['sortOrder'],\n    init: function() {\n      this.activate(this.defaultTab);\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    updateTimes: function() {\n      var content;\n      if (content = this.get('content')) {\n        content.forEach(function(r) {\n          return r.updateTimes();\n        });\n      }\n      return Ember.run.later(this.updateTimes.bind(this), Travis.INTERVALS.updateTimes);\n    },\n    activate: function(tab, params) {\n      this.set('tab', tab);\n      return this[\"view\" + ($.camelize(tab))](params);\n    },\n    viewRecent: function() {\n      var content;\n      content = Travis.LimitedArray.create({\n        content: Travis.Repo.find(),\n        limit: 30\n      });\n      return this.set('content', content);\n    },\n    viewOwned: function() {\n      return this.set('content', Travis.Repo.accessibleBy(Travis.app.get('currentUser.login')));\n    },\n    viewSearch: function(params) {\n      return this.set('content', Travis.Repo.search(params.search));\n    },\n    searchObserver: (function() {\n      var search;\n      search = this.get('search');\n      if (search) {\n        return this.searchFor(search);\n      } else {\n        this.activate('recent');\n        return 'recent';\n      }\n    }).observes('search'),\n    searchFor: function(phrase) {\n      if (this.searchLater) {\n        Ember.run.cancel(this.searchLater);\n      }\n      return this.searchLater = Ember.run.later(this, (function() {\n        return this.activate('search', {\n          search: phrase\n        });\n      }), 500);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/repos");minispade.register('controllers/sidebar', "(function() {(function() {\n\n  Travis.reopen({\n    SidebarController: Em.ArrayController.extend({\n      init: function() {\n        this.tickables = [];\n        return Travis.Ticker.create({\n          target: this,\n          interval: Travis.INTERVALS.sponsors\n        });\n      },\n      tick: function() {\n        var tickable, _i, _len, _ref, _results;\n        _ref = this.tickables;\n        _results = [];\n        for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n          tickable = _ref[_i];\n          _results.push(tickable.tick());\n        }\n        return _results;\n      }\n    }),\n    QueuesController: Em.ArrayController.extend(),\n    WorkersController: Em.ArrayController.extend({\n      groups: (function() {\n        var content, groups, host, worker, _i, _len, _ref;\n        if (content = this.get('arrangedContent')) {\n          groups = {};\n          _ref = content.toArray();\n          for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n            worker = _ref[_i];\n            host = worker.get('host');\n            if (!groups[host]) {\n              groups[host] = Em.ArrayProxy.create(Em.SortableMixin, {\n                content: [],\n                sortProperties: ['nameForSort']\n              });\n            }\n            groups[host].addObject(worker);\n          }\n          return $.values(groups);\n        }\n      }).property('length')\n    }),\n    SponsorsController: Em.ArrayController.extend({\n      page: 0,\n      arrangedContent: (function() {\n        return this.get('shuffled').slice(this.start(), this.end());\n      }).property('shuffled.length', 'page'),\n      shuffled: (function() {\n        var content;\n        if (content = this.get('content')) {\n          return $.shuffle(content);\n        } else {\n          return [];\n        }\n      }).property('content.length'),\n      tick: function() {\n        return this.set('page', this.isLast() ? 0 : this.get('page') + 1);\n      },\n      pages: (function() {\n        var length;\n        length = this.get('content.length');\n        if (length) {\n          return parseInt(length / this.get('perPage') + 1);\n        } else {\n          return 1;\n        }\n      }).property('length'),\n      isLast: function() {\n        return this.get('page') === this.get('pages') - 1;\n      },\n      start: function() {\n        return this.get('page') * this.get('perPage');\n      },\n      end: function() {\n        return this.start() + this.get('perPage');\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/sidebar");minispade.register('controllers/stats', "(function() {(function() {\n\n  Travis.StatsController = Travis.Controller.extend({\n    name: 'stats',\n    init: function() {\n      return this._super('top');\n    },\n    activate: function(action, params) {}\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=controllers/stats");minispade.register('helpers', "(function() {(function() {\nminispade.require('helpers/handlebars');\nminispade.require('helpers/helpers');\nminispade.require('helpers/urls');\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers");minispade.register('helpers/handlebars', "(function() {(function() {\n  var safe;\nminispade.require('ext/ember/bound_helper');\n\n  safe = function(string) {\n    return new Handlebars.SafeString(string);\n  };\n\n  Handlebars.registerHelper('tipsy', function(text, tip) {\n    return safe('<span class=\"tool-tip\" original-title=\"' + tip + '\">' + text + '</span>');\n  });\n\n  Handlebars.registerHelper('t', function(key) {\n    return safe(I18n.t(key));\n  });\n\n  Ember.registerBoundHelper('formatTime', function(value, options) {\n    return safe(Travis.Helpers.timeAgoInWords(value) || '-');\n  });\n\n  Ember.registerBoundHelper('formatDuration', function(duration, options) {\n    return safe(Travis.Helpers.timeInWords(duration));\n  });\n\n  Ember.registerBoundHelper('formatCommit', function(commit, options) {\n    if (commit) {\n      return safe(Travis.Helpers.formatCommit(commit.get('sha'), commit.get('branch')));\n    }\n  });\n\n  Ember.registerBoundHelper('formatSha', function(sha, options) {\n    return safe(Travis.Helpers.formatSha(sha));\n  });\n\n  Ember.registerBoundHelper('pathFrom', function(url, options) {\n    return safe(Travis.Helpers.pathFrom(url));\n  });\n\n  Ember.registerBoundHelper('formatMessage', function(message, options) {\n    return safe(Travis.Helpers.formatMessage(message, options));\n  });\n\n  Ember.registerBoundHelper('formatConfig', function(config, options) {\n    return safe(Travis.Helpers.formatConfig(config));\n  });\n\n  Ember.registerBoundHelper('formatLog', function(log, options) {\n    var item, parentView, repo;\n    parentView = this.get('parentView');\n    repo = parentView.get(options.repo);\n    item = parentView.get(options.item);\n    return Travis.Helpers.formatLog(log, repo, item) || '';\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers/handlebars");minispade.register('helpers/helpers', "(function() {(function() {\nminispade.require('travis/log');\nminispade.require('config/emoij');\n\n  this.Travis.Helpers = {\n    compact: function(object) {\n      var key, result, value, _ref;\n      result = {};\n      _ref = object || {};\n      for (key in _ref) {\n        value = _ref[key];\n        if (!$.isEmpty(value)) {\n          result[key] = value;\n        }\n      }\n      return result;\n    },\n    safe: function(string) {\n      return new Handlebars.SafeString(string);\n    },\n    colorForResult: function(result) {\n      if (result === 0) {\n        return 'green';\n      } else {\n        if (result === 1) {\n          return 'red';\n        } else {\n          return null;\n        }\n      }\n    },\n    formatCommit: function(sha, branch) {\n      return Travis.Helpers.formatSha(sha) + (branch ? \" (\" + branch + \")\" : '');\n    },\n    formatSha: function(sha) {\n      return (sha || '').substr(0, 7);\n    },\n    formatConfig: function(config) {\n      var values;\n      config = $.only(config, 'rvm', 'gemfile', 'env', 'otp_release', 'php', 'node_js', 'scala', 'jdk', 'python', 'perl');\n      values = $.map(config, function(value, key) {\n        value = (value && value.join ? value.join(', ') : value) || '';\n        return '%@: %@'.fmt($.camelize(key), value);\n      });\n      if (values.length === 0) {\n        return '-';\n      } else {\n        return values.join(', ');\n      }\n    },\n    formatMessage: function(message, options) {\n      message = message || '';\n      if (options.short) {\n        message = message.split(/\\n/)[0];\n      }\n      return this._emojize(this._escape(message)).replace(/\\n/g, '<br/>');\n    },\n    formatLog: function(log, repo, item) {\n      var event, url;\n      event = item.constructor === Travis.Build ? 'showBuild' : 'showJob';\n      url = Travis.app.get('router').urlForEvent(event, repo, item);\n      return Travis.Log.filter(log, url);\n    },\n    pathFrom: function(url) {\n      return (url || '').split('/').pop();\n    },\n    timeAgoInWords: function(date) {\n      return $.timeago.distanceInWords(date);\n    },\n    durationFrom: function(started, finished) {\n      started = started && this._toUtc(new Date(this._normalizeDateString(started)));\n      finished = finished ? this._toUtc(new Date(this._normalizeDateString(finished))) : this._nowUtc();\n      if (started && finished) {\n        return Math.round((finished - started) / 1000);\n      } else {\n        return 0;\n      }\n    },\n    timeInWords: function(duration) {\n      var days, hours, minutes, result, seconds;\n      days = Math.floor(duration / 86400);\n      hours = Math.floor(duration % 86400 / 3600);\n      minutes = Math.floor(duration % 3600 / 60);\n      seconds = duration % 60;\n      if (days > 0) {\n        return 'more than 24 hrs';\n      } else {\n        result = [];\n        if (hours === 1) {\n          result.push(hours + ' hr');\n        }\n        if (hours > 1) {\n          result.push(hours + ' hrs');\n        }\n        if (minutes > 0) {\n          result.push(minutes + ' min');\n        }\n        if (seconds > 0) {\n          result.push(seconds + ' sec');\n        }\n        if (result.length > 0) {\n          return result.join(' ');\n        } else {\n          return '-';\n        }\n      }\n    },\n    _normalizeDateString: function(string) {\n      if (window.JHW) {\n        string = string.replace('T', ' ').replace(/-/g, '/');\n        string = string.replace('Z', '').replace(/\\..*$/, '');\n      }\n      return string;\n    },\n    _nowUtc: function() {\n      return this._toUtc(new Date());\n    },\n    _toUtc: function(date) {\n      return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());\n    },\n    _emojize: function(text) {\n      var emojis;\n      emojis = text.match(/:\\S+?:/g);\n      if (emojis !== null) {\n        $.each(emojis.uniq(), function(ix, emoji) {\n          var image, strippedEmoji;\n          strippedEmoji = emoji.substring(1, emoji.length - 1);\n          if (EmojiDictionary.indexOf(strippedEmoji) !== -1) {\n            image = '<img class=\\'emoji\\' title=\\'' + emoji + '\\' alt=\\'' + emoji + '\\' src=\\'' + '/images/emoji/' + strippedEmoji + '.png\\'/>';\n            return text = text.replace(new RegExp(emoji, 'g'), image);\n          }\n        });\n      }\n      return text;\n    },\n    _escape: function(text) {\n      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers/helpers");minispade.register('helpers/urls', "(function() {(function() {\n\n  this.Travis.Urls = {\n    repo: function(slug) {\n      return \"/\" + slug;\n    },\n    builds: function(slug) {\n      return \"/\" + slug + \"/builds\";\n    },\n    pullRequests: function(slug) {\n      return \"/\" + slug + \"/pull_requests\";\n    },\n    branches: function(slug) {\n      return \"/\" + slug + \"/branches\";\n    },\n    build: function(slug, id) {\n      return \"/\" + slug + \"/builds/\" + id;\n    },\n    job: function(slug, id) {\n      return \"/\" + slug + \"/jobs/\" + id;\n    },\n    githubCommit: function(slug, sha) {\n      return \"http://github.com/\" + slug + \"/commit/\" + sha;\n    },\n    githubRepo: function(slug) {\n      return \"http://github.com/\" + slug;\n    },\n    githubWatchers: function(slug) {\n      return \"http://github.com/\" + slug + \"/watchers\";\n    },\n    githubNetwork: function(slug) {\n      return \"http://github.com/\" + slug + \"/network\";\n    },\n    githubAdmin: function(slug) {\n      return \"http://github.com/\" + slug + \"/admin/hooks#travis_minibucket\";\n    },\n    statusImage: function(slug, branch) {\n      return (\"https://secure.travis-ci.org/\" + slug + \".png\") + (branch ? \"?branch=\" + branch : '');\n    },\n    email: function(email) {\n      return \"mailto:\" + email;\n    },\n    account: function(login) {\n      return \"/profile/\" + login;\n    },\n    user: function(login) {\n      return \"/profile/\" + login + \"/me\";\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=helpers/urls");minispade.register('models', "(function() {(function() {\nminispade.require('models/extensions');\nminispade.require('models/account');\nminispade.require('models/artifact');\nminispade.require('models/broadcast');\nminispade.require('models/branch');\nminispade.require('models/build');\nminispade.require('models/commit');\nminispade.require('models/event');\nminispade.require('models/hook');\nminispade.require('models/job');\nminispade.require('models/repo');\nminispade.require('models/sponsor');\nminispade.require('models/user');\nminispade.require('models/worker');\n\n}).call(this);\n\n})();\n//@ sourceURL=models");minispade.register('models/account', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Account = Travis.Model.extend({\n    primaryKey: 'login',\n    login: DS.attr('string'),\n    name: DS.attr('string'),\n    type: DS.attr('string'),\n    reposCount: DS.attr('number'),\n    urlGithub: (function() {\n      return \"http://github.com/\" + (this.get('login'));\n    }).property()\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/account");minispade.register('models/artifact', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Artifact = Travis.Model.extend({\n    body: DS.attr('string'),\n    init: function() {\n      this._super.apply(this, arguments);\n      this.set('queue', Ember.A([]));\n      this.addObserver('body', this.fetchWorker);\n      return this.fetchWorker();\n    },\n    append: function(body) {\n      if (this.get('isLoaded')) {\n        return this.set('body', this.get('body') + body);\n      } else {\n        return this.get('queue').pushObject(body);\n      }\n    },\n    recordDidLoad: (function() {\n      var queue;\n      if (this.get('isLoaded')) {\n        queue = this.get('queue');\n        if (queue.get('length') > 0) {\n          return this.append(queue.toArray().join(''));\n        }\n      }\n    }).observes('isLoaded'),\n    fetchWorker: function() {\n      var body, line, match, worker;\n      if (body = this.get('body')) {\n        line = body.split(\"\\n\")[0];\n        if (line && (match = line.match(/Using worker: (.*)/))) {\n          if (worker = match[1]) {\n            worker = worker.trim().split(':')[0];\n            this.set('workerName', worker);\n            return this.removeObserver('body', this.fetchWorker);\n          }\n        }\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/artifact");minispade.register('models/branch', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Branch = Travis.Model.extend(Travis.Helpers, {\n    repoId: DS.attr('number'),\n    commitId: DS.attr('number'),\n    number: DS.attr('number'),\n    branch: DS.attr('string'),\n    message: DS.attr('string'),\n    result: DS.attr('number'),\n    duration: DS.attr('number'),\n    startedAt: DS.attr('string'),\n    finishedAt: DS.attr('string'),\n    commit: DS.belongsTo('Travis.Commit'),\n    repo: (function() {\n      if (this.get('repoId')) {\n        return Travis.Repo.find(this.get('repoId'));\n      }\n    }).property('repoId'),\n    updateTimes: function() {\n      this.notifyPropertyChange('started_at');\n      return this.notifyPropertyChange('finished_at');\n    }\n  });\n\n  this.Travis.Branch.reopenClass({\n    byRepoId: function(id) {\n      return this.find({\n        repository_id: id\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/branch");minispade.register('models/broadcast', "(function() {(function() {\n  var __indexOf = [].indexOf || function(item) { for (var i = 0, l = this.length; i < l; i++) { if (i in this && this[i] === item) return i; } return -1; };\nminispade.require('travis/model');\n\n  this.Travis.Broadcast = Travis.Model.extend({\n    message: DS.attr('string'),\n    toObject: function() {\n      return {\n        type: 'broadcast',\n        id: this.get('id'),\n        message: this.get('message')\n      };\n    },\n    isSeen: (function() {\n      var _ref;\n      return _ref = this.get('id'), __indexOf.call(Travis.Broadcast.seen, _ref) >= 0;\n    }).property(),\n    setSeen: function() {\n      Travis.Broadcast.seen.pushObject(this.get('id'));\n      localStorage.setItem('travis.seen_broadcasts', JSON.stringify(Travis.Broadcast.seen));\n      return this.notifyPropertyChange('isSeen');\n    }\n  });\n\n  this.Travis.Broadcast.reopenClass({\n    seen: Ember.A(JSON.parse(localStorage.getItem('travis.seen_broadcasts')) || [])\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/broadcast");minispade.register('models/build', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Build = Travis.Model.extend(Travis.DurationCalculations, {\n    eventType: DS.attr('string'),\n    repoId: DS.attr('number'),\n    commitId: DS.attr('number'),\n    state: DS.attr('string'),\n    number: DS.attr('number'),\n    branch: DS.attr('string'),\n    message: DS.attr('string'),\n    result: DS.attr('number'),\n    _duration: DS.attr('number'),\n    startedAt: DS.attr('string'),\n    finishedAt: DS.attr('string'),\n    repo: DS.belongsTo('Travis.Repo'),\n    commit: DS.belongsTo('Travis.Commit'),\n    jobs: DS.hasMany('Travis.Job'),\n    config: (function() {\n      return Travis.Helpers.compact(this.get('data.config'));\n    }).property('data.config'),\n    isMatrix: (function() {\n      return this.get('data.job_ids.length') > 1;\n    }).property('data.job_ids.length'),\n    isFinished: (function() {\n      return this.get('state') === 'finished';\n    }).property('state'),\n    requiredJobs: (function() {\n      return this.get('jobs').filter(function(data) {\n        return !data.get('allowFailure');\n      });\n    }).property('jobs.@each.allowFailure'),\n    allowedFailureJobs: (function() {\n      return this.get('jobs').filter(function(data) {\n        return data.get('allowFailure');\n      });\n    }).property('jobs.@each.allowFailure'),\n    configKeys: (function() {\n      var config, headers, key, keys;\n      if (!(config = this.get('config'))) {\n        return [];\n      }\n      keys = $.intersect($.keys(config), Travis.CONFIG_KEYS);\n      headers = (function() {\n        var _i, _len, _ref, _results;\n        _ref = ['build.job', 'build.duration', 'build.finished_at'];\n        _results = [];\n        for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n          key = _ref[_i];\n          _results.push(I18n.t(key));\n        }\n        return _results;\n      })();\n      return $.map(headers.concat(keys), function(key) {\n        return $.camelize(key);\n      });\n    }).property('config'),\n    requeue: (function() {\n      return Travis.ajax.post('/requests', {\n        build_id: this.get('id')\n      });\n    })\n  });\n\n  this.Travis.Build.reopenClass({\n    byRepoId: function(id, parameters) {\n      return this.find($.extend(parameters || {}, {\n        repository_id: id\n      }));\n    },\n    olderThanNumber: function(id, build_number) {\n      return this.find({\n        url: \"/builds\",\n        repository_id: id,\n        after_number: build_number\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/build");minispade.register('models/commit', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Commit = Travis.Model.extend({\n    buildId: DS.attr('number'),\n    sha: DS.attr('string'),\n    branch: DS.attr('string'),\n    message: DS.attr('string'),\n    compareUrl: DS.attr('string'),\n    authorName: DS.attr('string'),\n    authorEmail: DS.attr('string'),\n    committerName: DS.attr('string'),\n    committerEmail: DS.attr('string'),\n    build: DS.belongsTo('Travis.Build', {\n      key: 'buildId'\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/commit");minispade.register('models/event', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Event = Travis.Model.extend({\n    event: DS.attr('string'),\n    repoId: DS.attr('number'),\n    sourceId: DS.attr('number'),\n    sourceType: DS.attr('string'),\n    createdAt: DS.attr('string'),\n    event_: (function() {\n      return this.get('event');\n    }).property('event'),\n    result: (function() {\n      return this.get('data.data.result');\n    }).property('data.data.result'),\n    message: (function() {\n      return this.get('data.data.message');\n    }).property('data.data.message'),\n    source: (function() {\n      var type;\n      if (type = this.get('sourceType')) {\n        return Travis[type].find(this.get('sourceId'));\n      }\n    }).property('sourceType', 'sourceId')\n  });\n\n  this.Travis.Event.reopenClass({\n    byRepoId: function(id) {\n      return this.find({\n        repository_id: id\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/event");minispade.register('models/extensions', "(function() {(function() {\n\n  Travis.DurationCalculations = Ember.Mixin.create({\n    duration: (function() {\n      var duration;\n      if (duration = this.get('_duration')) {\n        return duration;\n      } else {\n        return Travis.Helpers.durationFrom(this.get('startedAt'), this.get('finishedAt'));\n      }\n    }).property('_duration', 'finishedAt', 'startedAt'),\n    updateTimes: function() {\n      this.notifyPropertyChange('_duration');\n      return this.notifyPropertyChange('finished_at');\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/extensions");minispade.register('models/hook', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Hook = Travis.Model.extend({\n    name: DS.attr('string'),\n    ownerName: DS.attr('string'),\n    description: DS.attr('string'),\n    active: DS.attr('boolean'),\n    account: (function() {\n      return this.get('slug').split('/')[0];\n    }).property('slug'),\n    slug: (function() {\n      return \"\" + (this.get('ownerName')) + \"/\" + (this.get('name'));\n    }).property('ownerName', 'name'),\n    urlGithub: (function() {\n      return \"http://github.com/\" + (this.get('slug'));\n    }).property(),\n    urlGithubAdmin: (function() {\n      return \"http://github.com/\" + (this.get('slug')) + \"/admin/hooks#travis_minibucket\";\n    }).property(),\n    toggle: function() {\n      var transaction;\n      transaction = this.get('store').transaction();\n      transaction.add(this);\n      this.set('active', !this.get('active'));\n      return transaction.commit();\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/hook");minispade.register('models/job', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Job = Travis.Model.extend(Travis.DurationCalculations, {\n    repoId: DS.attr('number'),\n    buildId: DS.attr('number'),\n    commitId: DS.attr('number'),\n    logId: DS.attr('number'),\n    queue: DS.attr('string'),\n    state: DS.attr('string'),\n    number: DS.attr('string'),\n    result: DS.attr('number'),\n    _duration: DS.attr('number'),\n    startedAt: DS.attr('string'),\n    finishedAt: DS.attr('string'),\n    allowFailure: DS.attr('boolean'),\n    repo: DS.belongsTo('Travis.Repo'),\n    build: DS.belongsTo('Travis.Build'),\n    commit: DS.belongsTo('Travis.Commit'),\n    log: DS.belongsTo('Travis.Artifact'),\n    config: (function() {\n      return Travis.Helpers.compact(this.get('data.config'));\n    }).property('data.config'),\n    sponsor: (function() {\n      var worker;\n      worker = this.get('log.workerName');\n      if (worker && worker.length) {\n        return Travis.WORKERS[worker] || {\n          name: \"Travis Pro\",\n          url: \"http://travis-ci.com\"\n        };\n      }\n    }).property('log.workerName'),\n    configValues: (function() {\n      var buildConfig, config, keys;\n      config = this.get('config');\n      buildConfig = this.get('build.config');\n      if (config && buildConfig) {\n        keys = $.intersect($.keys(buildConfig), Travis.CONFIG_KEYS);\n        return keys.map(function(key) {\n          return config[key];\n        });\n      } else {\n        return [];\n      }\n    }).property('config'),\n    appendLog: function(text) {\n      var log;\n      if (log = this.get('log')) {\n        return log.append(text);\n      }\n    },\n    subscribe: function() {\n      var id;\n      if (id = this.get('id')) {\n        return Travis.app.pusher.subscribe(\"job-\" + id);\n      }\n    },\n    onStateChange: (function() {\n      if (this.get('state') === 'finished') {\n        return Travis.app.pusher.unsubscribe(\"job-\" + (this.get('id')));\n      }\n    }).observes('state')\n  });\n\n  this.Travis.Job.reopenClass({\n    queued: function(queue) {\n      this.find();\n      return Travis.app.store.filter(this, function(job) {\n        var queued;\n        queued = ['created', 'queued'].indexOf(job.get('state')) !== -1;\n        return queued && (!queue || job.get('queue') === (\"builds.\" + queue));\n      });\n    },\n    findMany: function(ids) {\n      return Travis.app.store.findMany(this, ids);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/job");minispade.register('models/repo', "(function() {(function() {\nminispade.require('travis/expandable_record_array');\nminispade.require('travis/model');\n\n  this.Travis.Repo = Travis.Model.extend({\n    slug: DS.attr('string'),\n    description: DS.attr('string'),\n    lastBuildId: DS.attr('number'),\n    lastBuildNumber: DS.attr('string'),\n    lastBuildResult: DS.attr('number'),\n    lastBuildStartedAt: DS.attr('string'),\n    lastBuildFinishedAt: DS.attr('string'),\n    lastBuild: DS.belongsTo('Travis.Build'),\n    builds: (function() {\n      var array, builds, id;\n      id = this.get('id');\n      builds = Travis.Build.byRepoId(id, {\n        event_type: 'push'\n      });\n      array = Travis.ExpandableRecordArray.create({\n        type: Travis.Build,\n        content: Ember.A([]),\n        store: this.get('store')\n      });\n      array.load(builds);\n      return array;\n    }).property(),\n    pullRequests: (function() {\n      var array, builds, id;\n      id = this.get('id');\n      builds = Travis.Build.byRepoId(id, {\n        event_type: 'pull_request'\n      });\n      array = Travis.ExpandableRecordArray.create({\n        type: Travis.Build,\n        content: Ember.A([]),\n        store: this.get('store')\n      });\n      array.load(builds);\n      return array;\n    }).property(),\n    branches: (function() {\n      return Travis.Branch.byRepoId(this.get('id'));\n    }).property(),\n    events: (function() {\n      return Travis.Event.byRepoId(this.get('id'));\n    }).property(),\n    owner: (function() {\n      return (this.get('slug') || '').split('/')[0];\n    }).property('slug'),\n    name: (function() {\n      return (this.get('slug') || '').split('/')[1];\n    }).property('slug'),\n    lastBuildDuration: (function() {\n      var duration;\n      duration = this.get('data.last_build_duration');\n      if (!duration) {\n        duration = Travis.Helpers.durationFrom(this.get('lastBuildStartedAt'), this.get('lastBuildFinishedAt'));\n      }\n      return duration;\n    }).property('data.last_build_duration', 'lastBuildStartedAt', 'lastBuildFinishedAt'),\n    sortOrder: (function() {\n      var lastBuildFinishedAt;\n      if (lastBuildFinishedAt = this.get('lastBuildFinishedAt')) {\n        return -new Date(lastBuildFinishedAt).getTime();\n      } else {\n        return -new Date('9999').getTime() - parseInt(this.get('lastBuildId'));\n      }\n    }).property('lastBuildFinishedAt', 'lastBuildId'),\n    stats: (function() {\n      var _this = this;\n      return this.get('_stats') || $.get(\"https://api.github.com/repos/\" + (this.get('slug')), function(data) {\n        _this.set('_stats', data);\n        return _this.notifyPropertyChange('stats');\n      }) && {};\n    }).property(),\n    updateTimes: function() {\n      return this.notifyPropertyChange('lastBuildDuration');\n    }\n  });\n\n  this.Travis.Repo.reopenClass({\n    recent: function() {\n      return this.find();\n    },\n    ownedBy: function(login) {\n      return this.find({\n        owner_name: login,\n        orderBy: 'name'\n      });\n    },\n    accessibleBy: function(login) {\n      return this.find({\n        member: login,\n        orderBy: 'name'\n      });\n    },\n    search: function(query) {\n      return this.find({\n        search: query,\n        orderBy: 'name'\n      });\n    },\n    bySlug: function(slug) {\n      var repo;\n      repo = $.select(this.find().toArray(), function(repo) {\n        return repo.get('slug') === slug;\n      });\n      if (repo.length > 0) {\n        return repo;\n      } else {\n        return this.find({\n          slug: slug\n        });\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/repo");minispade.register('models/sponsor', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Sponsor = Travis.Model.extend({\n    type: DS.attr('string'),\n    url: DS.attr('string'),\n    link: DS.attr('string'),\n    image: (function() {\n      return \"/images/sponsors/\" + (this.get('data.image'));\n    }).property('data.image')\n  });\n\n  Travis.Sponsor.reopenClass({\n    decks: function() {\n      return this.platinum().concat(this.gold());\n    },\n    platinum: function() {\n      var platinum, sponsor, _i, _len, _results;\n      platinum = this.byType('platinum').toArray();\n      _results = [];\n      for (_i = 0, _len = platinum.length; _i < _len; _i++) {\n        sponsor = platinum[_i];\n        _results.push([sponsor]);\n      }\n      return _results;\n    },\n    gold: function() {\n      var gold, _results;\n      gold = this.byType('gold').toArray();\n      _results = [];\n      while (gold.length > 0) {\n        _results.push(gold.splice(0, 2));\n      }\n      return _results;\n    },\n    links: function() {\n      return this.byType('silver');\n    },\n    byType: function() {\n      var types;\n      types = Array.prototype.slice.apply(arguments);\n      return Travis.Sponsor.filter(function(sponsor) {\n        return types.indexOf(sponsor.get('type')) !== -1;\n      });\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/sponsor");minispade.register('models/user', "(function() {(function() {\nminispade.require('travis/ajax');\nminispade.require('travis/model');\n\n  this.Travis.User = Travis.Model.extend({\n    name: DS.attr('string'),\n    email: DS.attr('string'),\n    login: DS.attr('string'),\n    token: DS.attr('string'),\n    locale: DS.attr('string'),\n    gravatarId: DS.attr('string'),\n    isSyncing: DS.attr('boolean'),\n    syncedAt: DS.attr('string'),\n    repoCount: DS.attr('number'),\n    init: function() {\n      if (this.get('isSyncing')) {\n        this.poll();\n      }\n      this._super();\n      return Ember.run.next(this, function() {\n        var transaction;\n        transaction = this.get('store').transaction();\n        return transaction.add(this);\n      });\n    },\n    urlGithub: (function() {\n      return \"https://github.com/\" + (this.get('login'));\n    }).property(),\n    permissions: (function() {\n      var _this = this;\n      if (!this.permissions) {\n        this.permissions = Ember.ArrayProxy.create({\n          content: []\n        });\n        Travis.ajax.get('/users/permissions', function(data) {\n          return _this.permissions.set('content', data.permissions);\n        });\n      }\n      return this.permissions;\n    }).property(),\n    updateLocale: function(locale) {\n      var observer, self, transaction;\n      this.setWithSession('locale', locale);\n      transaction = this.get('transaction');\n      transaction.commit();\n      self = this;\n      observer = function() {\n        if (!self.get('isSaving')) {\n          self.removeObserver('isSaving', observer);\n          transaction = self.get('store').transaction();\n          return transaction.add(self);\n        }\n      };\n      return this.addObserver('isSaving', observer);\n    },\n    type: (function() {\n      return 'user';\n    }).property(),\n    sync: function() {\n      Travis.ajax.post('/users/sync');\n      this.setWithSession('isSyncing', true);\n      return this.poll();\n    },\n    poll: function() {\n      var _this = this;\n      return Travis.ajax.get('/users', function(data) {\n        if (data.user.is_syncing) {\n          return Ember.run.later(_this, _this.poll.bind(_this), 3000);\n        } else {\n          _this.set('isSyncing', false);\n          return _this.setWithSession('syncedAt', data.user.synced_at);\n        }\n      });\n    },\n    setWithSession: function(name, value) {\n      var user;\n      this.set(name, value);\n      user = JSON.parse(typeof sessionStorage !== \"undefined\" && sessionStorage !== null ? sessionStorage.getItem('travis.user') : void 0);\n      user[$.underscore(name)] = this.get(name);\n      return typeof sessionStorage !== \"undefined\" && sessionStorage !== null ? sessionStorage.setItem('travis.user', JSON.stringify(user)) : void 0;\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/user");minispade.register('models/worker', "(function() {(function() {\nminispade.require('travis/model');\n\n  this.Travis.Worker = Travis.Model.extend({\n    state: DS.attr('string'),\n    name: DS.attr('string'),\n    host: DS.attr('string'),\n    lastSeenAt: DS.attr('string'),\n    payload: (function() {\n      return this.get('data.payload');\n    }).property('data.payload'),\n    number: (function() {\n      return this.get('name').match(/\\d+$/)[0];\n    }).property('name'),\n    isWorking: (function() {\n      return this.get('state') === 'working';\n    }).property('state'),\n    jobId: (function() {\n      return this.get('payload.job.id');\n    }).property('payload.job.id'),\n    job: (function() {\n      return Travis.Job.find(this.get('job_id'));\n    }).property('jobId'),\n    repo: (function() {\n      return Travis.Repo.find(this.get('payload.repository.id') || this.get('payload.repo.id'));\n    }).property('payload.repository.id', 'payload.repo.id'),\n    repoSlug: (function() {\n      return this.get('payload.repo.slug') || this.get('payload.repository.slug');\n    }).property('payload.repo.slug', 'payload.repository.slug'),\n    nameForSort: (function() {\n      var id, match, name;\n      if (name = this.get('name')) {\n        match = name.match(/(.*?)-(\\d+)/);\n        if (match) {\n          name = match[1];\n          id = match[2].toString();\n          if (id.length < 2) {\n            id = \"00\" + id;\n          } else if (id.length < 3) {\n            id = \"0\" + id;\n          }\n          return \"\" + name + \"-\" + id;\n        }\n      }\n    }).property('name')\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=models/worker");minispade.register('pusher', "(function() {(function() {\n\n  Travis.Pusher = function(key) {\n    if (key) {\n      this.init(key);\n    }\n    return this;\n  };\n\n  $.extend(Travis.Pusher, {\n    CHANNELS: ['common'],\n    CHANNEL_PREFIX: ''\n  });\n\n  $.extend(Travis.Pusher.prototype, {\n    active_channels: [],\n    init: function(key) {\n      var channel, _i, _len, _ref, _results;\n      Pusher.warn = this.warn.bind(this);\n      this.pusher = new Pusher(key);\n      _ref = Travis.Pusher.CHANNELS;\n      _results = [];\n      for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n        channel = _ref[_i];\n        _results.push(this.subscribe(channel));\n      }\n      return _results;\n    },\n    subscribe: function(channel) {\n      var _this = this;\n      if (this.pusher && this.active_channels.indexOf(channel) === -1) {\n        this.active_channels.push(channel);\n        return this.pusher.subscribe(this.prefix(channel)).bind_all(function(event, data) {\n          return _this.receive(event, data);\n        });\n      }\n    },\n    unsubscribe: function(channel) {\n      var ix;\n      ix = this.active_channels.indexOf(channel);\n      if (this.pusher && ix === -1) {\n        this.active_channels.splice(ix, 1);\n        return this.pusher.unsubscribe(this.prefix(channel));\n      }\n    },\n    prefix: function(channel) {\n      return \"\" + Travis.Pusher.CHANNEL_PREFIX + channel;\n    },\n    receive: function(event, data) {\n      if (event.substr(0, 6) === 'pusher') {\n        return;\n      }\n      if (data.id) {\n        data = this.normalize(event, data);\n      }\n      return Ember.run.next(function() {\n        return Travis.app.store.receive(event, data);\n      });\n    },\n    normalize: function(event, data) {\n      switch (event) {\n        case 'build:started':\n        case 'build:finished':\n          return data;\n        case 'job:created':\n        case 'job:started':\n        case 'job:finished':\n        case 'job:log':\n          if (data.queue) {\n            data.queue = data.queue.replace('builds.', '');\n          }\n          return {\n            job: data\n          };\n        case 'worker:added':\n        case 'worker:updated':\n        case 'worker:removed':\n          return {\n            worker: data\n          };\n      }\n    },\n    warn: function(type, warning) {\n      if (!this.ignoreWarning(warning)) {\n        return console.warn(warning);\n      }\n    },\n    ignoreWarning: function(warning) {\n      var message, _ref;\n      if (message = (_ref = warning.data) != null ? _ref.message : void 0) {\n        return message.indexOf('Existing subscription') === 0 || message.indexOf('No current subscription') === 0;\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=pusher");minispade.register('routes', "(function() {(function() {\n  var defaultRoute, lineNumberRoute;\nminispade.require('travis/location');\n\n  defaultRoute = Ember.Route.extend({\n    route: '/',\n    index: 1000\n  });\n\n  lineNumberRoute = Ember.Route.extend({\n    route: '#L:number',\n    index: 1,\n    connectOutlets: function(router) {\n      return router.saveLineNumberHash();\n    },\n    dynamicSegmentPattern: \"([0-9]+)\"\n  });\n\n  Travis.Router = Ember.Router.extend({\n    location: 'travis',\n    enableLogging: true,\n    initialState: 'loading',\n    showRoot: Ember.Route.transitionTo('root.home.show'),\n    showStats: Ember.Route.transitionTo('root.stats'),\n    showRepo: Ember.Route.transitionTo('root.home.repo.show'),\n    showBuilds: Ember.Route.transitionTo('root.home.repo.builds.index'),\n    showBuild: Ember.Route.transitionTo('root.home.repo.builds.show'),\n    showPullRequests: Ember.Route.transitionTo('root.home.repo.pullRequests'),\n    showBranches: Ember.Route.transitionTo('root.home.repo.branches'),\n    showEvents: Ember.Route.transitionTo('root.home.repo.events'),\n    showJob: Ember.Route.transitionTo('root.home.repo.job'),\n    showProfile: Ember.Route.transitionTo('root.profile'),\n    showAccount: Ember.Route.transitionTo('root.profile.account'),\n    showUserProfile: Ember.Route.transitionTo('root.profile.account.profile'),\n    saveLineNumberHash: function(path) {\n      return Ember.run.next(this, function() {\n        var match;\n        path = path || this.get('location').getURL();\n        if (match = path.match(/#L\\d+$/)) {\n          return this.set('repoController.lineNumberHash', match[0]);\n        }\n      });\n    },\n    reload: function() {\n      var url;\n      console.log('Triggering reload');\n      url = this.get('location').getURL();\n      this.transitionTo('loading');\n      return Ember.run.next(this, function() {\n        return this.route(url);\n      });\n    },\n    signedIn: function() {\n      return !!Travis.app.get('auth.user');\n    },\n    needsAuth: function(path) {\n      return path.indexOf('/profile') === 0;\n    },\n    afterSignOut: function() {\n      return this.authorize('/');\n    },\n    loading: Ember.Route.extend({\n      routePath: function(router, path) {\n        router.saveLineNumberHash(path);\n        router.authorize(path);\n        if (!router.signedIn()) {\n          return Travis.app.autoSignIn();\n        }\n      }\n    }),\n    authorize: function(path) {\n      if (!this.signedIn() && this.needsAuth(path)) {\n        Travis.app.storeAfterSignInPath(path);\n        return this.transitionTo('root.auth');\n      } else {\n        this.transitionTo('root');\n        return this.route(path);\n      }\n    },\n    root: Ember.Route.extend({\n      route: '/',\n      loading: Ember.State.extend(),\n      afterSignIn: (function() {}),\n      auth: Ember.Route.extend({\n        route: '/auth',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('simple');\n          $('body').attr('id', 'auth');\n          router.get('applicationController').connectOutlet('top', 'top');\n          return router.get('applicationController').connectOutlet('main', 'signin');\n        },\n        afterSignIn: function(router, path) {\n          return router.route(path || '/');\n        }\n      }),\n      stats: Ember.Route.extend({\n        route: '/stats',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('simple');\n          $('body').attr('id', 'stats');\n          router.get('applicationController').connectOutlet('top', 'top');\n          return router.get('applicationController').connectOutlet('main', 'stats');\n        }\n      }),\n      profile: Ember.Route.extend({\n        initialState: 'index',\n        route: '/profile',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('profile');\n          $('body').attr('id', 'profile');\n          router.get('accountsController').set('content', Travis.Account.find());\n          router.get('applicationController').connectOutlet('top', 'top');\n          return router.get('applicationController').connectOutlet('left', 'accounts');\n        },\n        index: Ember.Route.extend({\n          route: '/',\n          connectOutlets: function(router) {\n            router.get('applicationController').connectOutlet('main', 'profile');\n            return router.get('profileController').activate('hooks');\n          }\n        }),\n        account: Ember.Route.extend({\n          initialState: 'index',\n          route: '/:login',\n          connectOutlets: function(router, account) {\n            var params;\n            if (account) {\n              params = {\n                login: account.get('login')\n              };\n              return router.get('profileController').setParams(params);\n            } else {\n              return router.send('showProfile');\n            }\n          },\n          deserialize: function(router, params) {\n            var account, controller, deferred, observer;\n            controller = router.get('accountsController');\n            if (!controller.get('content')) {\n              controller.set('content', Travis.Account.find());\n            }\n            account = controller.findByLogin(params.login);\n            if (account) {\n              return account;\n            } else {\n              deferred = $.Deferred();\n              observer = function() {\n                if (account = controller.findByLogin(params.login)) {\n                  controller.removeObserver('content.length', observer);\n                  return deferred.resolve(account);\n                }\n              };\n              controller.addObserver('content.length', observer);\n              return deferred.promise();\n            }\n          },\n          serialize: function(router, account) {\n            if (account) {\n              return {\n                login: account.get('login')\n              };\n            } else {\n              return {};\n            }\n          },\n          index: Ember.Route.extend({\n            route: '/',\n            connectOutlets: function(router) {\n              return router.get('profileController').activate('hooks');\n            }\n          }),\n          profile: Ember.Route.extend({\n            route: '/profile',\n            connectOutlets: function(router) {\n              return router.get('profileController').activate('user');\n            }\n          })\n        })\n      }),\n      home: Ember.Route.extend({\n        route: '/',\n        connectOutlets: function(router) {\n          router.get('applicationView').connectLayout('home');\n          $('body').attr('id', 'home');\n          router.get('applicationController').connectOutlet('left', 'repos');\n          router.get('applicationController').connectOutlet('right', 'sidebar');\n          router.get('applicationController').connectOutlet('top', 'top');\n          router.get('applicationController').connectOutlet('main', 'repo');\n          router.get('applicationController').connectOutlet('flash', 'flash');\n          return router.get('repoController').set('repos', router.get('reposController'));\n        },\n        show: Ember.Route.extend({\n          route: '/',\n          connectOutlets: function(router) {\n            return router.get('repoController').activate('index');\n          },\n          initialState: 'default',\n          \"default\": defaultRoute,\n          lineNumber: lineNumberRoute\n        }),\n        showWithLineNumber: Ember.Route.extend({\n          route: '/#/L:number',\n          connectOutlets: function(router) {\n            return router.get('repoController').activate('index');\n          }\n        }),\n        repo: Ember.Route.extend({\n          route: '/:owner/:name',\n          dynamicSegmentPattern: \"([^/#]+)\",\n          connectOutlets: function(router, repo) {\n            return router.get('repoController').set('repo', repo);\n          },\n          deserialize: function(router, params) {\n            var deferred, observer, repos, slug;\n            slug = \"\" + params.owner + \"/\" + params.name;\n            repos = Travis.Repo.bySlug(slug);\n            deferred = $.Deferred();\n            observer = function() {\n              if (repos.get('isLoaded')) {\n                repos.removeObserver('isLoaded', observer);\n                return deferred.resolve(repos.objectAt(0));\n              }\n            };\n            if (repos.length) {\n              deferred.resolve(repos[0]);\n            } else {\n              repos.addObserver('isLoaded', observer);\n            }\n            return deferred.promise();\n          },\n          serialize: function(router, repo) {\n            var name, owner, _ref;\n            if (typeof repo === 'string') {\n              _ref = repo.split('/'), owner = _ref[0], name = _ref[1];\n              return {\n                owner: owner,\n                name: name\n              };\n            } else if (repo) {\n              return {\n                owner: repo.get('owner'),\n                name: repo.get('name')\n              };\n            } else {\n              return {};\n            }\n          },\n          show: Ember.Route.extend({\n            route: '/',\n            connectOutlets: function(router) {\n              return router.get('repoController').activate('current');\n            },\n            initialState: 'default',\n            \"default\": defaultRoute,\n            lineNumber: lineNumberRoute\n          }),\n          builds: Ember.Route.extend({\n            route: '/builds',\n            index: Ember.Route.extend({\n              route: '/',\n              connectOutlets: function(router, repo) {\n                return router.get('repoController').activate('builds');\n              }\n            }),\n            show: Ember.Route.extend({\n              route: '/:build_id',\n              connectOutlets: function(router, build) {\n                if (!build.get) {\n                  build = Travis.Build.find(build);\n                }\n                router.get('repoController').set('build', build);\n                return router.get('repoController').activate('build');\n              },\n              serialize: function(router, build) {\n                if (build.get) {\n                  return {\n                    build_id: build.get('id')\n                  };\n                } else {\n                  return {\n                    build_id: build\n                  };\n                }\n              },\n              deserialize: function(router, params) {\n                var build, deferred, observer;\n                build = Travis.Build.find(params.build_id);\n                if (build.get('id')) {\n                  return build;\n                } else {\n                  deferred = $.Deferred();\n                  observer = function() {\n                    if (build.get('id')) {\n                      build.removeObserver('id', observer);\n                      return deferred.resolve(build);\n                    }\n                  };\n                  build.addObserver('id', observer);\n                  return deferred.promise();\n                }\n              },\n              initialState: 'default',\n              \"default\": defaultRoute,\n              lineNumber: lineNumberRoute,\n              dynamicSegmentPattern: \"([^/#]+)\"\n            })\n          }),\n          pullRequests: Ember.Route.extend({\n            route: '/pull_requests',\n            connectOutlets: function(router, repo) {\n              return router.get('repoController').activate('pull_requests');\n            }\n          }),\n          branches: Ember.Route.extend({\n            route: '/branches',\n            connectOutlets: function(router, repo) {\n              return router.get('repoController').activate('branches');\n            }\n          }),\n          events: Ember.Route.extend({\n            route: '/events',\n            connectOutlets: function(router, repo) {\n              return router.get('repoController').activate('events');\n            }\n          }),\n          job: Ember.Route.extend({\n            route: '/jobs/:job_id',\n            dynamicSegmentPattern: \"([^/#]+)\",\n            connectOutlets: function(router, job) {\n              if (!job.get) {\n                job = Travis.Job.find(job);\n              }\n              router.get('repoController').set('job', job);\n              return router.get('repoController').activate('job');\n            },\n            serialize: function(router, job) {\n              if (job.get) {\n                return {\n                  job_id: job.get('id')\n                };\n              } else {\n                return {\n                  job_id: job\n                };\n              }\n            },\n            deserialize: function(router, params) {\n              var deferred, job, observer;\n              job = Travis.Job.find(params.job_id);\n              if (job.get('id')) {\n                return job;\n              } else {\n                deferred = $.Deferred();\n                observer = function() {\n                  if (job.get('id')) {\n                    job.removeObserver('id', observer);\n                    return deferred.resolve(job);\n                  }\n                };\n                job.addObserver('id', observer);\n                return deferred.promise();\n              }\n            },\n            initialState: 'default',\n            \"default\": defaultRoute,\n            lineNumber: lineNumberRoute\n          })\n        })\n      })\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=routes");minispade.register('slider', "(function() {(function() {\n\n  this.Travis.Slider = function() {\n    if ((typeof localStorage !== \"undefined\" && localStorage !== null ? localStorage.getItem('travis.maximized') : void 0) === 'true') {\n      this.minimize();\n    }\n    return this;\n  };\n\n  $.extend(Travis.Slider.prototype, {\n    persist: function() {\n      return typeof localStorage !== \"undefined\" && localStorage !== null ? localStorage.setItem('travis.maximized', this.isMinimized()) : void 0;\n    },\n    isMinimized: function() {\n      return $('body').hasClass('maximized');\n    },\n    minimize: function() {\n      return $('body').addClass('maximized');\n    },\n    toggle: function() {\n      var element;\n      $('body').toggleClass('maximized');\n      this.persist();\n      element = $('<span></span>');\n      $('#top .profile').append(element);\n      return Em.run.later((function() {\n        return element.remove();\n      }), 10);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=slider");minispade.register('store', "(function() {(function() {\n  var DATA_PROXY;\nminispade.require('store/rest_adapter');\n\n  DATA_PROXY = {\n    get: function(name) {\n      return this.savedData[name];\n    }\n  };\n\n  Travis.Store = DS.Store.extend({\n    revision: 6,\n    adapter: 'Travis.RestAdapter',\n    init: function() {\n      this._super.apply(this, arguments);\n      return this._loadedData = {};\n    },\n    load: function(type, id, hash) {\n      var record, result;\n      result = this._super.apply(this, arguments);\n      if (result && result.clientId) {\n        record = this.findByClientId(type, result.clientId);\n        record.set('incomplete', false);\n        record.set('complete', true);\n      }\n      return result;\n    },\n    merge: function(type, id, hash) {\n      var adapter, cidToHash, clientId, data, record, typeMap;\n      if (hash === void 0) {\n        hash = id;\n        adapter = Ember.get(this, '_adapter');\n        id = adapter.extractId(type, hash);\n      }\n      id = id + '';\n      typeMap = this.typeMapFor(type);\n      cidToHash = this.clientIdToHash;\n      clientId = typeMap.idToCid[id];\n      if (clientId !== void 0) {\n        if (data = cidToHash[clientId]) {\n          delete hash.id;\n          $.extend(data, hash);\n        } else {\n          cidToHash[clientId] = hash;\n        }\n        if (record = this.recordCache[clientId]) {\n          record.loadedData();\n        }\n      } else {\n        clientId = this.pushHash(hash, id, type);\n      }\n      if (clientId) {\n        this.updateRecordArrays(type, clientId);\n        return {\n          id: id,\n          clientId: clientId\n        };\n      }\n    },\n    receive: function(event, data) {\n      var job, mappings, name, type, _ref;\n      _ref = event.split(':'), name = _ref[0], type = _ref[1];\n      mappings = this.get('_adapter.mappings');\n      type = mappings[name];\n      if (event === 'job:log') {\n        if (job = this.find(Travis.Job, data['job']['id'])) {\n          return job.appendLog(data['job']['_log']);\n        }\n      } else if (data[type.singularName()]) {\n        return this._loadOne(this, type, data);\n      } else if (data[type.pluralName()]) {\n        return this._loadMany(this, type, data);\n      } else {\n        if (!type) {\n          throw \"can't load data for \" + name;\n        }\n      }\n    },\n    _loadOne: function(store, type, json) {\n      var job, repo, root;\n      root = type.singularName();\n      if (type === Travis.Build && (json.repository || json.repo)) {\n        this.loadIncomplete(Travis.Repo, json.repository || json.repo);\n      } else if (type === Travis.Worker && json.worker.payload) {\n        if (repo = json.worker.payload.repo || json.worker.payload.repository) {\n          this.loadIncomplete(Travis.Repo, repo);\n        }\n        if (job = json.worker.payload.job) {\n          this.loadIncomplete(Travis.Job, job);\n        }\n      }\n      return this.loadIncomplete(type, json[root]);\n    },\n    addLoadedData: function(type, clientId, hash) {\n      var id, key, loadedData, _base, _base1, _name, _results;\n      id = hash.id;\n      (_base = this._loadedData)[_name = type.toString()] || (_base[_name] = {});\n      loadedData = ((_base1 = this._loadedData[type])[clientId] || (_base1[clientId] = []));\n      _results = [];\n      for (key in hash) {\n        if (!loadedData.contains(key)) {\n          _results.push(loadedData.pushObject(key));\n        } else {\n          _results.push(void 0);\n        }\n      }\n      return _results;\n    },\n    isDataLoadedFor: function(type, clientId, key) {\n      var data, recordsData;\n      if (recordsData = this._loadedData[type.toString()]) {\n        if (data = recordsData[clientId]) {\n          return data.contains(key);\n        }\n      }\n    },\n    loadIncomplete: function(type, hash) {\n      var record, result;\n      result = this.merge(type, hash);\n      if (result && result.clientId) {\n        this.addLoadedData(type, result.clientId, hash);\n        record = this.findByClientId(type, result.clientId);\n        if (!record.get('complete')) {\n          record.loadedAsIncomplete();\n        }\n        return record;\n      }\n    },\n    _loadMany: function(store, type, json) {\n      var root;\n      root = type.pluralName();\n      this.adapter.sideload(store, type, json, root);\n      return this.loadMany(type, json[root]);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=store");minispade.register('store/fixture_adapter', "(function() {(function() {\n\n  this.Travis.FixtureAdapter = DS.Adapter.extend({\n    find: function(store, type, id) {\n      var fixtures;\n      fixtures = type.FIXTURES;\n      Ember.assert(\"Unable to find fixtures for model type \" + type.toString(), !!fixtures);\n      if (fixtures.hasLoaded) {\n        return;\n      }\n      return setTimeout((function() {\n        store.loadMany(type, fixtures);\n        return fixtures.hasLoaded = true;\n      }), 300);\n    },\n    findMany: function() {\n      return this.find.apply(this, arguments);\n    },\n    findAll: function(store, type) {\n      var fixtures, ids;\n      fixtures = type.FIXTURES;\n      Ember.assert(\"Unable to find fixtures for model type \" + type.toString(), !!fixtures);\n      ids = fixtures.map(function(item, index, self) {\n        return item.id;\n      });\n      return store.loadMany(type, ids, fixtures);\n    },\n    findQuery: function(store, type, params, array) {\n      var fixture, fixtures, hashes, key, matches, value;\n      fixtures = type.FIXTURES;\n      Ember.assert(\"Unable to find fixtures for model type \" + type.toString(), !!fixtures);\n      hashes = (function() {\n        var _i, _len, _results;\n        _results = [];\n        for (_i = 0, _len = fixtures.length; _i < _len; _i++) {\n          fixture = fixtures[_i];\n          matches = (function() {\n            var _results1;\n            _results1 = [];\n            for (key in params) {\n              value = params[key];\n              _results1.push(key === 'orderBy' || fixture[key] === value);\n            }\n            return _results1;\n          })();\n          if (matches.reduce(function(a, b) {\n            return a && b;\n          })) {\n            _results.push(fixture);\n          } else {\n            _results.push(null);\n          }\n        }\n        return _results;\n      })();\n      return array.load(hashes.compact());\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=store/fixture_adapter");minispade.register('store/rest_adapter', "(function() {(function() {\nminispade.require('travis/ajax');\nminispade.require('models');\n\n  this.Travis.RestAdapter = DS.RESTAdapter.extend({\n    mappings: {\n      broadcasts: Travis.Broadcast,\n      repositories: Travis.Repo,\n      repository: Travis.Repo,\n      repos: Travis.Repo,\n      repo: Travis.Repo,\n      builds: Travis.Build,\n      build: Travis.Build,\n      commits: Travis.Commit,\n      commit: Travis.Commit,\n      jobs: Travis.Job,\n      job: Travis.Job,\n      account: Travis.Account,\n      accounts: Travis.Account,\n      worker: Travis.Worker,\n      workers: Travis.Worker\n    },\n    plurals: {\n      repositories: 'repositories',\n      repository: 'repositories',\n      repo: 'repos',\n      repos: 'repos',\n      build: 'builds',\n      branch: 'branches',\n      job: 'jobs',\n      worker: 'workers',\n      profile: 'profile'\n    },\n    ajax: function() {\n      return Travis.ajax.ajax.apply(this, arguments);\n    }\n  });\n\n  this.Travis.RestAdapter.map('Travis.Branch', {\n    repoId: {\n      key: 'repository_id'\n    }\n  });\n\n  this.Travis.RestAdapter.map('Travis.Build', {\n    repoId: {\n      key: 'repository_id'\n    },\n    _duration: {\n      key: 'duration'\n    },\n    repo: {\n      key: 'repository_id'\n    },\n    jobs: {\n      key: 'job_ids'\n    }\n  });\n\n  this.Travis.RestAdapter.map('Travis.Commit', {\n    build: {\n      key: 'buildId'\n    }\n  });\n\n  this.Travis.RestAdapter.map('Travis.Event', {\n    repoId: {\n      key: 'repository_id'\n    },\n    sourceId: {\n      key: 'source_id'\n    },\n    sourceType: {\n      key: 'source_type'\n    }\n  });\n\n  this.Travis.RestAdapter.map('Travis.Job', {\n    repoId: {\n      key: 'repository_id'\n    },\n    _duration: {\n      key: 'duration'\n    },\n    repo: {\n      key: 'repository_id'\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=store/rest_adapter");minispade.register('tailing', "(function() {(function() {\n\n  this.Travis.Tailing = function() {\n    this.position = $(window).scrollTop();\n    $(window).scroll($.throttle(200, this.onScroll.bind(this)));\n    return this;\n  };\n\n  $.extend(Travis.Tailing.prototype, {\n    options: {\n      timeout: 200\n    },\n    run: function() {\n      this.autoScroll();\n      this.positionButton();\n      if (this.active()) {\n        return Ember.run.later(this.run.bind(this), this.options.timeout);\n      }\n    },\n    toggle: function(event) {\n      if (this.active()) {\n        return this.stop();\n      } else {\n        return this.start();\n      }\n    },\n    active: function() {\n      return $('#tail').hasClass('active');\n    },\n    start: function() {\n      $('#tail').addClass('active');\n      return this.run();\n    },\n    stop: function() {\n      return $('#tail').removeClass('active');\n    },\n    autoScroll: function() {\n      var log, logBottom, win, winBottom;\n      if (!this.active()) {\n        return;\n      }\n      win = $(window);\n      log = $('#log');\n      logBottom = log.offset().top + log.outerHeight() + 40;\n      winBottom = win.scrollTop() + win.height();\n      if (logBottom - winBottom > 0) {\n        return win.scrollTop(logBottom - win.height());\n      }\n    },\n    onScroll: function() {\n      var position;\n      this.positionButton();\n      position = $(window).scrollTop();\n      if (position < this.position) {\n        this.stop();\n      }\n      return this.position = position;\n    },\n    positionButton: function() {\n      var max, offset, tail;\n      tail = $('#tail');\n      if (tail.length === 0) {\n        return;\n      }\n      offset = $(window).scrollTop() - $('#log').offset().top;\n      max = $('#log').height() - $('#tail').height() + 5;\n      if (offset > max) {\n        offset = max;\n      }\n      if (offset > 0) {\n        return tail.css({\n          top: offset - 2\n        });\n      } else {\n        return tail.css({\n          top: 0\n        });\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=tailing");minispade.register('views', "(function() {(function() {\nminispade.require('ext/ember/namespace');\n\n  this.Travis.reopen({\n    View: Em.View.extend({\n      popup: function(event) {\n        this.popupCloseAll();\n        return $(\"#\" + event.target.name).toggleClass('display');\n      },\n      popupClose: function(event) {\n        return $(event.target).closest('.popup').removeClass('display');\n      },\n      popupCloseAll: function() {\n        return $('.popup').removeClass('display');\n      }\n    })\n  });\nminispade.require('views/accounts');\nminispade.require('views/application');\nminispade.require('views/build');\nminispade.require('views/events');\nminispade.require('views/flash');\nminispade.require('views/job');\nminispade.require('views/repo');\nminispade.require('views/profile');\nminispade.require('views/sidebar');\nminispade.require('views/stats');\nminispade.require('views/signin');\nminispade.require('views/top');\n\n}).call(this);\n\n})();\n//@ sourceURL=views");minispade.register('views/accounts', "(function() {(function() {\n\n  this.Travis.reopen({\n    AccountsView: Travis.View.extend({\n      tabBinding: 'controller.tab',\n      templateName: 'profile/accounts',\n      classAccounts: (function() {\n        if (this.get('tab') === 'accounts') {\n          return 'active';\n        }\n      }).property('tab')\n    }),\n    AccountsListView: Em.CollectionView.extend({\n      elementId: 'accounts',\n      accountBinding: 'content',\n      tagName: 'ul',\n      emptyView: Ember.View.extend({\n        template: Ember.Handlebars.compile('<div class=\"loading\"><span>Loading</span></div>')\n      }),\n      itemViewClass: Travis.View.extend({\n        accountBinding: 'content',\n        typeBinding: 'content.type',\n        selectedBinding: 'account.selected',\n        classNames: ['account'],\n        classNameBindings: ['type', 'selected'],\n        name: (function() {\n          return this.get('content.name') || this.get('content.login');\n        }).property('content.login', 'content.name'),\n        urlAccount: (function() {\n          return Travis.Urls.account(this.get('account.login'));\n        }).property('account.login')\n      })\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/accounts");minispade.register('views/application', "(function() {(function() {\n\n  this.Travis.reopen({\n    ApplicationView: Travis.View.extend({\n      templateName: 'layouts/home',\n      classNames: ['application'],\n      connectLayout: function(name) {\n        name = \"layouts/\" + name;\n        if (this.get('templateName') !== name) {\n          this.set('templateName', name);\n          return this.rerender();\n        }\n      },\n      localeDidChange: (function() {\n        var locale;\n        if (locale = Travis.app.get('auth.user.locale')) {\n          if (Travis.needsLocaleChange(locale)) {\n            Travis.setLocale(locale);\n            return Travis.app.get('router').reload();\n          }\n        }\n      }).observes('Travis.app.auth.user.locale'),\n      click: function(event) {\n        var targetAndParents;\n        targetAndParents = $(event.target).parents().andSelf();\n        if (!(targetAndParents.hasClass('open-popup') || targetAndParents.hasClass('popup'))) {\n          this.popupCloseAll();\n        }\n        if (!targetAndParents.hasClass('menu')) {\n          return $('.menu').removeClass('display');\n        }\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/application");minispade.register('views/build', "(function() {(function() {\n\n  this.Travis.reopen({\n    BuildsView: Travis.View.extend({\n      templateName: 'builds/list',\n      buildsBinding: 'controller.builds',\n      showMore: function() {\n        var id, number;\n        id = this.get('controller.repo.id');\n        number = this.get('builds.lastObject.number');\n        return this.get('builds').load(Travis.Build.olderThanNumber(id, number));\n      },\n      ShowMoreButton: Em.View.extend({\n        tagName: 'button',\n        classNameBindings: ['isLoading'],\n        attributeBindings: ['disabled'],\n        isLoadingBinding: 'controller.builds.isLoading',\n        template: Em.Handlebars.compile('{{view.label}}'),\n        disabledBinding: 'isLoading',\n        label: (function() {\n          if (this.get('isLoading')) {\n            return 'Loading';\n          } else {\n            return 'Show more';\n          }\n        }).property('isLoading'),\n        click: function() {\n          return this.get('parentView').showMore();\n        }\n      })\n    }),\n    BuildsItemView: Travis.View.extend({\n      tagName: 'tr',\n      classNameBindings: ['color'],\n      repoBinding: 'controller.repo',\n      buildBinding: 'context',\n      commitBinding: 'build.commit',\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('build.result'));\n      }).property('build.result'),\n      urlBuild: (function() {\n        return Travis.Urls.build(this.get('repo.slug'), this.get('build.id'));\n      }).property('repo.slug', 'build.id'),\n      urlGithubCommit: (function() {\n        return Travis.Urls.githubCommit(this.get('repo.slug'), this.get('commit.sha'));\n      }).property('repo.slug', 'commit.sha')\n    }),\n    BuildView: Travis.View.extend({\n      templateName: 'builds/show',\n      elementId: 'build',\n      classNameBindings: ['color', 'loading'],\n      repoBinding: 'controller.repo',\n      buildBinding: 'controller.build',\n      commitBinding: 'build.commit',\n      currentItemBinding: 'build',\n      loading: (function() {\n        return !this.get('build.isComplete');\n      }).property('build.isComplete'),\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('build.result'));\n      }).property('build.result'),\n      urlBuild: (function() {\n        return Travis.Urls.build(this.get('repo.slug'), this.get('build.id'));\n      }).property('repo.slug', 'build.id'),\n      urlGithubCommit: (function() {\n        return Travis.Urls.githubCommit(this.get('repo.slug'), this.get('commit.sha'));\n      }).property('repo.slug', 'commit.sha'),\n      urlAuthor: (function() {\n        return Travis.Urls.email(this.get('commit.authorEmail'));\n      }).property('commit.authorEmail'),\n      urlCommitter: (function() {\n        return Travis.Urls.email(this.get('commit.committerEmail'));\n      }).property('commit.committerEmail')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/build");minispade.register('views/events', "(function() {(function() {\n\n  this.Travis.reopen({\n    EventsView: Travis.View.extend({\n      templateName: 'events/list',\n      eventsBinding: 'controller.events'\n    }),\n    EventsItemView: Travis.View.extend({\n      tagName: 'tr'\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/events");minispade.register('views/flash', "(function() {(function() {\n\n  this.Travis.reopen({\n    FlashView: Travis.View.extend({\n      elementId: 'flash',\n      tagName: 'ul',\n      templateName: 'layouts/flash'\n    }),\n    FlashItemView: Travis.View.extend({\n      tagName: 'li',\n      classNameBindings: ['type'],\n      type: (function() {\n        return this.get('flash.type') || 'broadcast';\n      }).property('flash.type'),\n      close: function(event) {\n        return this.get('controller').close(this.get('flash'));\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/flash");minispade.register('views/job', "(function() {(function() {\n\n  this.Travis.reopen({\n    JobsView: Travis.View.extend({\n      templateName: 'jobs/list',\n      buildBinding: 'controller.build'\n    }),\n    JobsItemView: Travis.View.extend({\n      tagName: 'tr',\n      classNameBindings: ['color'],\n      repoBinding: 'context.repo',\n      jobBinding: 'context',\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('job.result'));\n      }).property('job.result'),\n      urlJob: (function() {\n        return Travis.Urls.job(this.get('repo.slug'), this.get('job.id'));\n      }).property('repo.slug', 'job.id')\n    }),\n    JobView: Travis.View.extend({\n      templateName: 'jobs/show',\n      repoBinding: 'controller.repo',\n      jobBinding: 'controller.job',\n      commitBinding: 'job.commit',\n      currentItemBinding: 'job',\n      color: (function() {\n        return Travis.Helpers.colorForResult(this.get('job.result'));\n      }).property('job.result'),\n      urlJob: (function() {\n        return Travis.Urls.job(this.get('repo.slug'), this.get('job.id'));\n      }).property('repo.slug', 'job.id'),\n      urlGithubCommit: (function() {\n        return Travis.Urls.githubCommit(this.get('repo.slug'), this.get('commit.sha'));\n      }).property('repo.slug', 'commit.sha'),\n      urlAuthor: (function() {\n        return Travis.Urls.email(this.get('commit.authorEmail'));\n      }).property('commit.authorEmail'),\n      urlCommitter: (function() {\n        return Travis.Urls.email(this.get('commit.committerEmail'));\n      }).property('commit.committerEmail')\n    }),\n    LogView: Travis.View.extend({\n      templateName: 'jobs/log',\n      logBinding: 'job.log',\n      scrollTo: function(hash) {\n        $('#main').scrollTop(0);\n        $('html,body').scrollTop($(hash).offset().top);\n        return this.set('controller.lineNumberHash', null);\n      },\n      lineNumberHashDidChange: (function() {\n        return this.tryScrollingToHashLineNumber();\n      }).observes('controller.lineNumberHash'),\n      tryScrollingToHashLineNumber: function() {\n        var checker, hash, self;\n        if (hash = this.get('controller.lineNumberHash')) {\n          self = this;\n          checker = function() {\n            if (self.get('isDestroyed')) {\n              return;\n            }\n            if ($(hash).length) {\n              return self.scrollTo(hash);\n            } else {\n              return setTimeout(checker, 100);\n            }\n          };\n          return checker();\n        }\n      },\n      didInsertElement: function() {\n        this._super.apply(this, arguments);\n        return this.tryScrollingToHashLineNumber();\n      },\n      click: function(event) {\n        var path, target;\n        target = $(event.target);\n        target.closest('.fold').toggleClass('open');\n        if (target.is('.log-line-number')) {\n          path = target.attr('href');\n          Travis.app.get('router').route(path);\n          event.stopPropagation();\n          return false;\n        }\n      },\n      toTop: function() {\n        return $(window).scrollTop(0);\n      },\n      jobBinding: 'context',\n      toggleTailing: function(event) {\n        Travis.app.tailing.toggle();\n        return event.preventDefault();\n      },\n      logSubscriber: (function() {\n        var job, state;\n        job = this.get('job');\n        state = this.get('job.state');\n        if (job && state !== 'finished') {\n          job.subscribe();\n        }\n        return null;\n      }).property('job', 'job.state')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/job");minispade.register('views/left', "(function() {(function() {\n\n  this.Travis.reopen({\n    ReposView: Travis.View.extend({\n      templateName: 'repos/list',\n      tabBinding: 'controller.tab',\n      classRecent: (function() {\n        if (this.get('tab') === 'recent') {\n          return 'active';\n        }\n      }).property('tab'),\n      classOwned: (function() {\n        var classes;\n        classes = [];\n        if (this.get('tab') === 'owned') {\n          classes.push('active');\n        }\n        if (Travis.app.get('currentUser')) {\n          classes.push('display');\n        }\n        return classes.join(' ');\n      }).property('tab', 'Travis.currentUser'),\n      classSearch: (function() {\n        if (this.get('tab') === 'search') {\n          return 'active';\n        }\n      }).property('tab')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/left");minispade.register('views/profile', "(function() {(function() {\n\n  this.Travis.reopen({\n    ProfileView: Travis.View.extend({\n      templateName: 'profile/show',\n      accountBinding: 'controller.account',\n      name: (function() {\n        return this.get('account.name') || this.get('account.login');\n      }).property('account.name', 'account.login')\n    }),\n    ProfileTabsView: Travis.View.extend({\n      templateName: 'profile/tabs',\n      tabBinding: 'controller.tab',\n      activate: function(event) {\n        return this.get('controller').activate(event.target.name);\n      },\n      classHooks: (function() {\n        if (this.get('tab') === 'hooks') {\n          return 'active';\n        }\n      }).property('tab'),\n      classUser: (function() {\n        if (this.get('tab') === 'user') {\n          return 'active';\n        }\n      }).property('tab'),\n      accountBinding: 'controller.account',\n      displayUser: (function() {\n        return this.get('controller.account.login') === this.get('controller.user.login');\n      }).property('controller.account.login', 'controller.user.login')\n    }),\n    HooksView: Travis.View.extend({\n      templateName: 'profile/tabs/hooks',\n      userBinding: 'controller.user',\n      urlGithubAdmin: (function() {\n        return Travis.Urls.githubAdmin(this.get('hook.slug'));\n      }).property('hook.slug')\n    }),\n    UserView: Travis.View.extend({\n      templateName: 'profile/tabs/user',\n      userBinding: 'controller.user',\n      gravatarUrl: (function() {\n        return \"\" + location.protocol + \"//www.gravatar.com/avatar/\" + (this.get('user.gravatarId')) + \"?s=48&d=mm\";\n      }).property('user.gravatarId'),\n      locales: (function() {\n        return [\n          {\n            key: null,\n            name: ''\n          }, {\n            key: 'en',\n            name: 'English'\n          }, {\n            key: 'ca',\n            name: 'Catalan'\n          }, {\n            key: 'cs',\n            name: 'Čeština'\n          }, {\n            key: 'es',\n            name: 'Español'\n          }, {\n            key: 'fr',\n            name: 'Français'\n          }, {\n            key: 'ja',\n            name: '日本語'\n          }, {\n            key: 'nl',\n            name: 'Nederlands'\n          }, {\n            key: 'nb',\n            name: 'Norsk Bokmål'\n          }, {\n            key: 'pl',\n            name: 'Polski'\n          }, {\n            key: {\n              'pt-BR': {\n                name: 'Português brasileiro'\n              }\n            }\n          }, {\n            key: 'ru',\n            name: 'Русский'\n          }\n        ];\n      }).property(),\n      saveLocale: function(event) {\n        return this.get('user').updateLocale($('#locale').val());\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/profile");minispade.register('views/repo', "(function() {(function() {\nminispade.require('views/repo/list');\nminispade.require('views/repo/show');\n\n}).call(this);\n\n})();\n//@ sourceURL=views/repo");minispade.register('views/repo/list', "(function() {(function() {\n\n  this.Travis.reopen({\n    ReposView: Travis.View.extend({\n      templateName: 'repos/list',\n      toggleInfo: function(event) {\n        return $('#repos').toggleClass('open');\n      }\n    }),\n    ReposListView: Em.CollectionView.extend({\n      elementId: 'repos',\n      tagName: 'ul',\n      emptyView: Ember.View.extend({\n        template: Ember.Handlebars.compile('<div class=\"loading\"><span>Loading</span></div>')\n      }),\n      itemViewClass: Travis.View.extend({\n        repoBinding: 'content',\n        classNames: ['repo'],\n        classNameBindings: ['color', 'selected'],\n        selectedBinding: 'repo.selected',\n        color: (function() {\n          return Travis.Helpers.colorForResult(this.get('repo.lastBuildResult'));\n        }).property('repo.lastBuildResult'),\n        urlRepo: (function() {\n          return Travis.Urls.repo(this.get('repo.slug'));\n        }).property('repo.slug'),\n        urlLastBuild: (function() {\n          return Travis.Urls.build(this.get('repo.slug'), this.get('repo.lastBuildId'));\n        }).property('repo.slug', 'repo.lastBuildId')\n      })\n    }),\n    ReposListTabsView: Travis.View.extend({\n      templateName: 'repos/list/tabs',\n      tabBinding: 'controller.tab',\n      activate: function(event) {\n        return this.get('controller').activate(event.target.name);\n      },\n      classRecent: (function() {\n        if (this.get('tab') === 'recent') {\n          return 'active';\n        }\n      }).property('tab'),\n      classOwned: (function() {\n        var classes;\n        classes = [];\n        if (this.get('tab') === 'owned') {\n          classes.push('active');\n        }\n        if (Travis.app.get('currentUser')) {\n          classes.push('display-inline');\n        }\n        return classes.join(' ');\n      }).property('tab', 'Travis.app.currentUser'),\n      classSearch: (function() {\n        if (this.get('tab') === 'search') {\n          return 'active';\n        }\n      }).property('tab')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/repo/list");minispade.register('views/repo/show', "(function() {(function() {\n\n  this.Travis.reopen({\n    RepoView: Travis.View.extend({\n      templateName: 'repos/show',\n      reposBinding: 'controller.repos',\n      repoBinding: 'controller.repo',\n      \"class\": (function() {\n        if (!this.get('repo.isComplete') && !this.get('isEmpty')) {\n          return 'loading';\n        }\n      }).property('repo.isComplete'),\n      isEmpty: (function() {\n        return this.get('repos.isLoaded') && this.get('repos.length') === 0;\n      }).property('repos.length'),\n      urlGithub: (function() {\n        return Travis.Urls.githubRepo(this.get('repo.slug'));\n      }).property('repo.slug'),\n      urlGithubWatchers: (function() {\n        return Travis.Urls.githubWatchers(this.get('repo.slug'));\n      }).property('repo.slug'),\n      urlGithubNetwork: (function() {\n        return Travis.Urls.githubNetwork(this.get('repo.slug'));\n      }).property('repo.slug')\n    }),\n    ReposEmptyView: Travis.View.extend({\n      template: ''\n    }),\n    RepoShowTabsView: Travis.View.extend({\n      templateName: 'repos/show/tabs',\n      repoBinding: 'controller.repo',\n      buildBinding: 'controller.build',\n      jobBinding: 'controller.job',\n      tabBinding: 'controller.tab',\n      classCurrent: (function() {\n        if (this.get('tab') === 'current') {\n          return 'active';\n        }\n      }).property('tab'),\n      classBuilds: (function() {\n        if (this.get('tab') === 'builds') {\n          return 'active';\n        }\n      }).property('tab'),\n      classPullRequests: (function() {\n        if (this.get('tab') === 'pull_requests') {\n          return 'active';\n        }\n      }).property('tab'),\n      classBranches: (function() {\n        if (this.get('tab') === 'branches') {\n          return 'active';\n        }\n      }).property('tab'),\n      classEvents: (function() {\n        if (this.get('tab') === 'events') {\n          return 'active';\n        }\n      }).property('tab'),\n      classBuild: (function() {\n        var classes, tab;\n        tab = this.get('tab');\n        classes = [];\n        if (tab === 'build') {\n          classes.push('active');\n        }\n        if (tab === 'build' || tab === 'job') {\n          classes.push('display-inline');\n        }\n        return classes.join(' ');\n      }).property('tab'),\n      classJob: (function() {\n        if (this.get('tab') === 'job') {\n          return 'active display-inline';\n        }\n      }).property('tab')\n    }),\n    RepoShowToolsView: Travis.View.extend({\n      templateName: 'repos/show/tools',\n      repoBinding: 'controller.repo',\n      buildBinding: 'controller.build',\n      jobBinding: 'controller.job',\n      tabBinding: 'controller.tab',\n      closeMenu: function() {\n        return $('.menu').removeClass('display');\n      },\n      menu: function(event) {\n        var element;\n        this.popupCloseAll();\n        element = $('#tools .menu').toggleClass('display');\n        return event.stopPropagation();\n      },\n      requeue: function() {\n        this.closeMenu();\n        return this.get('build').requeue();\n      },\n      statusImages: function(event) {\n        this.set('active', true);\n        this.closeMenu();\n        this.popup(event);\n        return event.stopPropagation();\n      },\n      canPush: (function() {\n        return this.get('isBuildTab') && this.get('build.isFinished') && this.get('hasPushPermissions');\n      }).property('build.isFinished', 'hasPushPermissions', 'isBuildTab'),\n      isBuildTab: (function() {\n        return ['current', 'build', 'job'].indexOf(this.get('tab')) > -1;\n      }).property('tab'),\n      hasPushPermissions: (function() {\n        var permissions;\n        if (permissions = Travis.app.get('currentUser.permissions')) {\n          return permissions.indexOf(this.get('repo.id')) > -1;\n        }\n      }).property('Travis.app.currentUser.permissions.length', 'repo.id'),\n      branches: (function() {\n        if (this.get('active')) {\n          return this.get('repo.branches');\n        }\n      }).property('active', 'repo.branches'),\n      urlRepo: (function() {\n        return 'https://' + location.host + Travis.Urls.repo(this.get('repo.slug'));\n      }).property('repo.slug'),\n      urlStatusImage: (function() {\n        return Travis.Urls.statusImage(this.get('repo.slug'), this.get('branch.commit.branch'));\n      }).property('repo.slug', 'branch'),\n      markdownStatusImage: (function() {\n        return \"[![Build Status](\" + (this.get('urlStatusImage')) + \")](\" + (this.get('urlRepo')) + \")\";\n      }).property('urlStatusImage'),\n      textileStatusImage: (function() {\n        return \"!\" + (this.get('urlStatusImage')) + \"!:\" + (this.get('urlRepo'));\n      }).property('urlStatusImage'),\n      rdocStatusImage: (function() {\n        return \"{<img src=\\\"\" + (this.get('urlStatusImage')) + \"\\\" alt=\\\"Build Status\\\" />}[\" + (this.get('urlRepo')) + \"]\";\n      }).property('urlStatusImage')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/repo/show");minispade.register('views/sidebar', "(function() {(function() {\n\n  this.Travis.reopen({\n    SidebarView: Travis.View.extend({\n      templateName: 'layouts/sidebar',\n      DecksView: Em.View.extend({\n        templateName: \"sponsors/decks\",\n        controller: Travis.SponsorsController.create({\n          perPage: 1\n        }),\n        didInsertElement: function() {\n          var controller;\n          controller = this.get('controller');\n          if (!controller.get('content')) {\n            Travis.app.get('router.sidebarController').tickables.push(controller);\n            controller.set('content', Travis.Sponsor.decks());\n          }\n          return this._super.apply(this, arguments);\n        }\n      }),\n      LinksView: Em.View.extend({\n        templateName: \"sponsors/links\",\n        controller: Travis.SponsorsController.create({\n          perPage: 6\n        }),\n        didInsertElement: function() {\n          var controller;\n          controller = this.get('controller');\n          if (!controller.get('content')) {\n            controller.set('content', Travis.Sponsor.links());\n            Travis.app.get('router.sidebarController').tickables.push(controller);\n          }\n          return this._super.apply(this, arguments);\n        }\n      }),\n      WorkersView: Em.View.extend({\n        templateName: 'workers/list',\n        controller: Travis.WorkersController.create(),\n        didInsertElement: function() {\n          this.set('controller.content', Travis.Worker.find());\n          return this._super.apply(this, arguments);\n        }\n      }),\n      QueuesView: Em.View.extend({\n        templateName: 'queues/list',\n        controller: Em.ArrayController.create(),\n        didInsertElement: function() {\n          var queue, queues;\n          queues = (function() {\n            var _i, _len, _ref, _results;\n            _ref = Travis.QUEUES;\n            _results = [];\n            for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n              queue = _ref[_i];\n              _results.push(Em.ArrayController.create({\n                content: Travis.Job.queued(queue.name),\n                id: \"queue_\" + queue.name,\n                name: queue.display\n              }));\n            }\n            return _results;\n          })();\n          this.set('controller.content', queues);\n          return this._super.apply(this, arguments);\n        }\n      })\n    }),\n    WorkersView: Travis.View.extend({\n      toggleWorkers: function(event) {\n        var handle;\n        handle = $(event.target).toggleClass('open');\n        if (handle.hasClass('open')) {\n          return $('#workers li').addClass('open');\n        } else {\n          return $('#workers li').removeClass('open');\n        }\n      }\n    }),\n    WorkersListView: Travis.View.extend({\n      toggle: function(event) {\n        return $(event.target).closest('li').toggleClass('open');\n      }\n    }),\n    WorkersItemView: Travis.View.extend({\n      display: (function() {\n        var name, number, payload, repo, state;\n        name = (this.get('worker.name') || '').replace('travis-', '');\n        state = this.get('worker.state');\n        payload = this.get('worker.payload');\n        if (state === 'working' && (payload != null ? payload.repository : void 0) && (payload != null ? payload.build : void 0)) {\n          repo = this.get('worker.repoSlug');\n          number = ' #' + payload.build.number;\n          return (\"<span class='name'>\" + name + \": \" + repo + \"</span> \" + number).htmlSafe();\n        } else {\n          return \"\" + name + \": \" + state;\n        }\n      }).property('worker.state')\n    }),\n    QueueItemView: Travis.View.extend({\n      tagName: 'li'\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/sidebar");minispade.register('views/signin', "(function() {(function() {\n\n  this.Travis.reopen({\n    SigninView: Travis.View.extend({\n      templateName: 'auth/signin',\n      signingIn: (function() {\n        return Travis.app.get('authState') === 'signing-in';\n      }).property('Travis.app.authState')\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/signin");minispade.register('views/stats', "(function() {(function() {\n\n  this.Travis.reopen({\n    StatsView: Travis.View.extend({\n      templateName: 'stats/show',\n      didInsertElement: function() {},\n      renderChart: function(config) {\n        var chart;\n        chart = new Highcharts.Chart(config);\n        return this.fetch(config.source, function(data) {\n          var stats;\n          stats = (function() {\n            var _i, _len, _ref, _results;\n            _ref = data.stats;\n            _results = [];\n            for (_i = 0, _len = _ref.length; _i < _len; _i++) {\n              stats = _ref[_i];\n              _results.push(config.map(stats));\n            }\n            return _results;\n          })();\n          return chart.series[0].setData(stats);\n        });\n      },\n      fetch: function(url, callback) {\n        return $.ajax({\n          type: 'GET',\n          url: url,\n          accepts: {\n            json: 'application/vnd.travis-ci.2+json'\n          },\n          success: callback\n        });\n      },\n      CHARTS: {\n        repos: {\n          source: '/api/stats/repos',\n          total: 0,\n          map: function(data) {\n            return [Date.parse(data.date), this.total += parseInt(data.count)];\n          },\n          chart: {\n            renderTo: \"repos_stats\"\n          },\n          title: {\n            text: \"Total Projects/Repositories\"\n          },\n          xAxis: {\n            type: \"datetime\",\n            dateTimeLabelFormats: {\n              month: \"%e. %b\",\n              year: \"%b\"\n            }\n          },\n          yAxis: {\n            title: {\n              text: \"Count\"\n            },\n            min: 0\n          },\n          tooltip: {\n            formatter: function() {\n              return Highcharts.dateFormat(\"%e. %b\", this.x) + \": \" + this.y + \" repos\";\n            }\n          },\n          series: [\n            {\n              name: \"Repository Growth\",\n              data: []\n            }\n          ]\n        },\n        builds: {\n          source: '/api/stats/tests',\n          map: function(data) {\n            return [Date.parse(data.date), parseInt(data.count)];\n          },\n          chart: {\n            renderTo: \"tests_stats\",\n            type: \"column\"\n          },\n          title: {\n            text: \"Build Count\"\n          },\n          subtitle: {\n            text: \"last month\"\n          },\n          xAxis: {\n            type: \"datetime\",\n            dateTimeLabelFormats: {\n              month: \"%e. %b\",\n              year: \"%b\"\n            }\n          },\n          yAxis: {\n            title: {\n              text: \"Count\"\n            },\n            min: 0\n          },\n          tooltip: {\n            formatter: function() {\n              return Highcharts.dateFormat(\"%e. %b\", this.x) + \": \" + this.y + \" builds\";\n            }\n          },\n          series: [\n            {\n              name: \"Total Builds\",\n              data: []\n            }\n          ]\n        }\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/stats");minispade.register('views/top', "(function() {(function() {\n\n  this.Travis.reopen({\n    TopView: Travis.View.extend({\n      templateName: 'layouts/top',\n      tabBinding: 'controller.tab',\n      userBinding: 'controller.user',\n      gravatarUrl: (function() {\n        return \"\" + location.protocol + \"//www.gravatar.com/avatar/\" + (this.get('user.gravatarId')) + \"?s=24&d=mm\";\n      }).property('user.gravatarId'),\n      classHome: (function() {\n        if (this.get('tab') === 'home') {\n          return 'active';\n        }\n      }).property('tab'),\n      classStats: (function() {\n        if (this.get('tab') === 'stats') {\n          return 'active';\n        }\n      }).property('tab'),\n      classProfile: (function() {\n        var classes;\n        classes = ['profile'];\n        if (this.get('tab') === 'profile') {\n          classes.push('active');\n        }\n        classes.push(Travis.app.get('authState'));\n        return classes.join(' ');\n      }).property('tab', 'Travis.app.authState'),\n      showProfile: function() {\n        return $('#top .profile ul').show();\n      },\n      hideProfile: function() {\n        return $('#top .profile ul').hide();\n      }\n    })\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=views/top");minispade.register('config/emoij', "(function() {(function() {\n\n  this.EmojiDictionary = ['-1', '0', '1', '109', '2', '3', '4', '5', '6', '7', '8', '8ball', '9', 'a', 'ab', 'airplane', 'alien', 'ambulance', 'angel', 'anger', 'angry', 'apple', 'aquarius', 'aries', 'arrow_backward', 'arrow_down', 'arrow_forward', 'arrow_left', 'arrow_lower_left', 'arrow_lower_right', 'arrow_right', 'arrow_up', 'arrow_upper_left', 'arrow_upper_right', 'art', 'astonished', 'atm', 'b', 'baby', 'baby_chick', 'baby_symbol', 'balloon', 'bamboo', 'bank', 'barber', 'baseball', 'basketball', 'bath', 'bear', 'beer', 'beers', 'beginner', 'bell', 'bento', 'bike', 'bikini', 'bird', 'birthday', 'black_square', 'blue_car', 'blue_heart', 'blush', 'boar', 'boat', 'bomb', 'book', 'boot', 'bouquet', 'bow', 'bowtie', 'boy', 'bread', 'briefcase', 'broken_heart', 'bug', 'bulb', 'bullettrain_front', 'bullettrain_side', 'bus', 'busstop', 'cactus', 'cake', 'calling', 'camel', 'camera', 'cancer', 'capricorn', 'car', 'cat', 'cd', 'chart', 'checkered_flag', 'cherry_blossom', 'chicken', 'christmas_tree', 'church', 'cinema', 'city_sunrise', 'city_sunset', 'clap', 'clapper', 'clock1', 'clock10', 'clock11', 'clock12', 'clock2', 'clock3', 'clock4', 'clock5', 'clock6', 'clock7', 'clock8', 'clock9', 'closed_umbrella', 'cloud', 'clubs', 'cn', 'cocktail', 'coffee', 'cold_sweat', 'computer', 'confounded', 'congratulations', 'construction', 'construction_worker', 'convenience_store', 'cool', 'cop', 'copyright', 'couple', 'couple_with_heart', 'couplekiss', 'cow', 'crossed_flags', 'crown', 'cry', 'cupid', 'currency_exchange', 'curry', 'cyclone', 'dancer', 'dancers', 'dango', 'dart', 'dash', 'de', 'department_store', 'diamonds', 'disappointed', 'dog', 'dolls', 'dolphin', 'dress', 'dvd', 'ear', 'ear_of_rice', 'egg', 'eggplant', 'egplant', 'eight_pointed_black_star', 'eight_spoked_asterisk', 'elephant', 'email', 'es', 'european_castle', 'exclamation', 'eyes', 'factory', 'fallen_leaf', 'fast_forward', 'fax', 'fearful', 'feelsgood', 'feet', 'ferris_wheel', 'finnadie', 'fire', 'fire_engine', 'fireworks', 'fish', 'fist', 'flags', 'flushed', 'football', 'fork_and_knife', 'fountain', 'four_leaf_clover', 'fr', 'fries', 'frog', 'fuelpump', 'gb', 'gem', 'gemini', 'ghost', 'gift', 'gift_heart', 'girl', 'goberserk', 'godmode', 'golf', 'green_heart', 'grey_exclamation', 'grey_question', 'grin', 'guardsman', 'guitar', 'gun', 'haircut', 'hamburger', 'hammer', 'hamster', 'hand', 'handbag', 'hankey', 'hash', 'headphones', 'heart', 'heart_decoration', 'heart_eyes', 'heartbeat', 'heartpulse', 'hearts', 'hibiscus', 'high_heel', 'horse', 'hospital', 'hotel', 'hotsprings', 'house', 'hurtrealbad', 'icecream', 'id', 'ideograph_advantage', 'imp', 'information_desk_person', 'iphone', 'it', 'jack_o_lantern', 'japanese_castle', 'joy', 'jp', 'key', 'kimono', 'kiss', 'kissing_face', 'kissing_heart', 'koala', 'koko', 'kr', 'leaves', 'leo', 'libra', 'lips', 'lipstick', 'lock', 'loop', 'loudspeaker', 'love_hotel', 'mag', 'mahjong', 'mailbox', 'man', 'man_with_gua_pi_mao', 'man_with_turban', 'maple_leaf', 'mask', 'massage', 'mega', 'memo', 'mens', 'metal', 'metro', 'microphone', 'minidisc', 'mobile_phone_off', 'moneybag', 'monkey', 'monkey_face', 'moon', 'mortar_board', 'mount_fuji', 'mouse', 'movie_camera', 'muscle', 'musical_note', 'nail_care', 'necktie', 'new', 'no_good', 'no_smoking', 'nose', 'notes', 'o', 'o2', 'ocean', 'octocat', 'octopus', 'oden', 'office', 'ok', 'ok_hand', 'ok_woman', 'older_man', 'older_woman', 'open_hands', 'ophiuchus', 'palm_tree', 'parking', 'part_alternation_mark', 'pencil', 'penguin', 'pensive', 'persevere', 'person_with_blond_hair', 'phone', 'pig', 'pill', 'pisces', 'plus1', 'point_down', 'point_left', 'point_right', 'point_up', 'point_up_2', 'police_car', 'poop', 'post_office', 'postbox', 'pray', 'princess', 'punch', 'purple_heart', 'question', 'rabbit', 'racehorse', 'radio', 'rage', 'rage1', 'rage2', 'rage3', 'rage4', 'rainbow', 'raised_hands', 'ramen', 'red_car', 'red_circle', 'registered', 'relaxed', 'relieved', 'restroom', 'rewind', 'ribbon', 'rice', 'rice_ball', 'rice_cracker', 'rice_scene', 'ring', 'rocket', 'roller_coaster', 'rose', 'ru', 'runner', 'sa', 'sagittarius', 'sailboat', 'sake', 'sandal', 'santa', 'satellite', 'satisfied', 'saxophone', 'school', 'school_satchel', 'scissors', 'scorpius', 'scream', 'seat', 'secret', 'shaved_ice', 'sheep', 'shell', 'ship', 'shipit', 'shirt', 'shit', 'shoe', 'signal_strength', 'six_pointed_star', 'ski', 'skull', 'sleepy', 'slot_machine', 'smile', 'smiley', 'smirk', 'smoking', 'snake', 'snowman', 'sob', 'soccer', 'space_invader', 'spades', 'spaghetti', 'sparkler', 'sparkles', 'speaker', 'speedboat', 'squirrel', 'star', 'star2', 'stars', 'station', 'statue_of_liberty', 'stew', 'strawberry', 'sunflower', 'sunny', 'sunrise', 'sunrise_over_mountains', 'surfer', 'sushi', 'suspect', 'sweat', 'sweat_drops', 'swimmer', 'syringe', 'tada', 'tangerine', 'taurus', 'taxi', 'tea', 'telephone', 'tennis', 'tent', 'thumbsdown', 'thumbsup', 'ticket', 'tiger', 'tm', 'toilet', 'tokyo_tower', 'tomato', 'tongue', 'top', 'tophat', 'traffic_light', 'train', 'trident', 'trophy', 'tropical_fish', 'truck', 'trumpet', 'tshirt', 'tulip', 'tv', 'u5272', 'u55b6', 'u6307', 'u6708', 'u6709', 'u6e80', 'u7121', 'u7533', 'u7a7a', 'umbrella', 'unamused', 'underage', 'unlock', 'up', 'us', 'v', 'vhs', 'vibration_mode', 'virgo', 'vs', 'walking', 'warning', 'watermelon', 'wave', 'wc', 'wedding', 'whale', 'wheelchair', 'white_square', 'wind_chime', 'wink', 'wink2', 'wolf', 'woman', 'womans_hat', 'womens', 'x', 'yellow_heart', 'zap', 'zzz'];\n\n}).call(this);\n\n})();\n//@ sourceURL=config/emoij");minispade.register('data/sponsors', "(function() {(function() {\n\n  this.Travis.SPONSORS = [\n    {\n      type: 'platinum',\n      url: \"http://www.wooga.com\",\n      image: \"wooga-205x130.png\"\n    }, {\n      type: 'platinum',\n      url: \"http://bendyworks.com\",\n      image: \"bendyworks-205x130.png\"\n    }, {\n      type: 'platinum',\n      url: \"http://cloudcontrol.com\",\n      image: \"cloudcontrol-205x130.png\"\n    }, {\n      type: 'platinum',\n      url: \"http://xing.de\",\n      image: \"xing-205x130.png\"\n    }, {\n      type: 'gold',\n      url: \"http://heroku.com\",\n      image: \"heroku-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://soundcloud.com\",\n      image: \"soundcloud-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://nedap.com\",\n      image: \"nedap-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://mongohq.com\",\n      image: \"mongohq-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://zweitag.de\",\n      image: \"zweitag-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://kanbanery.com\",\n      image: \"kanbanery-205x60.png\"\n    }, {\n      type: 'gold',\n      url: \"http://ticketevolution.com\",\n      image: \"ticketevolution-205x60.jpg\"\n    }, {\n      type: 'gold',\n      url: \"http://plan.io/travis\",\n      image: \"planio-205x60.png\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://cobot.me\\\">Cobot</a><span>: The one tool to run your coworking space</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://jumpstartlab.com\\\">JumpstartLab</a><span>: We build developers</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://evilmartians.com\\\">Evil Martians</a><span>: Agile Ruby on Rails development</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://zendesk.com\\\">Zendesk</a><span>: Love your helpdesk</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://stripe.com\\\">Stripe</a><span>: Payments for developers</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://basho.com\\\">Basho</a><span>: We make Riak!</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://thinkrelevance.com\\\">Relevance</a><span>: We deliver software solutions</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://mindmatters.de\\\">Mindmatters</a><span>: Software für Menschen</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://amenhq.com\\\">Amen</a><span>: The best and worst of everything</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://site5.com\\\">Site5</a><span>: Premium Web Hosting Solutions</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.crowdint.com\\\">Crowd Interactive</a><span>: Leading Rails consultancy in Mexico</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.atomicobject.com/detroit\\\">Atomic Object</a><span>: Work with really smart people</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://codeminer.com.br\\\">Codeminer</a><span>: smart services for your startup</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://cloudant.com\\\">Cloudant</a><span>: grow into your data layer, not out of it</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://gidsy.com\\\">Gidsy</a><span>: Explore, organize &amp; book unique things to do!</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://5apps.com\\\">5apps</a><span>: Package &amp; deploy HTML5 apps automatically</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://meltmedia.com\\\">Meltmedia</a><span>: We are Interactive Superheroes</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.fngtps.com\\\">Fingertips</a><span> offers design and development services</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.engineyard.com\\\">Engine Yard</a><span>: Build epic apps, let us handle the rest</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://malwarebytes.org\\\">Malwarebytes</a><span>: Defeat Malware once and for all.</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://readmill.com\\\">Readmill</a><span>: The best reading app on the iPad.</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://www.mdsol.com\\\">Medidata</a><span>: clinical tech improving quality of life</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://coderwall.com/teams/4f27194e973bf000040005f0\\\">ESM</a><span>: Japan's best agile Ruby/Rails consultancy</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://twitter.com\\\">Twitter</a><span>: instantly connects people everywhere</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://agileanimal.com\\\">AGiLE ANiMAL</a><span>: we <3 Travis CI.</span>\"\n    }, {\n      type: 'silver',\n      link: \"<a href=\\\"http://tupalo.com\\\">Tupalo</a><span>: Discover, review &amp; share local businesses.</span>\"\n    }\n  ];\n\n  this.Travis.WORKERS = {\n    \"jvm-otp1.worker.travis-ci.org\": {\n      name: \"Travis Pro\",\n      url: \"http://travis-ci.com\"\n    },\n    \"jvm-otp2.worker.travis-ci.org\": {\n      name: \"Transloadit\",\n      url: \"http://transloadit.com\"\n    },\n    \"ppp1.worker.travis-ci.org\": {\n      name: \"Travis Pro\",\n      url: \"http://beta.travis-ci.com\"\n    },\n    \"ppp2.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    },\n    \"ppp3.worker.travis-ci.org\": {\n      name: \"Alchemy CMS\",\n      url: \"http://alchemy-cms.com/\"\n    },\n    \"rails1.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    },\n    \"ruby1.worker.travis-ci.org\": {\n      name: \"Engine Yard\",\n      url: \"http://www.engineyard.com\"\n    },\n    \"ruby2.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    },\n    \"ruby3.worker.travis-ci.org\": {\n      name: \"Railslove\",\n      url: \"http://railslove.de\"\n    },\n    \"ruby4.worker.travis-ci.org\": {\n      name: \"Engine Yard\",\n      url: \"http://www.engineyard.com\"\n    },\n    \"spree.worker.travis-ci.org\": {\n      name: \"Spree\",\n      url: \"http://spreecommerce.com\"\n    },\n    \"staging.worker.travis-ci.org\": {\n      name: \"EnterpriseRails\",\n      url: \"http://www.enterprise-rails.com\"\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=data/sponsors");minispade.register('ext/jquery', "(function() {(function() {\n\n  $.fn.extend({\n    outerHtml: function() {\n      return $(this).wrap('<div></div>').parent().html();\n    },\n    outerElement: function() {\n      return $($(this).outerHtml()).empty();\n    },\n    flash: function() {\n      return Utils.flash(this);\n    },\n    unflash: function() {\n      return Utils.unflash(this);\n    },\n    filterLog: function() {\n      this.deansi();\n      return this.foldLog();\n    },\n    deansi: function() {\n      return this.html(Utils.deansi(this.html()));\n    },\n    foldLog: function() {\n      return this.html(Utils.foldLog(this.html()));\n    },\n    unfoldLog: function() {\n      return this.html(Utils.unfoldLog(this.html()));\n    },\n    updateTimes: function() {\n      return Utils.updateTimes(this);\n    },\n    activateTab: function(tab) {\n      return Utils.activateTab(this, tab);\n    },\n    timeInWords: function() {\n      return $(this).each(function() {\n        return $(this).text(Utils.timeInWords(parseInt($(this).attr('title'))));\n      });\n    },\n    updateGithubStats: function(repo) {\n      return Utils.updateGithubStats(repo, $(this));\n    }\n  });\n\n  $.extend({\n    isEmpty: function(obj) {\n      if ($.isArray(obj)) {\n        return !obj.length;\n      } else if ($.isObject(obj)) {\n        return !$.keys(obj).length;\n      } else {\n        return !obj;\n      }\n    },\n    isObject: function(obj) {\n      return Object.prototype.toString.call(obj) === '[object Object]';\n    },\n    keys: function(obj) {\n      var keys;\n      keys = [];\n      $.each(obj, function(key) {\n        return keys.push(key);\n      });\n      return keys;\n    },\n    values: function(obj) {\n      var values;\n      values = [];\n      $.each(obj, function(key, value) {\n        return values.push(value);\n      });\n      return values;\n    },\n    underscore: function(string) {\n      return string[0].toLowerCase() + string.substring(1).replace(/([A-Z])?/g, function(match, chr) {\n        if (chr) {\n          return \"_\" + (chr.toUpperCase());\n        } else {\n          return '';\n        }\n      });\n    },\n    camelize: function(string, uppercase) {\n      string = uppercase === false ? $.underscore(string) : $.capitalize(string);\n      return string.replace(/_(.)?/g, function(match, chr) {\n        if (chr) {\n          return chr.toUpperCase();\n        } else {\n          return '';\n        }\n      });\n    },\n    capitalize: function(string) {\n      return string[0].toUpperCase() + string.substring(1);\n    },\n    compact: function(object) {\n      return $.grep(object, function(value) {\n        return !!value;\n      });\n    },\n    all: function(array, callback) {\n      var args, i;\n      args = Array.prototype.slice.apply(arguments);\n      callback = args.pop();\n      array = args.pop() || this;\n      i = 0;\n      while (i < array.length) {\n        if (callback(array[i])) {\n          return false;\n        }\n        i++;\n      }\n      return true;\n    },\n    detect: function(array, callback) {\n      var args, i;\n      args = Array.prototype.slice.apply(arguments);\n      callback = args.pop();\n      array = args.pop() || this;\n      i = 0;\n      while (i < array.length) {\n        if (callback(array[i])) {\n          return array[i];\n        }\n        i++;\n      }\n    },\n    select: function(array, callback) {\n      var args, i, result;\n      args = Array.prototype.slice.apply(arguments);\n      callback = args.pop();\n      array = args.pop() || this;\n      result = [];\n      i = 0;\n      while (i < array.length) {\n        if (callback(array[i])) {\n          result.push(array[i]);\n        }\n        i++;\n      }\n      return result;\n    },\n    slice: function(object, key) {\n      var keys, result;\n      keys = Array.prototype.slice.apply(arguments);\n      object = (typeof keys[0] === 'object' ? keys.shift() : this);\n      result = {};\n      for (key in object) {\n        if (keys.indexOf(key) > -1) {\n          result[key] = object[key];\n        }\n      }\n      return result;\n    },\n    only: function(object) {\n      var key, keys, result;\n      keys = Array.prototype.slice.apply(arguments);\n      object = (typeof keys[0] === 'object' ? keys.shift() : this);\n      result = {};\n      for (key in object) {\n        if (keys.indexOf(key) !== -1) {\n          result[key] = object[key];\n        }\n      }\n      return result;\n    },\n    except: function(object) {\n      var key, keys, result;\n      keys = Array.prototype.slice.apply(arguments);\n      object = (typeof keys[0] === 'object' ? keys.shift() : this);\n      result = {};\n      for (key in object) {\n        if (keys.indexOf(key) === -1) {\n          result[key] = object[key];\n        }\n      }\n      return result;\n    },\n    intersect: function(array, other) {\n      return array.filter(function(element) {\n        return other.indexOf(element) !== -1;\n      });\n    },\n    map: function(elems, callback, arg) {\n      var i, isArray, key, length, ret, value;\n      value = void 0;\n      key = void 0;\n      ret = [];\n      i = 0;\n      length = elems.length;\n      isArray = elems instanceof jQuery || length !== void 0 && typeof length === 'number' && (length > 0 && elems[0] && elems[length - 1]) || length === 0 || jQuery.isArray(elems);\n      if (isArray) {\n        while (i < length) {\n          value = callback(elems[i], i, arg);\n          if (value != null) {\n            ret[ret.length] = value;\n          }\n          i++;\n        }\n      } else {\n        for (key in elems) {\n          value = callback(elems[key], key, arg);\n          if (value != null) {\n            ret[ret.length] = value;\n          }\n        }\n      }\n      return ret.concat.apply([], ret);\n    },\n    shuffle: function(array) {\n      var current, tmp, top;\n      array = array.slice();\n      top = array.length;\n      while (top && --top) {\n        current = Math.floor(Math.random() * (top + 1));\n        tmp = array[current];\n        array[current] = array[top];\n        array[top] = tmp;\n      }\n      return array;\n    },\n    truncate: function(string, length) {\n      if (string.length > length) {\n        return string.trim().substring(0, length) + '...';\n      } else {\n        return string;\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=ext/jquery");minispade.register('travis/ajax', "(function() {(function() {\n\n  jQuery.support.cors = true;\n\n  this.Travis.ajax = Em.Object.create({\n    DEFAULT_OPTIONS: {\n      accepts: {\n        json: 'application/vnd.travis-ci.2+json'\n      }\n    },\n    get: function(url, callback) {\n      return this.ajax(url, 'get', {\n        success: callback\n      });\n    },\n    post: function(url, data, callback) {\n      return this.ajax(url, 'post', {\n        data: data,\n        success: callback\n      });\n    },\n    ajax: function(url, method, options) {\n      var endpoint, success, token, _base,\n        _this = this;\n      endpoint = Travis.config.api_endpoint || '';\n      options = options || {};\n      if (token = sessionStorage.getItem('travis.token')) {\n        options.headers || (options.headers = {});\n        (_base = options.headers)['Authorization'] || (_base['Authorization'] = \"token \" + token);\n      }\n      options.url = \"\" + endpoint + url;\n      options.type = method;\n      options.dataType = 'json';\n      options.contentType = 'application/json; charset=utf-8';\n      options.context = this;\n      if (options.data && method !== 'GET' && method !== 'get') {\n        options.data = JSON.stringify(options.data);\n      }\n      success = options.success || (function() {});\n      options.success = function(data) {\n        var _ref;\n        if (((_ref = Travis.app) != null ? _ref.router : void 0) && data.flash) {\n          Travis.app.router.flashController.loadFlashes(data.flash);\n        }\n        delete data.flash;\n        return success.call(_this, data);\n      };\n      options.error = function(data) {\n        if (data.flash) {\n          return Travis.app.router.flashController.pushObject(data.flash);\n        }\n      };\n      return $.ajax($.extend(options, Travis.ajax.DEFAULT_OPTIONS));\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/ajax");minispade.register('travis/expandable_record_array', "(function() {(function() {\n\n  Travis.ExpandableRecordArray = DS.RecordArray.extend({\n    isLoaded: false,\n    isLoading: false,\n    load: function(array) {\n      var observer, self;\n      this.set('isLoading', true);\n      self = this;\n      observer = function() {\n        var content;\n        if (this.get('isLoaded')) {\n          content = self.get('content');\n          array.removeObserver('isLoaded', observer);\n          array.forEach(function(record) {\n            return self.pushObject(record);\n          });\n          self.set('isLoading', false);\n          return self.set('isLoaded', true);\n        }\n      };\n      return array.addObserver('isLoaded', observer);\n    },\n    pushObject: function(record) {\n      var clientId, id, ids;\n      ids = this.get('content');\n      id = record.get('id');\n      clientId = record.get('clientId');\n      if (ids.contains(clientId)) {\n        return;\n      }\n      return ids.pushObject(clientId);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/expandable_record_array");minispade.register('travis/limited_array', "(function() {(function() {\n\n  Travis.LimitedArray = Em.ArrayProxy.extend({\n    limit: 10,\n    init: function() {\n      return this._super.apply(this, arguments);\n    },\n    arrangedContent: (function() {\n      var content;\n      if (content = this.get('content')) {\n        return content.slice(0, this.get('limit'));\n      }\n    }).property('content'),\n    contentArrayDidChange: function(array, index, removedCount, addedCount) {\n      var addedObjects, arrangedContent, length, limit, object, _i, _len;\n      this._super.apply(this, arguments);\n      if (addedCount > 0) {\n        addedObjects = array.slice(index, index + addedCount);\n        arrangedContent = this.get('arrangedContent');\n        for (_i = 0, _len = addedObjects.length; _i < _len; _i++) {\n          object = addedObjects[_i];\n          arrangedContent.unshiftObject(object);\n        }\n        limit = this.get('limit');\n        length = arrangedContent.get('length');\n        if (length > limit) {\n          return arrangedContent.replace(limit, length - limit);\n        }\n      }\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/limited_array");minispade.register('travis/location', "(function() {(function() {\n\n  Travis.Location = Ember.HistoryLocation.extend({\n    onUpdateURL: function(callback) {\n      var guid;\n      guid = Ember.guidFor(this);\n      return Ember.$(window).bind('popstate.ember-location-' + guid, function(e) {\n        return callback(location.pathname + location.hash);\n      });\n    },\n    getURL: function() {\n      var location;\n      location = this.get('location');\n      return location.pathname + location.hash;\n    },\n    initState: function() {\n      this.replaceState(this.getURL());\n      return Ember.set(this, 'history', window.history);\n    }\n  });\n\n  Ember.Location.implementations['travis'] = Travis.Location;\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/location");minispade.register('travis/log', "(function() {(function() {\n\n  this.Travis.Log = {\n    FOLDS: {\n      schema: /(<p.*?\\/a>\\$ (?:bundle exec )?rake( db:create)? db:schema:load[\\s\\S]*?<p.*?\\/a>-- assume_migrated_upto_version[\\s\\S]*?<\\/p>\\n<p.*?\\/a>.*<\\/p>)/g,\n      migrate: /(<p.*?\\/a>\\$ (?:bundle exec )?rake( db:create)? db:migrate[\\s\\S]*== +\\w+: migrated \\(.*\\) =+)/g,\n      bundle: /(<p.*?\\/a>\\$ bundle install.*<\\/p>\\n(<p.*?\\/a>(Updating|Using|Installing|Fetching|remote:|Receiving|Resolving).*?<\\/p>\\n|<p.*?\\/a><\\/p>\\n)*)/g,\n      exec: /(<p.*?\\/a>[\\/\\w]*.rvm\\/rubies\\/[\\S]*?\\/(ruby|rbx|jruby) .*?<\\/p>)/g\n    },\n    filter: function(log, path) {\n      log = this.escape(log);\n      log = this.deansi(log);\n      log = log.replace(/\\r/g, '');\n      log = this.number(log, path);\n      log = this.fold(log);\n      log = log.replace(/\\n/g, '');\n      return log;\n    },\n    stripPaths: function(log) {\n      return log.replace(/\\/home\\/vagrant\\/builds(\\/[^\\/\\n]+){2}\\//g, '');\n    },\n    escape: function(log) {\n      return Handlebars.Utils.escapeExpression(log);\n    },\n    escapeRuby: function(log) {\n      return log.replace(/#<(\\w+.*?)>/, '#&lt;$1&gt;');\n    },\n    number: function(log, path) {\n      var result;\n      path = \"\" + path + \"/\";\n      result = '';\n      $.each(log.trim().split('\\n'), function(ix, line) {\n        var number, pathWithNumber;\n        number = ix + 1;\n        pathWithNumber = \"\" + path + \"#L\" + number;\n        return result += '<p><a href=\"%@\" id=\"L%@\" class=\"log-line-number\" name=\"L%@\">%@</a>%@</p>\\n'.fmt(pathWithNumber, number, number, number, line);\n      });\n      return result.trim();\n    },\n    deansi: function(log) {\n      var ansi, text;\n      log = log.replace(/\\r\\r/g, '\\r').replace(/\\033\\[K\\r/g, '\\r').replace(/^.*\\r(?!$)/gm, '').replace(/\u001b\\[2K/g, '').replace(/\\033\\(B/g, \"\");\n      ansi = ansiparse(log);\n      text = '';\n      ansi.forEach(function(part) {\n        var classes;\n        classes = [];\n        part.foreground && classes.push(part.foreground);\n        part.background && classes.push('bg-' + part.background);\n        part.bold && classes.push('bold');\n        part.italic && classes.push('italic');\n        return text += (classes.length ? '<span class=\\'' + classes.join(' ') + '\\'>' + part.text + '</span>' : part.text);\n      });\n      return text.replace(/\\033/g, '');\n    },\n    fold: function(log) {\n      log = this.unfold(log);\n      $.each(Travis.Log.FOLDS, function(name, pattern) {\n        return log = log.replace(pattern, function() {\n          return '<div class=\\'fold ' + name + '\\'>' + arguments[1].trim() + '</div>';\n        });\n      });\n      return log;\n    },\n    unfold: function(log) {\n      return log.replace(/<div class='fold[^']*'>([\\s\\S]*?)<\\/div>/g, '$1\\n');\n    },\n    location: function() {\n      return window.location.hash;\n    }\n  };\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/log");minispade.register('travis/model', "(function() {(function() {\n\n  this.Travis.Model = DS.Model.extend({\n    primaryKey: 'id',\n    init: function() {\n      this.loadedAttributes = [];\n      return this._super.apply(this, arguments);\n    },\n    get: function(name) {\n      if (this.constructor.isAttribute(name) && this.get('incomplete') && !this.isAttributeLoaded(name)) {\n        this.loadTheRest();\n      }\n      return this._super.apply(this, arguments);\n    },\n    refresh: function() {\n      var id, store;\n      if (id = this.get('id')) {\n        store = this.get('store');\n        return store.adapter.find(store, this.constructor, id);\n      }\n    },\n    update: function(attrs) {\n      var _this = this;\n      $.each(attrs, function(key, value) {\n        if (key !== 'id') {\n          return _this.set(key, value);\n        }\n      });\n      return this;\n    },\n    isAttributeLoaded: function(name) {\n      var meta;\n      if (meta = Ember.get(this.constructor, 'attributes').get(name)) {\n        name = DS.RESTSerializer._keyForAttributeName(this.constructor, name);\n        return this.get('store').isDataLoadedFor(this.constructor, this.get('clientId'), name);\n      }\n    },\n    isComplete: (function() {\n      if (this.get('incomplete')) {\n        this.loadTheRest();\n        return false;\n      } else {\n        this.set('isCompleting', false);\n        return this.get('isLoaded');\n      }\n    }).property('incomplete', 'isLoaded'),\n    loadTheRest: function() {\n      if (this.get('isCompleting')) {\n        return;\n      }\n      this.set('isCompleting', true);\n      return this.refresh();\n    },\n    select: function() {\n      return this.constructor.select(this.get('id'));\n    },\n    loadedAsIncomplete: function() {\n      return this.set('incomplete', true);\n    }\n  });\n\n  this.Travis.Model.reopenClass({\n    find: function() {\n      if (arguments.length === 0) {\n        return Travis.app.store.findAll(this);\n      } else {\n        return this._super.apply(this, arguments);\n      }\n    },\n    filter: function(callback) {\n      return Travis.app.store.filter(this, callback);\n    },\n    load: function(attrs) {\n      return Travis.app.store.load(this, attrs);\n    },\n    select: function(id) {\n      return this.find().forEach(function(record) {\n        return record.set('selected', record.get('id') === id);\n      });\n    },\n    buildURL: function(suffix) {\n      var base, url;\n      base = this.url || this.pluralName();\n      Ember.assert('Base URL (' + base + ') must not start with slash', !base || base.toString().charAt(0) !== '/');\n      Ember.assert('URL suffix (' + suffix + ') must not start with slash', !suffix || suffix.toString().charAt(0) !== '/');\n      url = [base];\n      if (suffix !== void 0) {\n        url.push(suffix);\n      }\n      return url.join('/');\n    },\n    singularName: function() {\n      var name, parts;\n      parts = this.toString().split('.');\n      name = parts[parts.length - 1];\n      return name.replace(/([A-Z])/g, '_$1').toLowerCase().slice(1);\n    },\n    pluralName: function() {\n      return Travis.app.store.adapter.pluralize(this.singularName());\n    },\n    isAttribute: function(name) {\n      return Ember.get(this, 'attributes').has(name);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/model");minispade.register('travis/ticker', "(function() {(function() {\n\n  this.Travis.Ticker = Ember.Object.extend({\n    init: function() {\n      if (this.get('interval') !== -1) {\n        return this.schedule();\n      }\n    },\n    tick: function() {\n      var context, target, targets, _i, _len;\n      context = this.get('context');\n      targets = this.get('targets') || [this.get('target')];\n      for (_i = 0, _len = targets.length; _i < _len; _i++) {\n        target = targets[_i];\n        if (context) {\n          target = context.get(target);\n        }\n        if (target) {\n          target.tick();\n        }\n      }\n      return this.schedule();\n    },\n    schedule: function() {\n      var _this = this;\n      return Ember.run.later((function() {\n        return _this.tick();\n      }), this.get('interval') || Travis.app.TICK_INTERVAL);\n    }\n  });\n\n}).call(this);\n\n})();\n//@ sourceURL=travis/ticker");minispade.register('travis', "(function() {(function() {\nminispade.require('ext/jquery');\nminispade.require('ext/ember/namespace');\n\n  this.Travis = Em.Namespace.create({\n    config: {\n      api_endpoint: $('meta[rel=\"travis.api_endpoint\"]').attr('href'),\n      pusher_key: $('meta[name=\"travis.pusher_key\"]').attr('value')\n    },\n    CONFIG_KEYS: ['rvm', 'gemfile', 'env', 'jdk', 'otp_release', 'php', 'node_js', 'perl', 'python', 'scala'],\n    ROUTES: {\n      'profile/:login/me': ['profile', 'user'],\n      'profile/:login': ['profile', 'hooks'],\n      'profile': ['profile', 'hooks'],\n      'stats': ['stats', 'show'],\n      ':owner/:name/jobs/:id/:line': ['home', 'job'],\n      ':owner/:name/jobs/:id': ['home', 'job'],\n      ':owner/:name/builds/:id': ['home', 'build'],\n      ':owner/:name/builds': ['home', 'builds'],\n      ':owner/:name/pull_requests': ['home', 'pullRequests'],\n      ':owner/:name/branches': ['home', 'branches'],\n      ':owner/:name': ['home', 'current'],\n      '': ['home', 'index'],\n      '#': ['home', 'index']\n    },\n    QUEUES: [\n      {\n        name: 'common',\n        display: 'Common'\n      }, {\n        name: 'php',\n        display: 'PHP, Perl and Python'\n      }, {\n        name: 'node_js',\n        display: 'Node.js'\n      }, {\n        name: 'jvmotp',\n        display: 'JVM and Erlang'\n      }, {\n        name: 'rails',\n        display: 'Rails'\n      }, {\n        name: 'spree',\n        display: 'Spree'\n      }\n    ],\n    INTERVALS: {\n      sponsors: -1,\n      times: -1,\n      updateTimes: 1000\n    },\n    setLocale: function(locale) {\n      if (!locale) {\n        return;\n      }\n      I18n.locale = locale;\n      return localStorage.setItem('travis.locale', locale);\n    },\n    needsLocaleChange: function(locale) {\n      return I18n.locale !== locale;\n    },\n    run: function(attrs) {\n      if (location.hash.slice(0, 2) === '#!') {\n        location.href = location.href.replace('#!/', '');\n      }\n      this.setLocale(localStorage.getItem('travis.locale') || 'en');\n      return Ember.run.next(this, function() {\n        var app,\n          _this = this;\n        app = Travis.App.create(attrs || {});\n        $.each(Travis, function(key, value) {\n          if (value && value.isClass && key !== 'constructor') {\n            return app[key] = value;\n          }\n        });\n        this.app = app;\n        this.store = app.store;\n        return $(function() {\n          return app.initialize();\n        });\n      });\n    }\n  });\nminispade.require('travis/ajax');\nminispade.require('app');\n\n}).call(this);\n\n})();\n//@ sourceURL=travis");minispade.register('templates', "(function() {\nEmber.TEMPLATES['auth/signin'] = Ember.Handlebars.compile(\"{{#if view.signingIn}}\\n  <h1>Signing in ...</h1>\\n  <p>\\n    Trying to authenticate with GitHub.\\n  </p>\\n{{else}}\\n  <h1>Sign in</h1>\\n  <p>\\n    <a href=\\\"#\\\" {{action signIn target=\\\"Travis.app\\\"}}>Please sign in with GitHub.</a>\\n  </p>\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['builds/list'] = Ember.Handlebars.compile(\"{{#if builds.isLoaded}}\\n  <table id=\\\"builds\\\" class=\\\"list\\\">\\n    <thead>\\n      <tr>\\n        <th>{{t builds.name}}</th>\\n        <th>{{t builds.commit}}</th>\\n        <th>{{t builds.message}}</th>\\n        <th>{{t builds.duration}}</th>\\n        <th>{{t builds.finished_at}}</th>\\n      </tr>\\n    </thead>\\n\\n    <tbody>\\n      {{#each build in builds}}\\n        {{#view Travis.BuildsItemView contextBinding=\\\"build\\\"}}\\n          <td class=\\\"number\\\">\\n            <span class=\\\"status\\\"></span>\\n            {{#if id}}\\n              <a {{action showBuild repo this href=true}}>\\n                {{number}}\\n              </a>\\n            {{/if}}\\n          </td>\\n          <td class=\\\"commit\\\">\\n            <a {{bindAttr href=\\\"view.urlGithubCommit\\\"}}>\\n              {{formatCommit commit}}\\n            </a>\\n          </td>\\n          <td class=\\\"message\\\">\\n            {{{formatMessage commit.message short=\\\"true\\\"}}}\\n          </td>\\n          <td class=\\\"duration\\\" {{bindAttr title=\\\"duration\\\"}}>\\n            {{formatDuration duration}}\\n          </td>\\n          <td class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>\\n            {{formatTime finishedAt}}\\n          </td>\\n        {{/view}}\\n      {{/each}}\\n    </tbody>\\n  </table>\\n  <p>\\n    {{view view.ShowMoreButton}}\\n  </p>\\n{{else}}\\n  <div class=\\\"loading\\\"><span>Loading</span></div>\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['builds/show'] = Ember.Handlebars.compile(\"{{#with view}}\\n  {{#if loading}}\\n    <span>Loading</span>\\n  {{else}}\\n    <dl id=\\\"summary\\\">\\n      <div class=\\\"left\\\">\\n        <dt>{{t builds.name}}</dt>\\n        <dd class=\\\"number\\\">\\n          <span class=\\\"status\\\"></span>\\n          {{#if build.id}}\\n            <a {{action showBuild repo build href=true}}>{{build.number}}</a>\\n          {{/if}}\\n        </dd>\\n        <dt class=\\\"finished_at_label\\\">{{t builds.finished_at}}</dt>\\n        <dd class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>{{formatTime build.finishedAt}}</dd>\\n        <dt>{{t builds.duration}}</dt>\\n        <dd class=\\\"duration\\\" {{bindAttr title=\\\"startedAt\\\"}}>{{formatDuration build.duration}}</dd>\\n      </div>\\n\\n      <div class=\\\"right\\\">\\n        <dt>{{t builds.commit}}</dt>\\n        <dd class=\\\"commit\\\"><a href=\\\"{{unbound urlGithubCommit}}\\\">{{formatCommit build.commit}}</a></dd>\\n        {{#if commit.compareUrl}}\\n          <dt>{{t builds.compare}}</dt>\\n          <dd class=\\\"compare\\\"><a href=\\\"{{unbound commit.compareUrl}}\\\">{{pathFrom build.commit.compareUrl}}</a></dd>\\n        {{/if}}\\n        {{#if commit.authorName}}\\n          <dt>{{t builds.author}}</dt>\\n          <dd class=\\\"author\\\"><a href=\\\"{{unbound urlAuthor}}\\\">{{build.commit.authorName}}</a></dd>\\n        {{/if}}\\n        {{#if commit.committerName}}\\n          <dt>{{t builds.committer}}</dt>\\n          <dd class=\\\"committer\\\"><a href=\\\"{{unbound urlCommitter}}\\\">{{build.commit.committerName}}</a></dd>\\n        {{/if}}\\n      </div>\\n\\n      <dt>{{t builds.message}}</dt>\\n      <dd class=\\\"message\\\">{{{formatMessage build.commit.message}}}</dd>\\n\\n      {{#unless isMatrix}}\\n        <dt>{{t builds.config}}</dt>\\n        <dd class=\\\"config\\\">{{formatConfig build.config}}</dd>\\n      {{/unless}}\\n    </dl>\\n\\n    {{#if build.isMatrix}}\\n      {{view Travis.JobsView jobsBinding=\\\"build.requiredJobs\\\" required=\\\"true\\\"}}\\n      {{view Travis.JobsView jobsBinding=\\\"build.allowedFailureJobs\\\"}}\\n    {{else}}\\n      {{view Travis.LogView contextBinding=\\\"build.jobs.firstObject\\\"}}\\n    {{/if}}\\n  {{/if}}\\n{{/with}}\\n\");\n\nEmber.TEMPLATES['events/list'] = Ember.Handlebars.compile(\"{{#if view.events.isLoaded}}\\n  <table id=\\\"events\\\" class=\\\"list\\\">\\n    <thead>\\n      <tr>\\n        <th>Time</th>\\n        <th>Event</th>\\n        <th>Result</th>\\n        <th>Message</th>\\n      </tr>\\n    </thead>\\n\\n    <tbody>\\n      {{#each event in view.events}}\\n        {{#view Travis.EventsItemView contextBinding=\\\"event\\\"}}\\n          <td class=\\\"created_at\\\">\\n            {{formatTime createdAt}}\\n          </td>\\n          <td class=\\\"event\\\">\\n            {{event.event_}}\\n          </td>\\n          <td class=\\\"result\\\">\\n            {{event.result}}\\n          </td>\\n          <td class=\\\"message\\\">\\n            {{event.message}}\\n          </td>\\n        {{/view}}\\n      {{/each}}\\n    </tbody>\\n  </table>\\n{{else}}\\n  <div class=\\\"loading\\\"><span>Loading</span></div>\\n{{/if}}\\n\\n\");\n\nEmber.TEMPLATES['jobs/list'] = Ember.Handlebars.compile(\"{{#if view.jobs.length}}\\n  {{#if view.required}}\\n    <table id=\\\"jobs\\\" class=\\\"list\\\">\\n      <caption>\\n        {{t jobs.build_matrix}}\\n      </caption>\\n  {{else}}\\n    <table id=\\\"allowed_failure_jobs\\\" class=\\\"list\\\">\\n      <caption>\\n        {{t jobs.allowed_failures}}\\n        <a title=\\\"What's this?\\\" class=\\\"help open-popup\\\" name=\\\"help-allowed_failures\\\" {{action popup target=\\\"view\\\"}}></a>\\n      </caption>\\n  {{/if}}\\n    <thead>\\n      <tr>\\n        {{#each key in view.build.configKeys}}\\n          <th>{{key}}</th>\\n        {{/each}}\\n      </tr>\\n    </thead>\\n    <tbody>\\n      {{#each job in view.jobs}}\\n        {{#view Travis.JobsItemView contextBinding=\\\"job\\\"}}\\n          <td class=\\\"number\\\">\\n            <span class=\\\"status\\\"></span>\\n            {{#if job.id}}\\n              <a {{action showJob repo job href=true}}>{{number}}</a>\\n            {{/if}}\\n          </td>\\n          <td class=\\\"duration\\\" {{bindAttr title=\\\"startedAt\\\"}}>\\n            {{formatDuration duration}}\\n          </td>\\n          <td class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>\\n            {{formatTime finishedAt}}\\n          </td>\\n          {{#each value in configValues}}\\n            <td>{{value}}</td>\\n          {{/each}}\\n        {{/view}}\\n      {{/each}}\\n    </tbody>\\n  </table>\\n\\n  {{#unless view.required}}\\n    <div id=\\\"help-allowed_failures\\\" class=\\\"popup\\\">\\n      <a href=\\\"#\\\" class=\\\"close\\\" {{action popupClose target=\\\"view\\\"}}></a>\\n      <h4>{{t \\\"jobs.allowed_failures\\\"}}</h4>\\n      <p>\\n        Allowed Failures are items in your build matrix that are allowed to\\n        fail without causing the entire build to be shown as failed.\\n      </p>\\n      <p>\\n        You can define allowed failures in the build matrix as follows:\\n      </p>\\n      <pre>matrix:\\n  allow_failures:\\n    - rvm: ruby-head</pre>\\n      <p>\\n        This lets you add in experimental and preparatory builds to test against versions or\\n        configurations that you are not ready to officially support.\\n      </p>\\n    </div>\\n  {{/unless}}\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['jobs/log'] = Ember.Handlebars.compile(\"{{view.logSubscriber}}\\n\\n{{#if view.job.log.isLoaded}}\\n  <pre id=\\\"log\\\" class=\\\"ansi\\\"><a href=\\\"#\\\" id=\\\"tail\\\" {{action toggleTailing target=\\\"view\\\"}}>\\n    <span class=\\\"status\\\"></span>\\n    <label>Follow logs</label>\\n  </a>{{{formatLog log.body repo=\\\"repository\\\" item=\\\"parentView.currentItem\\\"}}}</pre>\\n\\n  {{#if sponsor.name}}\\n    <p class=\\\"sponsor\\\">\\n    {{t builds.messages.sponsored_by}}\\n      <a {{bindAttr href=\\\"sponsor.url\\\"}}>{{sponsor.name}}</a>\\n    </p>\\n  {{/if}}\\n\\n  <a href='#' class=\\\"to-top\\\" {{action toTop target=\\\"view\\\"}}>To top</a>\\n{{else}}\\n  <div id=\\\"log\\\" class=\\\"loading\\\">\\n    <span>Loading</span>\\n  </div>\\n{{/if}}\\n\");\n\nEmber.TEMPLATES['jobs/show'] = Ember.Handlebars.compile(\"{{#with view}}\\n  {{#if job.isComplete}}\\n    <div {{bindAttr class=\\\"view.color\\\"}}>\\n      <dl id=\\\"summary\\\">\\n        <div class=\\\"left\\\">\\n          <dt>Job</dt>\\n          <dd class=\\\"number\\\">\\n            <span class=\\\"status\\\"></span>\\n            {{#if job.id}}\\n              <a {{action showJob repo job href=true}}>{{job.number}}</a>\\n            {{/if}}\\n          </dd>\\n          <dt class=\\\"finished_at_label\\\">{{t jobs.finished_at}}</dt>\\n          <dd class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"finishedAt\\\"}}>{{formatTime job.finishedAt}}</dd>\\n          <dt>{{t jobs.duration}}</dt>\\n          <dd class=\\\"duration\\\" {{bindAttr title=\\\"startedAt\\\"}}>{{formatDuration job.duration}}</dd>\\n        </div>\\n\\n        <div class=\\\"right\\\">\\n          <dt>{{t jobs.commit}}</dt>\\n          <dd class=\\\"commit\\\"><a {{bindAttr href=\\\"urlGithubCommit\\\"}}>{{formatCommit commit}}</a></dd>\\n          {{#if commit.compareUrl}}\\n            <dt>{{t jobs.compare}}</dt>\\n            <dd class=\\\"compare\\\"><a {{bindAttr href=\\\"commit.compareUrl\\\"}}>{{pathFrom commit.compareUrl}}</a></dd>\\n          {{/if}}\\n          {{#if commit.authorName}}\\n            <dt>{{t jobs.author}}</dt>\\n            <dd class=\\\"author\\\"><a {{bindAttr href=\\\"urlAuthor\\\"}}>{{commit.authorName}}</a></dd>\\n          {{/if}}\\n          {{#if commit.committerName}}\\n            <dt>{{t jobs.committer}}</dt>\\n            <dd class=\\\"committer\\\"><a {{bindAttr href=\\\"urlCommitter\\\"}}>{{commit.committerName}}</a></dd>\\n          {{/if}}\\n        </div>\\n\\n        <dt>{{t jobs.message}}</dt>\\n        <dd class=\\\"message\\\">{{formatMessage commit.message}}</dd>\\n        <dt>{{t jobs.config}}</dt>\\n        <dd class=\\\"config\\\">{{formatConfig job.config}}</dd>\\n      </dl>\\n\\n      {{view Travis.LogView contextBinding=\\\"job\\\"}}}\\n    </div>\\n  {{else}}\\n    <div id=\\\"job\\\" class=\\\"loading\\\">\\n      <span>Loading</span>\\n    </div>\\n  {{/if}}\\n{{/with}}\\n\");\n\nEmber.TEMPLATES['layouts/flash'] = Ember.Handlebars.compile(\"{{#each flash in controller}}\\n  {{#view Travis.FlashItemView flashBinding=\\\"flash\\\"}}\\n    <p>{{{flash.message}}}</p>\\n    <a class=\\\"close\\\" {{action close target=\\\"view\\\"}}></a>\\n  {{/view}}\\n{{/each}}\\n\");\n\nEmber.TEMPLATES['layouts/home'] = Ember.Handlebars.compile(\"<div id=\\\"top\\\">\\n  {{outlet top}}\\n</div>\\n\\n<div id=\\\"left\\\">\\n  {{outlet left}}\\n</div>\\n\\n<div id=\\\"main\\\">\\n  {{outlet flash}}\\n  {{outlet main}}\\n</div>\\n\\n<div id=\\\"right\\\">\\n  {{outlet right}}\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/profile'] = Ember.Handlebars.compile(\"<div id=\\\"top\\\">\\n  {{outlet top}}\\n</div>\\n\\n<div id=\\\"left\\\">\\n  {{outlet left}}\\n</div>\\n\\n<div id=\\\"main\\\">\\n  {{outlet flash}}\\n  {{outlet main}}\\n</div>\\n\\n<div id=\\\"right\\\">\\n  <div id=\\\"github-wrapper\\\">\\n    <a id=\\\"github\\\" href=\\\"https://github.com/travis-ci\\\" title=\\\"Fork me on GitHub\\\">\\n      {{t layouts.application.fork_me}}\\n    </a>\\n  </div>\\n\\n  <div id=\\\"slider\\\" {{action toggle target=\\\"Travis.app.slider\\\"}}>\\n    <div class='icon'></div>&nbsp;\\n  </div>\\n\\n  <div class=\\\"box\\\">\\n    <h4>Getting started?</h4>\\n    <p>\\n      Please read our <a href=\\\"http://about.travis-ci.org/docs/user/getting-started\\\">guide</a>.\\n      It will only take a few minutes :)\\n    </p>\\n    <p>\\n      You can find detailled docs on our <a href=\\\"http://about.travis-ci.org/\\\">about</a> site.\\n    </p>\\n    <p>\\n      If you need help please don&rsquo;t hesitate to join\\n      <a href=\\\"irc://irc.freenode.net#travis\\\">#travis</a> on irc.freenode.net\\n      or our <a href=\\\"http://groups.google.com/group/travis-ci\\\">mailinglist</a>.\\n    </p>\\n  </div>\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/sidebar'] = Ember.Handlebars.compile(\"<div id=\\\"github-wrapper\\\">\\n  <a id=\\\"github\\\" href=\\\"https://github.com/travis-ci\\\" title=\\\"Fork me on GitHub\\\">\\n    {{t layouts.application.fork_me}}\\n  </a>\\n</div>\\n\\n<div id=\\\"slider\\\" {{action toggle target=\\\"Travis.app.slider\\\"}}>\\n  <div class='icon'></div>&nbsp;\\n</div>\\n\\n{{view view.DecksView}}\\n{{view view.WorkersView}}\\n{{view view.QueuesView}}\\n{{view view.LinksView}}\\n\\n<div id=\\\"about\\\" class=\\\"box\\\">\\n  <h4>{{t layouts.about.join}}</h4>\\n  <ul>\\n    <li>{{t layouts.about.repository}}: <a href=\\\"http://github.com/travis-ci\\\">Github</a></li>\\n    <li>{{t layouts.about.twitter}}: <a href=\\\"http://twitter.com/travisci\\\">@travisci</a></li>\\n    <li>{{t layouts.about.mailing_list}}: <a href=\\\"http://groups.google.com/group/travis-ci\\\">travis-ci</a></li>\\n    <li><a href=\\\"irc://irc.freenode.net#travis\\\">irc.freenode.net#travis</a></li>\\n  </ul>\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/simple'] = Ember.Handlebars.compile(\"<div id=\\\"top\\\">\\n  {{outlet top}}\\n</div>\\n\\n<div id=\\\"main\\\">\\n  {{outlet flash}}\\n  {{outlet main}}\\n</div>\\n\");\n\nEmber.TEMPLATES['layouts/top'] = Ember.Handlebars.compile(\"<a {{action showRoot href=true}}>\\n  <h1>Travis</h1>\\n</a>\\n\\n<ul id=\\\"navigation\\\">\\n  <li class=\\\"home\\\">\\n    <a {{action showRoot href=true}}>Home</a>\\n  </li>\\n  <li class=\\\"stats\\\">\\n    <a {{action showStats href=true}}>Stats</a>\\n  </li>\\n  <li>\\n    <a href=\\\"http://about.travis-ci.org/blog\\\">Blog</a>\\n  </li>\\n  <li>\\n    <a href=\\\"http://about.travis-ci.org/docs\\\">Docs</a>\\n  </li>\\n  <li {{bindAttr class=\\\"view.classProfile\\\"}}>\\n    <p class=\\\"handle\\\">\\n      <a class=\\\"signed-out\\\" href=\\\"#\\\" {{action signIn target=\\\"Travis.app\\\"}}>{{t layouts.top.github_login}}</a>\\n      <a class=\\\"signed-in\\\" {{action showProfile href=true}}><img {{bindAttr src=\\\"view.gravatarUrl\\\"}}>{{user.name}}</a>\\n      <span class=\\\"signing-in\\\">Signing in</span>\\n    </p>\\n    <ul>\\n      <li>\\n        <a {{action showProfile href=true}}>Accounts</a>\\n      </li>\\n      <li>\\n        <a href=\\\"/\\\" {{action signOut target=\\\"Travis.app\\\"}}>{{t layouts.top.sign_out}}</a>\\n      </li>\\n    </ul>\\n  </li>\\n</ul>\\n\");\n\nEmber.TEMPLATES['profile/accounts'] = Ember.Handlebars.compile(\"<div id=\\\"search_box\\\">\\n</div>\\n\\n<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_accounts\\\" {{bindAttr class=\\\"view.classAccounts\\\"}}>\\n    <h5><a name=\\\"accounts\\\" href=\\\"\\\">Accounts</a></h5>\\n  </li>\\n</ul>\\n\\n<div class=\\\"tab\\\">\\n  {{#collection Travis.AccountsListView contentBinding=\\\"controller\\\"}}\\n    <a {{action showAccount view.account href=true}} class=\\\"name\\\">{{view.name}}</a>\\n    <p class=\\\"summary\\\">\\n      <span class=\\\"repos_label\\\">Repositories:</span>\\n      <abbr class=\\\"repos\\\">{{view.account.reposCount}}</abbr>\\n    </p>\\n    <div class=\\\"indicator\\\"><span></span></div>\\n  {{/collection}}\\n</div>\\n\");\n\nEmber.TEMPLATES['profile/show'] = Ember.Handlebars.compile(\"<h3>{{view.name}}</h3>\\n\\n{{view Travis.ProfileTabsView}}\\n\\n<div class=\\\"tab\\\">\\n  {{outlet pane}}\\n</div>\\n\\n\");\n\nEmber.TEMPLATES['profile/tabs'] = Ember.Handlebars.compile(\"<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_hooks\\\" {{bindAttr class=\\\"view.classHooks\\\"}}>\\n    <h5>\\n      <a {{action showAccount view.account href=true}}>Repositories</a>\\n    </h5>\\n  </li>\\n  {{#if view.displayUser}}\\n    <li id=\\\"tab_user\\\" {{bindAttr class=\\\"view.classUser\\\"}}>\\n      <h5>\\n        <a {{action showUserProfile view.account href=true}}>Profile</a>\\n      </h5>\\n    </li>\\n  {{/if}}\\n</ul>\\n\");\n\nEmber.TEMPLATES['profile/tabs/hooks'] = Ember.Handlebars.compile(\"<p class=\\\"tip\\\">\\n  {{{t profiles.show.message.your_repos}}}\\n</p>\\n\\n{{#if hooks.isLoaded}}\\n  {{#if user.isSyncing}}\\n    <p class=\\\"message loading\\\">\\n      <span>Please wait while we sync from GitHub</span>\\n    </p>\\n  {{else}}\\n    <p class=\\\"message\\\">\\n      Last synchronized from GitHub: {{formatTime user.syncedAt}}\\n      <a class=\\\"sync_now button\\\" {{action sync target=\\\"user\\\"}}>\\n        Sync now\\n      </a>\\n    </p>\\n\\n    <ul id=\\\"hooks\\\">\\n      {{#each hook in hooks}}\\n        <li {{bindAttr class=\\\"hook.active:active\\\"}}>\\n          <a {{bindAttr href=\\\"hook.urlGithub\\\"}} rel=\\\"nofollow\\\">{{hook.slug}}</a>\\n          <p class=\\\"description\\\">{{hook.description}}</p>\\n\\n          <div class=\\\"controls\\\">\\n            <a {{bindAttr href=\\\"hook.urlGithubAdmin\\\"}} class=\\\"github-admin tool-tip\\\" title=\\\"Github service hooks admin page\\\"></a>\\n            <a {{action toggle target=\\\"hook\\\"}} class=\\\"switch\\\">\\n              {{#if hook.active}}\\n                ON\\n              {{else}}\\n                OFF\\n              {{/if}}\\n            </a>\\n          </div>\\n        </li>\\n      {{else}}\\n        <li>\\n          You do not seem to have any repositories that we could sync.\\n        </li>\\n      {{/each}}\\n    </ul>\\n  {{/if}}\\n{{else}}\\n  <p class=\\\"message loading\\\">\\n    <span>Loading</span>\\n  </p>\\n{{/if}}\\n\\n\\n\");\n\nEmber.TEMPLATES['profile/tabs/user'] = Ember.Handlebars.compile(\"<img {{bindAttr src=\\\"view.gravatarUrl\\\"}}>\\n\\n<dl class=\\\"profile\\\">\\n  <dt>\\n    {{t profiles.show.github}}:\\n  </dt>\\n  <dd>\\n    <a {{bindAttr href=\\\"urlGithub\\\"}}>{{user.login}}</a>\\n  </dd>\\n  <dt>\\n    {{t profiles.show.email}}:\\n  </dt>\\n  <dd>\\n    {{user.email}}\\n  </dd>\\n  <dt>\\n    {{t profiles.show.token}}:\\n  </dt>\\n  <dd>\\n    {{user.token}}\\n  </dd>\\n</dl>\\n\\n<form>\\n  {{view Ember.Select id=\\\"locale\\\"\\n     contentBinding=\\\"view.locales\\\"\\n     valueBinding=\\\"Travis.app.currentUser.locale\\\"\\n     optionLabelPath=\\\"content.name\\\"\\n     optionValuePath=\\\"content.key\\\"}}\\n\\n  <button name=\\\"commit\\\" {{action saveLocale target=\\\"view\\\"}}>\\n    {{t profiles.show.update_locale}}\\n  </button>\\n</form>\\n\\n\\n\");\n\nEmber.TEMPLATES['queues/list'] = Ember.Handlebars.compile(\"<ul id=\\\"queues\\\">\\n{{#each queue in controller}}\\n  <li class=\\\"queue\\\">\\n    <h4>{{t queue}}: {{queue.name}}</h4>\\n    <ul {{bindAttr id=\\\"queue.id\\\"}}>\\n      {{#each job in queue}}\\n        {{#view Travis.QueueItemView jobBinding=\\\"job\\\"}}\\n\\n          {{#if job.repo.slug}}\\n            <a {{action showJob job.repo job target=\\\"Travis.app.router\\\" href=true}}>\\n              <span class=\\\"slug\\\">\\n                {{job.repo.slug}}\\n              </span>\\n              #{{job.number}}\\n            </a>\\n          {{/if}}\\n        {{/view}}\\n      {{else}}\\n        {{t no_job}}\\n      {{/each}}\\n    </ul>\\n  </li>\\n{{/each}}\\n</ul>\\n\");\n\nEmber.TEMPLATES['repos/list'] = Ember.Handlebars.compile(\"<div id=\\\"search_box\\\">\\n  {{view Ember.TextField valueBinding=\\\"controller.search\\\"}}\\n</div>\\n\\n{{view Travis.ReposListTabsView}}\\n\\n<a {{action toggleInfo target=\\\"view\\\"}} class=\\\"toggle-info\\\"></a>\\n\\n<div class=\\\"tab\\\">\\n  {{#collection Travis.ReposListView contentBinding=\\\"controller\\\"}}\\n    {{#with view.repo}}\\n      <div class=\\\"slug-and-status\\\">\\n        <span class=\\\"status\\\"></span>\\n        {{#if slug}}\\n          <a {{action showRepo this href=true}} class=\\\"slug\\\">{{slug}}</a>\\n        {{/if}}\\n      </div>\\n      {{#if lastBuildId}}\\n        <a {{action showBuild this lastBuildId href=true}} class=\\\"last_build\\\">{{lastBuildNumber}}</a>\\n      {{/if}}\\n\\n      <p class=\\\"summary\\\">\\n        <span class=\\\"duration_label\\\">{{t repositories.duration}}:</span>\\n        <abbr class=\\\"duration\\\" {{bindAttr title=\\\"lastBuildStartedAt\\\"}}>{{formatDuration lastBuildDuration}}</abbr>,\\n        <span class=\\\"finished_at_label\\\">{{t repositories.finished_at}}:</span>\\n        <abbr class=\\\"finished_at timeago\\\" {{bindAttr title=\\\"lastBuildFinishedAt\\\"}}>{{formatTime lastBuildFinishedAt}}</abbr>\\n      </p>\\n\\n      <div class=\\\"indicator\\\"><span></span></div>\\n\\n      {{#if description}}\\n        <div class=\\\"info\\\">\\n          <p class=\\\"description\\\">{{description}}</p>\\n        </div>\\n      {{/if}}\\n    {{/with}}\\n  {{else}}\\n    <p class=\\\"empty\\\"></p>\\n  {{/collection}}\\n</div>\\n\");\n\nEmber.TEMPLATES['repos/list/tabs'] = Ember.Handlebars.compile(\"<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_recent\\\" {{bindAttr class=\\\"view.classRecent\\\"}}>\\n    <h5><a name=\\\"recent\\\" {{action activate target=\\\"view\\\"}}>{{t layouts.application.recent}}</a></h5>\\n  </li>\\n  <li id=\\\"tab_owned\\\" {{bindAttr class=\\\"view.classOwned\\\"}}>\\n    <h5><a name=\\\"owned\\\" {{action activate target=\\\"view\\\"}}>{{t layouts.application.my_repositories}}</a></h5>\\n  </li>\\n  <li id=\\\"tab_search\\\" {{bindAttr class=\\\"view.classSearch\\\"}}>\\n    <h5><a name=\\\"search\\\" {{action activate target=\\\"view\\\"}}>{{t layouts.application.search}}</a></h5>\\n  </li>\\n</ul>\\n\\n\");\n\nEmber.TEMPLATES['repos/show'] = Ember.Handlebars.compile(\"<div id=\\\"repo\\\" {{bindAttr class=\\\"view.class\\\"}}>\\n  {{#if view.isEmpty}}\\n    {{view Travis.ReposEmptyView}}\\n  {{else}}\\n    {{#if view.repo.isComplete}}\\n      {{#with view.repo}}\\n        <h3>\\n          <a {{bindAttr href=\\\"view.urlGithub\\\"}}>{{slug}}</a>\\n        </h3>\\n\\n        <p class=\\\"description\\\">{{description}}</p>\\n\\n        <ul class=\\\"github-stats\\\">\\n          <li class=\\\"language\\\">\\n            {{lastBuildLanguage}}\\n          </li>\\n          <li>\\n            <a class=\\\"watchers\\\" title=\\\"Watchers\\\" {{bindAttr href=\\\"view.urlGithubWatchers\\\"}}>\\n              {{stats.watchers}}\\n            </a>\\n          </li>\\n          <li>\\n            <a class=\\\"forks\\\" title=\\\"Forks\\\" {{bindAttr href=\\\"view.urlGithubNetwork\\\"}}>\\n              {{stats.forks}}\\n            </a>\\n          </li>\\n        </ul>\\n\\n        {{view Travis.RepoShowTabsView}}\\n        {{view Travis.RepoShowToolsView}}\\n      {{/with}}\\n\\n    {{else}}\\n      <span>Loading</span>\\n    {{/if}}\\n\\n    <div class=\\\"tab\\\">\\n      {{outlet pane}}\\n    </div>\\n  {{/if}}\\n</div>\\n\\n\");\n\nEmber.TEMPLATES['repos/show/tabs'] = Ember.Handlebars.compile(\"<ul class=\\\"tabs\\\">\\n  <li id=\\\"tab_current\\\" {{bindAttr class=\\\"view.classCurrent\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showRepo view.repo href=true}}>\\n        {{t repositories.tabs.current}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_builds\\\" {{bindAttr class=\\\"view.classBuilds\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showBuilds view.repo href=true}}>\\n        {{t repositories.tabs.build_history}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_pull_requests\\\" {{bindAttr class=\\\"view.classPullRequests\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showPullRequests view.repo href=true}}>\\n        {{t repositories.tabs.pull_requests}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_branches\\\" {{bindAttr class=\\\"view.classBranches\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showBranches view.repo href=true}}>\\n        {{t repositories.tabs.branches}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_events\\\" {{bindAttr class=\\\"view.classEvents\\\"}}>\\n    <h5>\\n      {{#if view.repo.slug}}\\n      <a {{action showEvents view.repo href=true}}>\\n        Events\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_build\\\" {{bindAttr class=\\\"view.classBuild\\\"}}>\\n    <h5>\\n      {{#if view.build.id}}\\n      <a {{action showBuild view.repo view.build href=true}}>\\n        {{t repositories.tabs.build}} #{{view.build.number}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n  <li id=\\\"tab_job\\\" {{bindAttr class=\\\"view.classJob\\\"}}>\\n    <h5>\\n      {{#if view.job.id}}\\n      <a {{action showJob view.repo view.job href=true}}>\\n        {{t repositories.tabs.job}} #{{view.job.number}}\\n      </a>\\n      {{/if}}\\n    </h5>\\n  </li>\\n</ul>\\n\");\n\nEmber.TEMPLATES['repos/show/tools'] = Ember.Handlebars.compile(\"<div id=\\\"tools\\\">\\n  <a href=\\\"#\\\" {{action menu target=\\\"view\\\"}}></a>\\n  <ul class=\\\"menu\\\">\\n    <li>\\n      <a href=\\\"#\\\" name=\\\"status-images\\\" class=\\\"open-popup\\\" {{action statusImages target=\\\"view\\\"}}>Status Images</a>\\n    </li>\\n    {{#if view.canPush}}\\n      <li>\\n        <a href=\\\"#\\\" {{action requeue target=\\\"view\\\"}}>Rebuild</a>\\n      </li>\\n    {{/if}}\\n  </ul>\\n</div>\\n\\n<div id=\\\"status-images\\\" class=\\\"popup\\\">\\n  <a href=\\\"#\\\" class=\\\"close\\\" {{action popupClose target=\\\"view\\\"}}></a>\\n  <p>\\n    <label>{{t repositories.branch}}:</label>\\n    {{#if view.branches.isLoaded}}\\n      {{view Ember.Select contentBinding=\\\"view.branches\\\" selectionBinding=\\\"view.branch\\\" optionLabelPath=\\\"content.commit.branch\\\" optionValuePath=\\\"content.commit.branch\\\"}}\\n    {{else}}\\n      <span class=\\\"loading\\\"></span>\\n    {{/if}}\\n  </p>\\n  <p>\\n    <label>{{t repositories.image_url}}:</label>\\n    <input type=\\\"text\\\" class=\\\"url\\\" {{bindAttr value=\\\"view.urlStatusImage\\\"}}></input>\\n  </p>\\n  <p>\\n    <label>{{t repositories.markdown}}:</label>\\n    <input type=\\\"text\\\" class=\\\"markdown\\\" {{bindAttr value=\\\"view.markdownStatusImage\\\"}}></input>\\n  </p>\\n  <p>\\n    <label>{{t repositories.textile}}:</label>\\n    <input type=\\\"text\\\" class=\\\"textile\\\" {{bindAttr value=\\\"view.textileStatusImage\\\"}}></input>\\n  </p>\\n  <p>\\n    <label>{{t repositories.rdoc}}:</label>\\n    <input type=\\\"text\\\" class=\\\"rdoc\\\" {{bindAttr value=\\\"view.rdocStatusImage\\\"}}></input>\\n  </p>\\n</div>\\n\");\n\nEmber.TEMPLATES['sponsors/decks'] = Ember.Handlebars.compile(\"<h4>{{t layouts.application.sponsers}}</h4>\\n\\n<ul class=\\\"sponsors top\\\">\\n  {{#each deck in controller}}\\n    {{#each deck}}\\n      <li {{bindAttr class=\\\"type\\\"}}>\\n        <a {{bindAttr href=\\\"url\\\"}}>\\n          <img {{bindAttr src=\\\"image\\\"}}>\\n        </a>\\n      </li>\\n    {{/each}}\\n  {{/each}}\\n</ul>\\n\\n<p class=\\\"hint\\\">\\n  <a href=\\\"https://love.travis-ci.org/sponsors\\\">\\n    {{{t layouts.application.sponsors_link}}}\\n  </a>\\n</p>\\n\");\n\nEmber.TEMPLATES['sponsors/links'] = Ember.Handlebars.compile(\"<div class=\\\"box\\\">\\n  <h4>{{t layouts.application.sponsers}}</h4>\\n\\n  <ul class=\\\"sponsors bottom\\\">\\n    {{#each controller}}\\n      <li>\\n        {{{link}}}\\n      </li>\\n    {{/each}}\\n  </ul>\\n\\n  <p class=\\\"hint\\\">\\n    <a href=\\\"https://love.travis-ci.org/sponsors\\\">\\n      {{{t layouts.application.sponsors_link}}}\\n    </a>\\n  </p>\\n</div>\\n\\n\");\n\nEmber.TEMPLATES['stats/show'] = Ember.Handlebars.compile(\"<h3>Sorry</h3>\\n<p>Statistics are disabled for now.</p>\\n<p> We're looking into a solution. If you want to help, please ping us!</p>\\n\");\n\nEmber.TEMPLATES['workers/list'] = Ember.Handlebars.compile(\"{{#view Travis.WorkersView}}\\n  <h4>\\n    {{t workers}}\\n    <a id=\\\"toggle-workers\\\" {{action toggleWorkers target=\\\"parentView.parentView\\\"}}></a>\\n  </h4>\\n  <ul id=\\\"workers\\\">\\n    {{#each group in controller.groups}}\\n      {{#view Travis.WorkersListView}}\\n        <li class=\\\"group\\\">\\n          <h5 {{action toggle target=\\\"view\\\"}}>\\n            {{group.firstObject.host}}\\n          </h5>\\n          <ul>\\n          {{#each worker in group}}\\n            {{#view Travis.WorkersItemView workerBinding=\\\"worker\\\"}}\\n              <li class=\\\"worker\\\">\\n                <div class=\\\"status\\\"></div>\\n                {{#if worker.isWorking}}\\n                  {{#if worker.jobId}}\\n                    <a {{action showJob worker.repoSlug worker.jobId target=\\\"Travis.app.router\\\" href=true}} {{bindAttr title=\\\"worker.lastSeenAt\\\"}}>\\n                      {{view.display}}\\n                    </a>\\n                  {{/if}}\\n                {{else}}\\n                  {{view.display}}\\n                {{/if}}\\n              </li>\\n            {{/view}}\\n          {{/each}}\\n          </ul>\\n        </li>\\n      {{/view}}\\n    {{else}}\\n      No workers\\n    {{/each}}\\n  </ul>\\n{{/view}}\\n\");\n\n})();\n//@ sourceURL=templates");minispade.register('config/locales', "(function() {window.I18n = window.I18n || {}\nwindow.I18n.translations = {\"ca\":{\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"nl\":\"Nederlands\",\"pl\":\"Polski\",\"pt-BR\":\"português brasileiro\",\"ru\":\"Русский\"}},\"en\":{\"errors\":{\"messages\":{\"not_found\":\"not found\",\"already_confirmed\":\"was already confirmed\",\"not_locked\":\"was not locked\"}},\"devise\":{\"failure\":{\"unauthenticated\":\"You need to sign in or sign up before continuing.\",\"unconfirmed\":\"You have to confirm your account before continuing.\",\"locked\":\"Your account is locked.\",\"invalid\":\"Invalid email or password.\",\"invalid_token\":\"Invalid authentication token.\",\"timeout\":\"Your session expired, please sign in again to continue.\",\"inactive\":\"Your account was not activated yet.\"},\"sessions\":{\"signed_in\":\"Signed in successfully.\",\"signed_out\":\"Signed out successfully.\"},\"passwords\":{\"send_instructions\":\"You will receive an email with instructions about how to reset your password in a few minutes.\",\"updated\":\"Your password was changed successfully. You are now signed in.\"},\"confirmations\":{\"send_instructions\":\"You will receive an email with instructions about how to confirm your account in a few minutes.\",\"confirmed\":\"Your account was successfully confirmed. You are now signed in.\"},\"registrations\":{\"signed_up\":\"You have signed up successfully. If enabled, a confirmation was sent to your e-mail.\",\"updated\":\"You updated your account successfully.\",\"destroyed\":\"Bye! Your account was successfully cancelled. We hope to see you again soon.\"},\"unlocks\":{\"send_instructions\":\"You will receive an email with instructions about how to unlock your account in a few minutes.\",\"unlocked\":\"Your account was successfully unlocked. You are now signed in.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Confirmation instructions\"},\"reset_password_instructions\":{\"subject\":\"Reset password instructions\"},\"unlock_instructions\":{\"subject\":\"Unlock Instructions\"}}},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} hour\",\"other\":\"%{count} hours\"},\"minutes_exact\":{\"one\":\"%{count} minute\",\"other\":\"%{count} minutes\"},\"seconds_exact\":{\"one\":\"%{count} second\",\"other\":\"%{count} seconds\"}}},\"workers\":\"Workers\",\"queue\":\"Queue\",\"no_job\":\"There are no jobs\",\"repositories\":{\"branch\":\"Branch\",\"image_url\":\"Image URL\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Started\",\"duration\":\"Duration\",\"finished_at\":\"Finished\",\"tabs\":{\"current\":\"Current\",\"build_history\":\"Build History\",\"branches\":\"Branch Summary\",\"pull_requests\":\"Pull Requests\",\"build\":\"Build\",\"job\":\"Job\"}},\"build\":{\"job\":\"Job\",\"duration\":\"Duration\",\"finished_at\":\"Finished\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"This test suite was run on a worker box sponsored by\"},\"build_matrix\":\"Build Matrix\",\"allowed_failures\":\"Allowed Failures\",\"author\":\"Author\",\"config\":\"Config\",\"compare\":\"Compare\",\"committer\":\"Committer\",\"branch\":\"Branch\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Started\",\"duration\":\"Duration\",\"finished_at\":\"Finished\"},\"builds\":{\"name\":\"Build\",\"messages\":{\"sponsored_by\":\"This test suite was run on a worker box sponsored by\"},\"build_matrix\":\"Build Matrix\",\"allowed_failures\":\"Allowed Failures\",\"author\":\"Author\",\"config\":\"Config\",\"compare\":\"Compare\",\"committer\":\"Committer\",\"branch\":\"Branch\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Started\",\"duration\":\"Duration\",\"finished_at\":\"Finished\",\"show_more\":\"Show more\"},\"layouts\":{\"top\":{\"home\":\"Home\",\"blog\":\"Blog\",\"docs\":\"Docs\",\"stats\":\"Stats\",\"github_login\":\"Sign in with Github\",\"profile\":\"Profile\",\"sign_out\":\"Sign Out\",\"admin\":\"Admin\"},\"application\":{\"fork_me\":\"Fork me on Github\",\"recent\":\"Recent\",\"search\":\"Search\",\"sponsers\":\"Sponsors\",\"sponsors_link\":\"See all of our amazing sponsors &rarr;\",\"my_repositories\":\"My Repositories\"},\"about\":{\"alpha\":\"This stuff is alpha.\",\"messages\":{\"alpha\":\"Please do <strong>not</strong> consider this a stable service. We're still far from that! More info <a href='https://github.com/travis-ci'>here.</a>\"},\"join\":\"Join us and help!\",\"mailing_list\":\"Mailing List\",\"repository\":\"Repository\",\"twitter\":\"Twitter\"},\"mobile\":{\"author\":\"Author\",\"build\":\"Build\",\"build_matrix\":\"Build Matrix\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Compare\",\"config\":\"Config\",\"duration\":\"Duration\",\"finished_at\":\"Finished at\",\"job\":\"Job\",\"log\":\"Log\"}},\"profiles\":{\"show\":{\"email\":\"Email\",\"github\":\"Github\",\"message\":{\"your_repos\":\"  Flick the switches below to turn on the Travis service hook for your projects, then push to GitHub.\",\"config\":\"how to configure custom build options\"},\"messages\":{\"notice\":\"To get started, please read our <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Getting Started guide</a>.\\n  <small>It will only take a couple of minutes.</small>\"},\"token\":\"Token\",\"your_repos\":\"Your Repositories\",\"update\":\"Update\",\"update_locale\":\"Update\",\"your_locale\":\"Your Locale\"}},\"statistics\":{\"index\":{\"count\":\"Count\",\"repo_growth\":\"Repository Growth\",\"total_projects\":\"Total Projects/Repositories\",\"build_count\":\"Build Count\",\"last_month\":\"last month\",\"total_builds\":\"Total Builds\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"es\":{\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} hora\",\"other\":\"%{count} horas\"},\"minutes_exact\":{\"one\":\"%{count} minuto\",\"other\":\"%{count} minutos\"},\"seconds_exact\":{\"one\":\"%{count} segundo\",\"other\":\"%{count} segundos\"}}},\"workers\":\"Procesos\",\"queue\":\"Cola\",\"no_job\":\"No hay trabajos\",\"repositories\":{\"branch\":\"Rama\",\"image_url\":\"Imagen URL\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Mensaje\",\"started_at\":\"Iniciado\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\",\"tabs\":{\"current\":\"Actual\",\"build_history\":\"Histórico\",\"branches\":\"Ramas\",\"build\":\"Builds\",\"job\":\"Trabajo\"}},\"build\":{\"job\":\"Trabajo\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"Esta serie de tests han sido ejecutados en una caja de Proceso patrocinada por\"},\"build_matrix\":\"Matriz de Builds\",\"allowed_failures\":\"Fallos Permitidos\",\"author\":\"Autor\",\"config\":\"Configuración\",\"compare\":\"Comparar\",\"committer\":\"Committer\",\"branch\":\"Rama\",\"commit\":\"Commit\",\"message\":\"Mensaje\",\"started_at\":\"Iniciado\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\",\"sponsored_by\":\"Patrocinado por\"},\"builds\":{\"name\":\"Build\",\"messages\":{\"sponsored_by\":\"Esta serie de tests han sido ejecutados en una caja de Proceso patrocinada por\"},\"build_matrix\":\"Matriz de Builds\",\"allowed_failures\":\"Fallos Permitidos\",\"author\":\"Autor\",\"config\":\"Configuración\",\"compare\":\"Comparar\",\"committer\":\"Committer\",\"branch\":\"Rama\",\"commit\":\"Commit\",\"message\":\"Mensaje\",\"started_at\":\"Iniciado\",\"duration\":\"Duración\",\"finished_at\":\"Finalizado\"},\"layouts\":{\"top\":{\"home\":\"Inicio\",\"blog\":\"Blog\",\"docs\":\"Documentación\",\"stats\":\"Estadísticas\",\"github_login\":\"Iniciar sesión con Github\",\"profile\":\"Perfil\",\"sign_out\":\"Desconectar\",\"admin\":\"Admin\"},\"application\":{\"fork_me\":\"Hazme un Fork en Github\",\"recent\":\"Reciente\",\"search\":\"Buscar\",\"sponsers\":\"Patrocinadores\",\"sponsors_link\":\"Ver todos nuestros patrocinadores &rarr;\",\"my_repositories\":\"Mis Repositorios\"},\"about\":{\"alpha\":\"Esto es alpha.\",\"messages\":{\"alpha\":\"Por favor <strong>no</strong> considereis esto un servicio estable. Estamos estamos aún lejos de ello! Más información <a href='https://github.com/travis-ci'>aquí.</a>\"},\"join\":\"Únetenos y ayudanos!\",\"mailing_list\":\"Lista de Correos\",\"repository\":\"Repositorio\",\"twitter\":\"Twitter\"}},\"profiles\":{\"show\":{\"email\":\"Correo electrónico\",\"github\":\"Github\",\"message\":{\"your_repos\":\"  Activa los interruptores para inicial el  Travis service hook para tus proyectos, y haz un Push en GitHub.<br />\\n  Para probar varias versiones de ruby, mira\",\"config\":\"como configurar tus propias opciones para el Build\"},\"messages\":{\"notice\":\"Para comenzar, por favor lee nuestra <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Guía de Inicio </a>.\\n  <small>Solo tomará unos pocos minutos.</small>\"},\"token\":\"Token\",\"your_repos\":\"Tus repositorios\",\"update\":\"Actualizar\",\"update_locale\":\"Actualizar\",\"your_locale\":\"Tu Idioma\"}},\"statistics\":{\"index\":{\"count\":\"Número\",\"repo_growth\":\"Crecimiento de Repositorios\",\"total_projects\":\"Total de Proyectos/Repositorios\",\"build_count\":\"Número de Builds\",\"last_month\":\"mes anterior\",\"total_builds\":\"Total de Builds\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"fr\":{\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} heure\",\"other\":\"%{count} heures\"},\"minutes_exact\":{\"one\":\"%{count} minute\",\"other\":\"%{count} minutes\"},\"seconds_exact\":{\"one\":\"%{count} seconde\",\"other\":\"%{count} secondes\"}}},\"workers\":\"Processus\",\"queue\":\"File\",\"no_job\":\"Pas de tâches\",\"repositories\":{\"branch\":\"Branche\",\"image_url\":\"Image\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Commencé\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\",\"tabs\":{\"current\":\"Actuel\",\"build_history\":\"Historique des tâches\",\"branches\":\"Résumé des branches\",\"build\":\"Construction\",\"job\":\"Tâche\"}},\"build\":{\"job\":\"Tâche\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"Cette série de tests a été exécutée sur une machine sponsorisée par\"},\"build_matrix\":\"Matrice des versions\",\"allowed_failures\":\"Échecs autorisés\",\"author\":\"Auteur\",\"config\":\"Config\",\"compare\":\"Comparer\",\"committer\":\"Committeur\",\"branch\":\"Branche\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Commencé\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\",\"sponsored_by\":\"Cette série de tests a été exécutée sur une machine sponsorisée par\"},\"builds\":{\"name\":\"Version\",\"messages\":{\"sponsored_by\":\"Cette série de tests a été exécutée sur une machine sponsorisée par\"},\"build_matrix\":\"Matrice des versions\",\"allowed_failures\":\"Échecs autorisés\",\"author\":\"Auteur\",\"config\":\"Config\",\"compare\":\"Comparer\",\"committer\":\"Committeur\",\"branch\":\"Branche\",\"commit\":\"Commit\",\"message\":\"Message\",\"started_at\":\"Commencé\",\"duration\":\"Durée\",\"finished_at\":\"Terminé\"},\"layouts\":{\"top\":{\"home\":\"Accueil\",\"blog\":\"Blog\",\"docs\":\"Documentation\",\"stats\":\"Statistiques\",\"github_login\":\"Connection Github\",\"profile\":\"Profil\",\"sign_out\":\"Déconnection\",\"admin\":\"Admin\"},\"application\":{\"fork_me\":\"Faites un Fork sur Github\",\"recent\":\"Récent\",\"search\":\"Chercher\",\"sponsers\":\"Sponsors\",\"sponsors_link\":\"Voir tous nos extraordinaire sponsors &rarr;\",\"my_repositories\":\"Mes dépôts\"},\"about\":{\"alpha\":\"Ceci est en alpha.\",\"messages\":{\"alpha\":\"S'il vous plaît ne considérez <strong>pas</strong> ce service comme étant stable. Nous sommes loin de ça! Plus d'infos <a href='https://github.com/travis-ci'>ici.</a>\"},\"join\":\"Joignez-vous à nous et aidez-nous!\",\"mailing_list\":\"Liste de distribution\",\"repository\":\"Dépôt\",\"twitter\":\"Twitter\"},\"mobile\":{\"author\":\"Auteur\",\"build\":\"Version\",\"build_matrix\":\"Matrice des versions\",\"commit\":\"Commit\",\"committer\":\"Committeur\",\"compare\":\"Comparer\",\"config\":\"Config\",\"duration\":\"Durée\",\"finished_at\":\"Terminé à\",\"job\":\"Tâche\",\"log\":\"Journal\"}},\"profiles\":{\"show\":{\"github\":\"Github\",\"message\":{\"your_repos\":\"Utilisez les boutons ci-dessous pour activer Travis sur vos projets puis déployez sur GitHub.<br />\\nPour tester sur plus de versions de ruby, voir\",\"config\":\"comment configurer des options de version personnalisées\"},\"messages\":{\"notice\":\"Pour commencer, veuillez lire notre <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">guide de démarrage</a>.\\n <small>Cela ne vous prendra que quelques minutes.</small>\"},\"token\":\"Jeton\",\"your_repos\":\"Vos dépôts\",\"email\":\"Courriel\",\"update\":\"Modifier\",\"update_locale\":\"Modifier\",\"your_locale\":\"Votre langue\"}},\"statistics\":{\"index\":{\"count\":\"Décompte\",\"repo_growth\":\"Croissance de dépôt\",\"total_projects\":\"Total des projets/dépôts\",\"build_count\":\"Décompte des versions\",\"last_month\":\"mois dernier\",\"total_builds\":\"Total des versions\"}},\"admin\":{\"actions\":{\"create\":\"créer\",\"created\":\"créé\",\"delete\":\"supprimer\",\"deleted\":\"supprimé\",\"update\":\"mise à jour\",\"updated\":\"mis à jour\"},\"credentials\":{\"log_out\":\"Déconnection\"},\"delete\":{\"confirmation\":\"Oui, je suis sure\",\"flash_confirmation\":\"%{name} a été détruit avec succès\"},\"flash\":{\"error\":\"%{name} n'a pas pu être %{action}\",\"noaction\":\"Aucune action n'a été entreprise\",\"successful\":\"%{name} a réussi à %{action}\"},\"history\":{\"name\":\"Historique\",\"no_activity\":\"Aucune activité\",\"page_name\":\"Historique pour %{name}\"},\"list\":{\"add_new\":\"Ajouter un nouveau\",\"delete_action\":\"Supprimer\",\"delete_selected\":\"Supprimer la sélection\",\"edit_action\":\"Modifier\",\"search\":\"Rechercher\",\"select\":\"Sélectionner le %{name} à modifier\",\"select_action\":\"Sélectionner\",\"show_all\":\"Montrer tout\"},\"new\":{\"basic_info\":\"Information de base\",\"cancel\":\"Annuler\",\"chosen\":\"%{name} choisi\",\"chose_all\":\"Choisir tout\",\"clear_all\":\"Déselectionner tout\",\"many_chars\":\"caractères ou moins\",\"one_char\":\"caractère.\",\"optional\":\"Optionnel\",\"required\":\"Requis\",\"save\":\"Sauvegarder\",\"save_and_add_another\":\"Sauvegarder et en ajouter un autre\",\"save_and_edit\":\"Sauvegarder et modifier\",\"select_choice\":\"Faites vos choix et cliquez\"},\"dashboard\":{\"add_new\":\"Ajouter un nouveau\",\"last_used\":\"Dernière utilisation\",\"model_name\":\"Nom du modèle\",\"modify\":\"Modification\",\"name\":\"Tableau de bord\",\"pagename\":\"Administration du site\",\"records\":\"Enregistrements\",\"show\":\"Voir\",\"ago\":\"plus tôt\"}},\"home\":{\"name\":\"accueil\"},\"repository\":{\"duration\":\"Durée\"},\"devise\":{\"confirmations\":{\"confirmed\":\"Votre compte a été crée avec succès. Vous être maintenant connecté.\",\"send_instructions\":\"Vous allez recevoir un courriel avec les instructions de confirmation de votre compte dans quelques minutes.\"},\"failure\":{\"inactive\":\"Votre compte n'a pas encore été activé.\",\"invalid\":\"Adresse courriel ou mot de passe invalide.\",\"invalid_token\":\"Jeton d'authentification invalide.\",\"locked\":\"Votre compte est bloqué.\",\"timeout\":\"Votre session est expirée, veuillez vous reconnecter pour continuer.\",\"unauthenticated\":\"Vous devez vous connecter ou vous enregistrer afin de continuer\",\"unconfirmed\":\"Vous devez confirmer votre compte avant de continuer.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Instructions de confirmations\"},\"reset_password_instructions\":{\"subject\":\"Instruction de remise à zéro du mot de passe\"},\"unlock_instructions\":{\"subject\":\"Instruction de débloquage\"}},\"passwords\":{\"send_instructions\":\"Vous recevrez un courriel avec les instructions de remise à zéro du mot de passe dans quelques minutes.\",\"updated\":\"Votre mot de passe a été changé avec succès. Vous êtes maintenant connecté.\"},\"registrations\":{\"destroyed\":\"Au revoir! Votre compte a été annulé avec succès. Nous espérons vous revoir bientôt.\",\"signed_up\":\"Vous êtes enregistré avec succès. Si activé, une confirmation vous a été envoyé par courriel.\",\"updated\":\"Votre compte a été mis a jour avec succès\"},\"sessions\":{\"signed_in\":\"Connecté avec succès\",\"signed_out\":\"Déconnecté avec succès\"},\"unlocks\":{\"send_instructions\":\"Vous recevrez un courriel contenant les instructions pour débloquer votre compte dans quelques minutes.\",\"unlocked\":\"Votre compte a été débloqué avec succès.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"étais déja confirmé\",\"not_found\":\"n'a pas été trouvé\",\"not_locked\":\"n'étais pas bloqué\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"ja\":{\"workers\":\"ワーカー\",\"queue\":\"キュー\",\"no_job\":\"ジョブはありません\",\"repositories\":{\"branch\":\"ブランチ\",\"image_url\":\"画像URL\",\"markdown\":\".md\",\"textile\":\".textile\",\"rdoc\":\".rdoc\",\"commit\":\"コミット\",\"message\":\"メッセージ\",\"started_at\":\"開始時刻\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\",\"tabs\":{\"current\":\"最新\",\"build_history\":\"ビルド履歴\",\"branches\":\"ブランチまとめ\",\"build\":\"ビルド\",\"job\":\"ジョブ\"}},\"build\":{\"job\":\"ジョブ\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"このテストは以下のスポンサーの協力で行いました。\"},\"build_matrix\":\"ビルドマトリクス\",\"allowed_failures\":\"失敗許容範囲内\",\"author\":\"制作者\",\"config\":\"設定\",\"compare\":\"比較\",\"committer\":\"コミット者\",\"branch\":\"ブランチ\",\"commit\":\"コミット\",\"message\":\"メッセージ\",\"started_at\":\"開始時刻\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\"},\"builds\":{\"name\":\"ビルド\",\"messages\":{\"sponsored_by\":\"このテストは以下のスポンサーの協力で行いました。\"},\"build_matrix\":\"失敗許容範囲外\",\"allowed_failures\":\"失敗許容範囲内\",\"author\":\"制作者\",\"config\":\"設定\",\"compare\":\"比較\",\"committer\":\"コミット者\",\"branch\":\"ブランチ\",\"commit\":\"コミット\",\"message\":\"メッセージ\",\"started_at\":\"開始時刻\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\"},\"layouts\":{\"about\":{\"alpha\":\"まだアルファですよ！\",\"join\":\"参加してみよう！\",\"mailing_list\":\"メールリスト\",\"messages\":{\"alpha\":\"Travis-ciは安定したサービスまで後一歩！詳しくは<a href='https://github.com/travis-ci'>こちら</a>\"},\"repository\":\"リポジトリ\",\"twitter\":\"ツイッター\"},\"application\":{\"fork_me\":\"Githubでフォークしよう\",\"my_repositories\":\"マイリポジトリ\",\"recent\":\"最近\",\"search\":\"検索\",\"sponsers\":\"スポンサー\",\"sponsors_link\":\"スポンサーをもっと見る &rarr;\"},\"top\":{\"blog\":\"ブログ\",\"docs\":\"Travisとは？\",\"github_login\":\"Githubでログイン\",\"home\":\"ホーム\",\"profile\":\"プロフィール\",\"sign_out\":\"ログアウト\",\"stats\":\"統計\",\"admin\":\"管理\"},\"mobile\":{\"author\":\"制作者\",\"build\":\"ビルド\",\"build_matrix\":\"ビルドマトリクス\",\"commit\":\"コミット\",\"committer\":\"コミット者\",\"compare\":\"比較\",\"config\":\"設定\",\"duration\":\"処理時間\",\"finished_at\":\"終了時刻\",\"job\":\"ジョブ\",\"log\":\"ログ\"}},\"profiles\":{\"show\":{\"github\":\"Github\",\"email\":\"メール\",\"message\":{\"config\":\"詳細設定\",\"your_repos\":\"以下のスイッチを設定し、Travis-ciを有効にします。Githubへプッシュしたらビルドは自動的に開始します。複数バーションや細かい設定はこちらへ：\"},\"messages\":{\"notice\":\"まずは<a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Travisのはじめ方</a>を参照してください。\"},\"token\":\"トークン\",\"your_repos\":\"リポジトリ\",\"update\":\"更新\",\"update_locale\":\"更新\",\"your_locale\":\"言語設定\"}},\"statistics\":{\"index\":{\"build_count\":\"ビルド数\",\"count\":\"数\",\"last_month\":\"先月\",\"repo_growth\":\"リポジトリ\",\"total_builds\":\"合計ビルド数\",\"total_projects\":\"合計リポジトリ\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"nb\":{\"admin\":{\"actions\":{\"create\":\"opprett\",\"created\":\"opprettet\",\"delete\":\"slett\",\"deleted\":\"slettet\",\"update\":\"oppdater\",\"updated\":\"oppdatert\"},\"credentials\":{\"log_out\":\"Logg ut\"},\"dashboard\":{\"add_new\":\"Legg til ny\",\"ago\":\"siden\",\"last_used\":\"Sist brukt\",\"model_name\":\"Modell\",\"modify\":\"Rediger\",\"name\":\"Dashbord\",\"pagename\":\"Nettstedsadministrasjon\",\"records\":\"Oppføringer\",\"show\":\"Vis\"},\"delete\":{\"confirmation\":\"Ja, jeg er sikker\",\"flash_confirmation\":\"%{name} ble slettet\"},\"flash\":{\"error\":\"%{name} kunne ikke bli %{action}\",\"noaction\":\"Ingen handlinger ble utført\",\"successful\":\"%{name} ble %{action}\"},\"history\":{\"name\":\"Logg\",\"no_activity\":\"Ingen aktivitet\",\"page_name\":\"Logg for %{name}\"},\"list\":{\"add_new\":\"Legg til ny\",\"delete_action\":\"Slett\",\"delete_selected\":\"Slett valgte\",\"edit_action\":\"Rediger\",\"search\":\"Søk\",\"select\":\"Velg %{name} for å redigere\",\"select_action\":\"Velg\",\"show_all\":\"Vis alle \"},\"new\":{\"basic_info\":\"Basisinformasjon\",\"cancel\":\"Avbryt\",\"chosen\":\"Valgt %{name}\",\"chose_all\":\"Velg alle\",\"clear_all\":\"Fjern alle\",\"many_chars\":\"eller færre tegn.\",\"one_char\":\"tegn.\",\"optional\":\"Valgfri\",\"required\":\"Påkrevd\",\"save\":\"Lagre\",\"save_and_add_another\":\"Lagre og legg til ny\",\"save_and_edit\":\"Lagre og rediger\",\"select_choice\":\"Kryss av for dine valg og klikk\"}},\"build\":{\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"job\":\"Jobb\"},\"builds\":{\"allowed_failures\":\"Tillatte feil\",\"author\":\"Forfatter\",\"branch\":\"Gren\",\"build_matrix\":\"Jobbmatrise\",\"commit\":\"Innsending\",\"committer\":\"Innsender\",\"compare\":\"Sammenlign\",\"config\":\"Oppsett\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"message\":\"Beskrivelse\",\"messages\":{\"sponsored_by\":\"Denne testen ble kjørt på en maskin sponset av\"},\"name\":\"Jobb\",\"started_at\":\"Startet\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} time\",\"other\":\"%{count} timer\"},\"minutes_exact\":{\"one\":\"%{count} minutt\",\"other\":\"%{count} minutter\"},\"seconds_exact\":{\"one\":\"%{count} sekund\",\"other\":\"%{count} sekunder\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Din konto er aktivert og du er nå innlogget.\",\"send_instructions\":\"Om noen få minutter så vil du få en e-post med informasjon om hvordan du bekrefter kontoen din.\"},\"failure\":{\"inactive\":\"Kontoen din har ikke blitt aktivert enda.\",\"invalid\":\"Ugyldig e-post eller passord.\",\"invalid_token\":\"Ugyldig autentiseringskode.\",\"locked\":\"Kontoen din er låst.\",\"timeout\":\"Du ble logget ut siden på grunn av mangel på aktivitet, vennligst logg inn på nytt.\",\"unauthenticated\":\"Du må logge inn eller registrere deg for å fortsette.\",\"unconfirmed\":\"Du må bekrefte kontoen din før du kan fortsette.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Bekreftelsesinformasjon\"},\"reset_password_instructions\":{\"subject\":\"Instruksjoner for å få nytt passord\"},\"unlock_instructions\":{\"subject\":\"Opplåsningsinstruksjoner\"}},\"passwords\":{\"send_instructions\":\"Om noen få minutter så vil du få en epost med informasjon om hvordan du kan få et nytt passord.\",\"updated\":\"Passordet ditt ble endret, og du er logget inn.\"},\"registrations\":{\"destroyed\":\"Adjø! Kontoen din ble kansellert. Vi håper vi ser deg igjen snart.\",\"signed_up\":\"Du er nå registrert.\",\"updated\":\"Kontoen din ble oppdatert.\"},\"sessions\":{\"signed_in\":\"Du er nå logget inn.\",\"signed_out\":\"Du er nå logget ut.\"},\"unlocks\":{\"send_instructions\":\"Om noen få minutter så kommer du til å få en e-post med informasjon om hvordan du kan låse opp kontoen din.\",\"unlocked\":\"Kontoen din ble låst opp, og du er nå logget inn igjen.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"har allerede blitt bekreftet\",\"not_found\":\"ikke funnnet\",\"not_locked\":\"var ikke låst\"}},\"home\":{\"name\":\"hjem\"},\"jobs\":{\"allowed_failures\":\"Tillatte feil\",\"author\":\"Forfatter\",\"branch\":\"Gren\",\"build_matrix\":\"Jobbmatrise\",\"commit\":\"Innsending\",\"committer\":\"Innsender\",\"compare\":\"Sammenlign\",\"config\":\"Oppsett\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"message\":\"Beskrivelse\",\"messages\":{\"sponsored_by\":\"Denne testserien ble kjørt på en maskin sponset av\"},\"started_at\":\"Startet\"},\"layouts\":{\"about\":{\"alpha\":\"Dette er alfa-greier.\",\"join\":\"Bli med og hjelp oss!\",\"mailing_list\":\"E-postliste\",\"messages\":{\"alpha\":\"Dette er <strong>ikke</strong> en stabil tjeneste. Vi har fremdeles et stykke igjen! Mer informasjon finner du <a href=\\\"https://github.com/travis-ci\\\">her</a>.\"},\"repository\":\"Kodelager\",\"twitter\":\"Twitter.\"},\"application\":{\"fork_me\":\"Se koden på Github\",\"my_repositories\":\"Mine kodelagre\",\"recent\":\"Nylig\",\"search\":\"Søk\",\"sponsers\":\"Sponsorer\",\"sponsors_link\":\"Se alle de flotte sponsorene våre &rarr;\"},\"mobile\":{\"author\":\"Forfatter\",\"build\":\"Jobb\",\"build_matrix\":\"Jobbmatrise\",\"commit\":\"Innsending\",\"committer\":\"Innsender\",\"compare\":\"Sammenlign\",\"config\":\"Oppsett\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"job\":\"Jobb\",\"log\":\"Logg\"},\"top\":{\"admin\":\"Administrator\",\"blog\":\"Blogg\",\"docs\":\"Dokumentasjon\",\"github_login\":\"Logg inn med Github\",\"home\":\"Hjem\",\"profile\":\"Profil\",\"sign_out\":\"Logg ut\",\"stats\":\"Statistikk\"}},\"no_job\":\"Ingen jobber finnnes\",\"profiles\":{\"show\":{\"email\":\"E-post\",\"github\":\"Github\",\"message\":{\"config\":\"hvordan sette opp egne jobbinnstillinger\",\"your_repos\":\"Slå\\u0010 på Travis for prosjektene dine ved å dra i bryterne under, og send koden til Github.<br />\\nFor å teste mot flere ruby-versjoner, se dokumentasjonen for\"},\"messages\":{\"notice\":\"For å komme i gang, vennligst les <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">kom-i-gang-veivisereren</a> vår. <small>Det tar bare et par minutter.</small>\"},\"token\":\"Kode\",\"update\":\"Oppdater\",\"update_locale\":\"Oppdater\",\"your_locale\":\"Ditt språk\",\"your_repos\":\"Dine kodelagre\"}},\"queue\":\"Kø\",\"repositories\":{\"branch\":\"Gren\",\"commit\":\"Innsender\",\"duration\":\"Varighet\",\"finished_at\":\"Fullført\",\"image_url\":\"Bilde-URL\",\"markdown\":\"Markdown\",\"message\":\"Beskrivelse\",\"rdoc\":\"RDOC\",\"started_at\":\"Startet\",\"tabs\":{\"branches\":\"Grensammendrag\",\"build\":\"Jobb\",\"build_history\":\"Jobblogg\",\"current\":\"Siste\",\"job\":\"Jobb\"},\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Varighet\"},\"statistics\":{\"index\":{\"build_count\":\"Antall jobber\",\"count\":\"Antall\",\"last_month\":\"siste måned\",\"repo_growth\":\"Vekst i kodelager\",\"total_builds\":\"Totale jobber\",\"total_projects\":\"Antall prosjekter/kodelagre\"}},\"workers\":\"Arbeidere\",\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"nl\":{\"admin\":{\"actions\":{\"create\":\"aanmaken\",\"created\":\"aangemaakt\",\"delete\":\"verwijderen\",\"deleted\":\"verwijderd\",\"update\":\"bijwerken\",\"updated\":\"bijgewerkt\"},\"credentials\":{\"log_out\":\"Afmelden\"},\"dashboard\":{\"add_new\":\"Nieuwe toevoegen\",\"ago\":\"geleden\",\"last_used\":\"Laatst gebruikt\",\"model_name\":\"Model naam\",\"modify\":\"Wijzigen\",\"pagename\":\"Site administratie\",\"show\":\"Laten zien\",\"records\":\"Gegevens\"},\"delete\":{\"confirmation\":\"Ja, ik ben zeker\",\"flash_confirmation\":\"%{name} is vernietigd\"},\"flash\":{\"error\":\"%{name} kon niet worden %{action}\",\"noaction\":\"Er zijn geen acties genomen\",\"successful\":\"%{name} is %{action}\"},\"history\":{\"name\":\"Geschiedenis\",\"no_activity\":\"Geen activiteit\",\"page_name\":\"Geschiedenis van %{name}\"},\"list\":{\"add_new\":\"Nieuwe toevoegen\",\"delete_action\":\"Verwijderen\",\"delete_selected\":\"Verwijder geselecteerden\",\"edit_action\":\"Bewerken\",\"search\":\"Zoeken\",\"select\":\"Selecteer %{name} om te bewerken\",\"select_action\":\"Selecteer\",\"show_all\":\"Laat allen zien\"},\"new\":{\"basic_info\":\"Basisinfo\",\"cancel\":\"Annuleren\",\"chosen\":\"%{name} gekozen\",\"chose_all\":\"Kies allen\",\"clear_all\":\"Deselecteer allen\",\"many_chars\":\"tekens of minder.\",\"one_char\":\"teken.\",\"optional\":\"Optioneel\",\"required\":\"Vereist\",\"save\":\"Opslaan\",\"save_and_add_another\":\"Opslaan en een nieuwe toevoegen\",\"save_and_edit\":\"Opslaan en bewerken\",\"select_choice\":\"Selecteer uw keuzes en klik\"}},\"build\":{\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"job\":\"Taak\"},\"builds\":{\"allowed_failures\":\"Toegestane mislukkingen\",\"author\":\"Auteur\",\"branch\":\"Tak\",\"build_matrix\":\"Bouw Matrix\",\"compare\":\"Vergelijk\",\"config\":\"Configuratie\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"message\":\"Bericht\",\"messages\":{\"sponsored_by\":\"Deze tests zijn gedraaid op een machine gesponsord door\"},\"name\":\"Bouw\",\"started_at\":\"Gestart\",\"commit\":\"Commit\",\"committer\":\"Committer\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} uur\",\"other\":\"%{count} uren\"},\"minutes_exact\":{\"one\":\"%{count} minuut\",\"other\":\"%{count} minuten\"},\"seconds_exact\":{\"one\":\"%{count} seconde\",\"other\":\"%{count} seconden\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Uw account is bevestigd. U wordt nu ingelogd.\",\"send_instructions\":\"Binnen enkele minuten zal u een email ontvangen met instructies om uw account te bevestigen.\"},\"failure\":{\"inactive\":\"Uw account is nog niet geactiveerd.\",\"invalid\":\"Ongeldig email adres of wachtwoord.\",\"invalid_token\":\"Ongeldig authenticatie token.\",\"locked\":\"Uw account is vergrendeld.\",\"timeout\":\"Uw sessie is verlopen, gelieve opnieuw in te loggen om verder te gaan.\",\"unauthenticated\":\"U moet inloggen of u registeren voordat u verder gaat.\",\"unconfirmed\":\"U moet uw account bevestigen voordat u verder gaat.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Bevestigings-instructies\"},\"reset_password_instructions\":{\"subject\":\"Wachtwoord herstel instructies\"},\"unlock_instructions\":{\"subject\":\"Ontgrendel-instructies\"}},\"passwords\":{\"send_instructions\":\"Binnen enkele minuten zal u een email krijgen met instructies om uw wachtwoord opnieuw in te stellen.\",\"updated\":\"Uw wachtwoord is veranderd. U wordt nu ingelogd.\"},\"registrations\":{\"destroyed\":\"Dag! Uw account is geannuleerd. We hopen u vlug terug te zien.\",\"signed_up\":\"Uw registratie is voltooid. Als het ingeschakeld is wordt een bevestiging naar uw email adres verzonden.\",\"updated\":\"Het bijwerken van uw account is gelukt.\"},\"sessions\":{\"signed_in\":\"Inloggen gelukt.\",\"signed_out\":\"Uitloggen gelukt.\"},\"unlocks\":{\"send_instructions\":\"Binnen enkele minuten zal u een email krijgen met instructies om uw account te ontgrendelen.\",\"unlocked\":\"Uw account is ontgrendeld. U wordt nu ingelogd.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"was al bevestigd\",\"not_found\":\"niet gevonden\",\"not_locked\":\"was niet vergrendeld\"}},\"jobs\":{\"allowed_failures\":\"Toegestane mislukkingen\",\"author\":\"Auteur\",\"branch\":\"Tak\",\"build_matrix\":\"Bouw matrix\",\"compare\":\"Vergelijk\",\"config\":\"Configuratie\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"message\":\"Bericht\",\"messages\":{\"sponsored_by\":\"Deze testen zijn uitgevoerd op een machine gesponsord door\"},\"started_at\":\"Gestart\",\"commit\":\"Commit\",\"committer\":\"Committer\"},\"layouts\":{\"about\":{\"alpha\":\"Dit is in alfa-stadium.\",\"join\":\"Doe met ons mee en help!\",\"mailing_list\":\"Mailing lijst\",\"messages\":{\"alpha\":\"Gelieve deze service <strong>niet</strong> te beschouwen als stabiel. Daar zijn we nog lang niet! Meer info <a href='https://github.com/travis-ci'>hier.</a>\"},\"repository\":\"Repository\",\"twitter\":\"Twitter\"},\"application\":{\"fork_me\":\"Maak een fork op Github\",\"my_repositories\":\"Mijn repositories\",\"recent\":\"Recent\",\"search\":\"Zoeken\",\"sponsers\":\"Sponsors\",\"sponsors_link\":\"Bekijk al onze geweldige sponsors &rarr;\"},\"mobile\":{\"author\":\"Auteur\",\"build\":\"Bouw\",\"build_matrix\":\"Bouw matrix\",\"compare\":\"Vergelijk\",\"config\":\"Configuratie\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid op\",\"job\":\"Taak\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"log\":\"Logboek\"},\"top\":{\"admin\":\"Administratie\",\"blog\":\"Blog\",\"docs\":\"Documentatie\",\"github_login\":\"Inloggen met Github\",\"home\":\"Home\",\"profile\":\"Profiel\",\"sign_out\":\"Uitloggen\",\"stats\":\"Statistieken\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"nl\":\"Nederlands\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"pt-BR\":\"português brasileiro\"},\"no_job\":\"Er zijn geen taken\",\"profiles\":{\"show\":{\"email\":\"Email adres\",\"github\":\"Github\",\"message\":{\"config\":\"hoe eigen bouw-opties in te stellen\",\"your_repos\":\"Zet de schakelaars hieronder aan om de Travis hook voor uw projecten te activeren en push daarna naar Github<br />\\nOm te testen tegen meerdere rubies, zie\"},\"messages\":{\"notice\":\"Om te beginnen kunt u onze <a href=\\\\\\\"http://about.travis-ci.org/docs/user/getting-started/\\\\\\\">startersgids</a> lezen.\\\\n  <small>Het zal maar enkele minuten van uw tijd vergen.</small>\"},\"update\":\"Bijwerken\",\"update_locale\":\"Bijwerken\",\"your_locale\":\"Uw taal\",\"your_repos\":\"Uw repositories\",\"token\":\"Token\"}},\"queue\":\"Wachtrij\",\"repositories\":{\"branch\":\"Tak\",\"duration\":\"Duur\",\"finished_at\":\"Voltooid\",\"image_url\":\"Afbeeldings URL\",\"message\":\"Bericht\",\"started_at\":\"Gestart\",\"tabs\":{\"branches\":\"Tak samenvatting\",\"build\":\"Bouw\",\"build_history\":\"Bouw geschiedenis\",\"current\":\"Huidig\",\"job\":\"Taak\"},\"commit\":\"Commit\",\"markdown\":\"Markdown\",\"rdoc\":\"RDOC\",\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Duur\"},\"statistics\":{\"index\":{\"build_count\":\"Bouw aantal\",\"count\":\"Aantal\",\"last_month\":\"voorbije maand\",\"repo_growth\":\"Repository groei\",\"total_builds\":\"Bouw totaal\",\"total_projects\":\"Projecten/Repository totaal\"}},\"workers\":\"Machines\",\"home\":{\"name\":\"Hoofdpagina\"}},\"pl\":{\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} godzina\",\"other\":\"%{count} godziny\"},\"minutes_exact\":{\"one\":\"%{count} minuta\",\"other\":\"%{count} minuty\"},\"seconds_exact\":{\"one\":\"%{count} sekunda\",\"other\":\"%{count} sekundy\"}}},\"workers\":\"Workers\",\"queue\":\"Kolejka\",\"no_job\":\"Brak zadań\",\"repositories\":{\"branch\":\"Gałąź\",\"image_url\":\"URL obrazka\",\"markdown\":\"Markdown\",\"textile\":\"Textile\",\"rdoc\":\"RDOC\",\"commit\":\"Commit\",\"message\":\"Opis\",\"started_at\":\"Rozpoczęto\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\",\"tabs\":{\"current\":\"Aktualny\",\"build_history\":\"Historia Buildów\",\"branches\":\"Wszystkie Gałęzie\",\"build\":\"Build\",\"job\":\"Zadanie\"}},\"build\":{\"job\":\"Zadanie\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\"},\"jobs\":{\"messages\":{\"sponsored_by\":\"Te testy zostały uruchomione na maszynie sponsorowanej przez\"},\"build_matrix\":\"Macierz Buildów\",\"allowed_failures\":\"Dopuszczalne Niepowodzenia\",\"author\":\"Autor\",\"config\":\"Konfiguracja\",\"compare\":\"Porównanie\",\"committer\":\"Committer\",\"branch\":\"Gałąź\",\"commit\":\"Commit\",\"message\":\"Opis\",\"started_at\":\"Rozpoczęto\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\",\"sponsored_by\":\"Te testy zostały uruchomione na maszynie sponsorowanej przez\"},\"builds\":{\"name\":\"Build\",\"messages\":{\"sponsored_by\":\"Te testy zostały uruchomione na maszynie sponsorowanej przez\"},\"build_matrix\":\"Macierz Buildów\",\"allowed_failures\":\"Dopuszczalne Niepowodzenia\",\"author\":\"Autor\",\"config\":\"Konfiguracja\",\"compare\":\"Porównanie\",\"committer\":\"Komitujący\",\"branch\":\"Gałąź\",\"commit\":\"Commit\",\"message\":\"Opis\",\"started_at\":\"Rozpoczęto\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\"},\"layouts\":{\"top\":{\"home\":\"Start\",\"blog\":\"Blog\",\"docs\":\"Dokumentacja\",\"stats\":\"Statystki\",\"github_login\":\"Zaloguj się przy pomocy Githuba\",\"profile\":\"Profil\",\"sign_out\":\"Wyloguj się\"},\"application\":{\"fork_me\":\"Fork me on Github\",\"recent\":\"Ostatnie\",\"search\":\"Wyniki\",\"sponsers\":\"Sponsorzy\",\"sponsors_link\":\"Zobacz naszych wszystkich wspaniałych sponsorów &rarr;\",\"my_repositories\":\"Moje repozytoria\"},\"about\":{\"alpha\":\"To wciąż jest wersja alpha.\",\"messages\":{\"alpha\":\"Proszę <strong>nie</strong> traktuj tego jako stabilnej usługi. Wciąż nam wiele do tego brakuje! Więcej informacji znajdziesz <a href='https://github.com/travis-ci'>tutaj.</a>\"},\"join\":\"Pomóż i dołącz do nas!\",\"mailing_list\":\"Lista mailingowa\",\"repository\":\"Repozytorium\",\"twitter\":\"Twitter\"},\"mobile\":{\"author\":\"Autor\",\"build\":\"Build\",\"build_matrix\":\"Macierz Buildów\",\"commit\":\"Commit\",\"committer\":\"Komitujący\",\"compare\":\"Porównianie\",\"config\":\"Konfiguracja\",\"duration\":\"Czas trwania\",\"finished_at\":\"Zakończono\",\"job\":\"Zadanie\",\"log\":\"Log\"}},\"profiles\":{\"show\":{\"email\":\"Email\",\"github\":\"Github\",\"message\":{\"your_repos\":\"  Przesuń suwak poniżej, aby włączyć Travisa, dla twoich projektów, a następnie umieść swój kod na GitHubie.<br />\\n Aby testować swój kod przy użyciu wielu wersji Rubiego, zobacz\",\"config\":\"jak skonfigurować niestandardowe opcje builda\"},\"messages\":{\"notice\":\"Aby zacząć, przeczytaj nasz <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Przewodnik </a>.\\n  <small>Zajmie ci to tylko kilka minut.</small>\"},\"token\":\"Token\",\"your_repos\":\"Twoje repozytoria\"}},\"statistics\":{\"index\":{\"count\":\"Ilość\",\"repo_growth\":\"Przyrost repozytoriów\",\"total_projects\":\"Łącznie projektów/repozytoriów\",\"build_count\":\"Liczba buildów\",\"last_month\":\"ostatni miesiąc\",\"total_builds\":\"Łącznie Buildów\"}},\"date\":{\"abbr_day_names\":[\"nie\",\"pon\",\"wto\",\"śro\",\"czw\",\"pią\",\"sob\"],\"abbr_month_names\":[\"sty\",\"lut\",\"mar\",\"kwi\",\"maj\",\"cze\",\"lip\",\"sie\",\"wrz\",\"paź\",\"lis\",\"gru\"],\"day_names\":[\"niedziela\",\"poniedziałek\",\"wtorek\",\"środa\",\"czwartek\",\"piątek\",\"sobota\"],\"formats\":{\"default\":\"%d-%m-%Y\",\"long\":\"%B %d, %Y\",\"short\":\"%d %b\"},\"month_names\":[\"styczeń\",\"luty\",\"marzec\",\"kwiecień\",\"maj\",\"czerwiec\",\"lipiec\",\"sierpień\",\"wrzesień\",\"październik\",\"listopad\",\"grudzień\"],\"order\":[\"day\",\"month\",\"year\"]},\"errors\":{\"format\":\"%{attribute} %{message}\",\"messages\":{\"accepted\":\"musi zostać zaakceptowane\",\"blank\":\"nie może być puste\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}},\"pt-BR\":{\"admin\":{\"actions\":{\"create\":\"criar\",\"created\":\"criado\",\"delete\":\"deletar\",\"deleted\":\"deletado\",\"update\":\"atualizar\",\"updated\":\"atualizado\"},\"credentials\":{\"log_out\":\"Deslogar\"},\"dashboard\":{\"add_new\":\"Adicionar novo\",\"ago\":\"atrás\",\"last_used\":\"Última utilização\",\"model_name\":\"Nome do modelo\",\"modify\":\"Modificar\",\"name\":\"Dashboard\",\"pagename\":\"Administração do site\",\"records\":\"Registros\",\"show\":\"Mostrar\"},\"delete\":{\"confirmation\":\"Sim, tenho certeza\",\"flash_confirmation\":\"%{name} foi destruído com sucesso\"},\"flash\":{\"error\":\"%{name} falhou ao %{action}\",\"noaction\":\"Nenhuma ação foi tomada\",\"successful\":\"%{name} foi %{action} com sucesso\"},\"history\":{\"name\":\"Histórico\",\"no_activity\":\"Nenhuma Atividade\",\"page_name\":\"Histórico para %{name}\"},\"list\":{\"add_new\":\"Adicionar novo\",\"delete_action\":\"Deletar\",\"delete_selected\":\"Deletar selecionados\",\"edit_action\":\"Editar\",\"search\":\"Buscar\",\"select\":\"Selecionar %{name} para editar\",\"select_action\":\"Selecionar\",\"show_all\":\"Mostrar todos\"},\"new\":{\"basic_info\":\"Informações básicas\",\"cancel\":\"Cancelar\",\"chosen\":\"Escolhido %{name}\",\"chose_all\":\"Escolher todos\",\"clear_all\":\"Limpar todos\",\"many_chars\":\"caracteres ou menos.\",\"one_char\":\"caractere.\",\"optional\":\"Opcional\",\"required\":\"Requerido\",\"save\":\"Salvar\",\"save_and_add_another\":\"Salvar e adicionar outro\",\"save_and_edit\":\"Salvar e alterar\",\"select_choice\":\"Selecione e clique\"}},\"build\":{\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"job\":\"Trabalho\"},\"builds\":{\"allowed_failures\":\"Falhas Permitidas\",\"author\":\"Autor\",\"branch\":\"Branch\",\"build_matrix\":\"Matriz de Build\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Comparar\",\"config\":\"Config\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"message\":\"Mensagem\",\"messages\":{\"sponsored_by\":\"Esta série de testes foi executada em uma caixa de processos patrocinada por\"},\"name\":\"Build\",\"started_at\":\"Iniciou em\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} hora\",\"other\":\"%{count} horas\"},\"minutes_exact\":{\"one\":\"%{count} minuto\",\"other\":\"%{count} minutos\"},\"seconds_exact\":{\"one\":\"%{count} segundo\",\"other\":\"%{count} segundos\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Sua conta foi confirmada com sucesso. Você agora está logado.\",\"send_instructions\":\"Você receberá um email com instruções de como confirmar sua conta em alguns minutos.\"},\"failure\":{\"inactive\":\"Sua conta ainda não foi ativada.\",\"invalid\":\"Email ou senha inválidos.\",\"invalid_token\":\"Token de autenticação inválido.\",\"locked\":\"Sua conta está trancada.\",\"timeout\":\"Sua sessão expirou, por favor faça seu login novamente.\",\"unauthenticated\":\"Você precisa fazer o login ou cadastrar-se antes de continuar.\",\"unconfirmed\":\"Você precisa confirmar sua conta antes de continuar.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Instruções de confirmação\"},\"reset_password_instructions\":{\"subject\":\"Instruções de atualização de senha\"},\"unlock_instructions\":{\"subject\":\"Instruções de destrancamento\"}},\"passwords\":{\"send_instructions\":\"Você receberá um email com instruções de como atualizar sua senha em alguns minutos.\",\"updated\":\"Sua senha foi alterada com sucesso. Você agora está logado.\"},\"registrations\":{\"destroyed\":\"Tchau! Sua conta foi cancelada com sucesso. Esperamos vê-lo novamente em breve!\",\"signed_up\":\"Você se cadastrou com sucesso. Se ativada, uma confirmação foi enviada para seu email.\",\"updated\":\"Você atualizou sua conta com sucesso.\"},\"sessions\":{\"signed_in\":\"Logado com sucesso.\",\"signed_out\":\"Deslogado com sucesso.\"},\"unlocks\":{\"send_instructions\":\"Você receberá um email com instruções de como destrancar sua conta em alguns minutos.\",\"unlocked\":\"Sua conta foi destrancada com sucesso. Você agora está logado.\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"já foi confirmado\",\"not_found\":\"não encontrado\",\"not_locked\":\"não estava trancado\"}},\"home\":{\"name\":\"home\"},\"jobs\":{\"allowed_failures\":\"Falhas Permitidas\",\"author\":\"Autor\",\"branch\":\"Branch\",\"build_matrix\":\"Matriz de Build\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Comparar\",\"config\":\"Config\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"message\":\"Mensagem\",\"messages\":{\"sponsored_by\":\"Esta série de testes foi executada em uma caixa de processos patrocinada por\"},\"started_at\":\"Iniciou em\"},\"layouts\":{\"about\":{\"alpha\":\"Isto é um alpha.\",\"join\":\"Junte-se à nós e ajude!\",\"mailing_list\":\"Lista de email\",\"messages\":{\"alpha\":\"Por favor, <strong>não</strong> considere isto um serviço estável. Estamos muito longe disso! Mais informações <a href='https://github.com/travis-ci'>aqui.</a>\"},\"repository\":\"Repositório\",\"twitter\":\"Twitter\"},\"application\":{\"fork_me\":\"Faça fork no Github\",\"my_repositories\":\"Meus Repositórios\",\"recent\":\"Recentes\",\"search\":\"Buscar\",\"sponsers\":\"Patrocinadores\",\"sponsors_link\":\"Conheça todos os nossos patrocinadores &rarr;\"},\"mobile\":{\"author\":\"Autor\",\"build\":\"Build\",\"build_matrix\":\"Matriz de Build\",\"commit\":\"Commit\",\"committer\":\"Committer\",\"compare\":\"Comparar\",\"config\":\"Config\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"job\":\"Trabalho\",\"log\":\"Log\"},\"top\":{\"admin\":\"Admin\",\"blog\":\"Blog\",\"docs\":\"Documentação\",\"github_login\":\"Logue com o Github\",\"home\":\"Home\",\"profile\":\"Perfil\",\"sign_out\":\"Sair\",\"stats\":\"Estatísticas\"}},\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"fr\":\"Français\",\"ja\":\"日本語\",\"nb\":\"Norsk Bokmål\",\"nl\":\"Nederlands\",\"pl\":\"Polski\",\"ru\":\"Русский\",\"pt-BR\":\"português brasileiro\"},\"no_job\":\"Não há trabalhos\",\"profiles\":{\"show\":{\"email\":\"Email\",\"github\":\"Github\",\"message\":{\"config\":\"como configurar opções de build\",\"your_repos\":\"Use os botões abaixo para ligar ou desligar o hook de serviço do Travis para seus projetos, e então, faça um push para o Github.<br />Para testar com múltiplas versões do Ruby, leia\"},\"messages\":{\"notice\":\"Para começar, leia nosso <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Guia de início</a>. <small>Só leva alguns minutinhos.</small>\"},\"token\":\"Token\",\"update\":\"Atualizar\",\"update_locale\":\"Atualizar\",\"your_locale\":\"Sua língua\",\"your_repos\":\"Seus Repositórios\"}},\"queue\":\"Fila\",\"repositories\":{\"branch\":\"Branch\",\"commit\":\"Commit\",\"duration\":\"Duração\",\"finished_at\":\"Concluído em\",\"image_url\":\"URL da imagem\",\"markdown\":\"Markdown\",\"message\":\"Mensagem\",\"rdoc\":\"RDOC\",\"started_at\":\"Iniciou em\",\"tabs\":{\"branches\":\"Sumário do Branch\",\"build\":\"Build\",\"build_history\":\"Histórico de Build\",\"current\":\"Atual\",\"job\":\"Trabalho\"},\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Duração\"},\"statistics\":{\"index\":{\"build_count\":\"Número de Builds\",\"count\":\"Número\",\"last_month\":\"último mês\",\"repo_growth\":\"Crescimento de Repositório\",\"total_builds\":\"Total de Builds\",\"total_projects\":\"Total de Projetos/Repositórios\"}},\"workers\":\"Processos\"},\"ru\":{\"admin\":{\"actions\":{\"create\":\"создать\",\"created\":\"создано\",\"delete\":\"удалить\",\"deleted\":\"удалено\",\"update\":\"обновить\",\"updated\":\"обновлено\"},\"credentials\":{\"log_out\":\"Выход\"},\"dashboard\":{\"add_new\":\"Добавить\",\"ago\":\"назад\",\"last_used\":\"Использовалось в последний раз\",\"model_name\":\"Имя модели\",\"modify\":\"Изменить\",\"name\":\"Панель управления\",\"pagename\":\"Управление сайтом\",\"records\":\"Записи\",\"show\":\"Показать\"},\"delete\":{\"confirmation\":\"Да, я уверен\",\"flash_confirmation\":\"%{name} успешно удалено\"},\"history\":{\"name\":\"История\",\"no_activity\":\"Нет активности\",\"page_name\":\"История %{name}\"},\"list\":{\"add_new\":\"Добавить\",\"delete_action\":\"Удалить\",\"delete_selected\":\"Удалить выбранные\",\"edit_action\":\"Редактировать\",\"search\":\"Поиск\",\"select\":\"Для редактирования выберите %{name}\",\"select_action\":\"Выбрать\",\"show_all\":\"Показать все\"},\"new\":{\"basic_info\":\"Основная информация\",\"cancel\":\"Отмена\",\"chosen\":\"Выбрано %{name}\",\"chose_all\":\"Выбрать все\",\"clear_all\":\"Очистить все\",\"one_char\":\"символ.\",\"optional\":\"Необязательно\",\"required\":\"Обязательно\",\"save\":\"Сохранить\",\"save_and_add_another\":\"Сохранить и добавить другое\",\"save_and_edit\":\"Сохранить и продолжить редактирование\",\"select_choice\":\"Выберите и кликните\",\"many_chars\":\"символов или меньше.\"},\"flash\":{\"error\":\"%{name} не удалось %{action}\",\"noaction\":\"Никаких действий не произведено\",\"successful\":\"%{name} было успешно %{action}\"}},\"build\":{\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"job\":\"Задача\"},\"builds\":{\"allowed_failures\":\"Допустимые неудачи\",\"author\":\"Автор\",\"branch\":\"Ветка\",\"build_matrix\":\"Матрица\",\"commit\":\"Коммит\",\"committer\":\"Коммитер\",\"compare\":\"Дифф\",\"config\":\"Конфигурация\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"message\":\"Комментарий\",\"messages\":{\"sponsored_by\":\"Эта серия тестов была запущена на машине, спонсируемой\"},\"name\":\"Билд\",\"started_at\":\"Начало\"},\"datetime\":{\"distance_in_words\":{\"hours_exact\":{\"one\":\"%{count} час\",\"few\":\"%{count} часа\",\"many\":\"%{count} часов\",\"other\":\"%{count} часа\"},\"minutes_exact\":{\"one\":\"%{count} минута\",\"few\":\"%{count} минуты\",\"many\":\"%{count} минут\",\"other\":\"%{count} минуты\"},\"seconds_exact\":{\"one\":\"%{count} секунда\",\"few\":\"%{count} секунды\",\"many\":\"%{count} секунд\",\"other\":\"%{count} секунды\"}}},\"devise\":{\"confirmations\":{\"confirmed\":\"Ваш аккаунт успешно подтвержден. Приветствуем!\",\"send_instructions\":\"В течении нескольких минут вы получите электронное письмо с инструкциями для прохождения процедуры подтверждения аккаунта.\"},\"failure\":{\"inactive\":\"Ваш аккаунт еще не активирован.\",\"invalid\":\"Ошибка в адресе почты или пароле.\",\"invalid_token\":\"Неправильный токен аутентификации.\",\"locked\":\"Ваш аккаунт заблокирован.\",\"timeout\":\"Сессия окончена. Для продолжения работы войдите снова.\",\"unauthenticated\":\"Вам нужно войти или зарегистрироваться.\",\"unconfirmed\":\"Вы должны сначала подтвердить свой аккаунт.\"},\"mailer\":{\"confirmation_instructions\":{\"subject\":\"Инструкции для подтверждению аккаунта\"},\"reset_password_instructions\":{\"subject\":\"Инструкции для сброса пароля\"},\"unlock_instructions\":{\"subject\":\"Инструкции для разблокирования аккаунта\"}},\"passwords\":{\"send_instructions\":\"В течении нескольких минут вы получите электронное письмо с инструкциями для сброса пароля.\",\"updated\":\"Ваш пароль успешно изменен. Приветствуем!\"},\"registrations\":{\"destroyed\":\"Ваш аккаунт был успешно удален. Живите долго и процветайте!\",\"signed_up\":\"Вы успешно прошли регистрацию. Инструкции для подтверждения аккаунта отправлены на ваш электронный адрес.\",\"updated\":\"Аккаунт успешно обновлен.\"},\"sessions\":{\"signed_in\":\"Приветствуем!\",\"signed_out\":\"Удачи!\"},\"unlocks\":{\"send_instructions\":\"В течении нескольких минут вы получите электронное письмо с инструкциям для разблокировния аккаунта.\",\"unlocked\":\"Ваш аккаунт успешно разблокирован. Приветствуем!\"}},\"errors\":{\"messages\":{\"already_confirmed\":\"уже подтвержден\",\"not_found\":\"не найден\",\"not_locked\":\"не заблокирован\"}},\"home\":{\"name\":\"Главная\"},\"jobs\":{\"allowed_failures\":\"Допустимые неудачи\",\"author\":\"Автор\",\"branch\":\"Ветка\",\"build_matrix\":\"Матрица\",\"commit\":\"Коммит\",\"committer\":\"Коммитер\",\"compare\":\"Сравнение\",\"config\":\"Конфигурация\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"message\":\"Комментарий\",\"messages\":{\"sponsored_by\":\"Эта серия тестов была запущена на машине спонсируемой\"},\"started_at\":\"Начало\"},\"layouts\":{\"about\":{\"alpha\":\"Это альфа-версия\",\"join\":\"Присоединяйтесь к нам и помогайте!\",\"mailing_list\":\"Лист рассылки\",\"messages\":{\"alpha\":\"Пожалуйста, <strong>не</strong> считайте данный сервис стабильным. Мы еще очень далеки от стабильности! <a href='https://github.com/travis-ci'>Подробности</a>\"},\"repository\":\"Репозиторий\",\"twitter\":\"Twitter\"},\"application\":{\"fork_me\":\"Fork me on Github\",\"my_repositories\":\"Мои репозитории\",\"recent\":\"Недавние\",\"search\":\"Поиск\",\"sponsers\":\"Спонсоры\",\"sponsors_link\":\"Список всех наших замечательных спонсоров &rarr;\"},\"mobile\":{\"author\":\"Автор\",\"build\":\"Сборка\",\"build_matrix\":\"Матрица сборок\",\"commit\":\"Коммит\",\"committer\":\"Коммитер\",\"compare\":\"Сравнение\",\"config\":\"Конфигурация\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"job\":\"Задача\",\"log\":\"Журнал\"},\"top\":{\"admin\":\"Управление\",\"blog\":\"Блог\",\"docs\":\"Документация\",\"github_login\":\"Войти через Github\",\"home\":\"Главная\",\"profile\":\"Профиль\",\"sign_out\":\"Выход\",\"stats\":\"Статистика\"}},\"no_job\":\"Очередь пуста\",\"profiles\":{\"show\":{\"email\":\"Электронная почта\",\"github\":\"Github\",\"message\":{\"config\":\"как настроить специальные опции билда\",\"your_repos\":\"Используйте переключатели, чтобы включить Travis service hook для вашего проекта, а потом отправьте код на GitHub.<br />\\nДля тестирования на нескольких версиях Ruby смотрите\"},\"messages\":{\"notice\":\"Перед началом, пожалуйста, прочтите <a href=\\\"http://about.travis-ci.org/docs/user/getting-started/\\\">Руководство для быстрого старта</a>. <small>Это займет всего несколько минут.</small>\"},\"token\":\"Токен\",\"update\":\"Обновить\",\"update_locale\":\"Обновить\",\"your_locale\":\"Ваш язык\",\"your_repos\":\"Ваши репозитории\"}},\"queue\":\"Очередь\",\"repositories\":{\"branch\":\"Ветка\",\"commit\":\"Коммит\",\"duration\":\"Длительность\",\"finished_at\":\"Завершен\",\"image_url\":\"URL изображения\",\"markdown\":\"Markdown\",\"message\":\"Комментарий\",\"rdoc\":\"RDOC\",\"started_at\":\"Начало\",\"tabs\":{\"branches\":\"Статус веток\",\"build\":\"Билд\",\"build_history\":\"История\",\"current\":\"Текущий\",\"job\":\"Задача\"},\"textile\":\"Textile\"},\"repository\":{\"duration\":\"Длительность\"},\"statistics\":{\"index\":{\"build_count\":\"Количество билдов\",\"count\":\"Количество\",\"last_month\":\"прошлый месяц\",\"repo_growth\":\"Рост числа репозиториев\",\"total_builds\":\"Всего билдов\",\"total_projects\":\"Всего проектов/репозиториев\"}},\"workers\":\"Машины\",\"locales\":{\"en\":\"English\",\"es\":\"Español\",\"ja\":\"日本語\",\"ru\":\"Русский\",\"fr\":\"Français\",\"nb\":\"Norsk Bokmål\",\"pl\":\"Polski\",\"nl\":\"Nederlands\",\"pt-BR\":\"português brasileiro\"}}};\n\n\n})();\n//@ sourceURL=config/locales");minispade.register('ext/ember/bound_helper', "(function() {// https://gist.github.com/2018185\n// For reference: https://github.com/wagenet/ember.js/blob/ac66dcb8a1cbe91d736074441f853e0da474ee6e/packages/ember-handlebars/lib/views/bound_property_view.js\nvar BoundHelperView = Ember.View.extend(Ember._Metamorph, {\n\n  context: null,\n  options: null,\n  property: null,\n  // paths of the property that are also observed\n  propertyPaths: [],\n\n  value: Ember.K,\n\n  valueForRender: function() {\n    var value = this.value(Ember.get(this.context, this.property), this.options);\n    if (this.options.escaped) { value = Handlebars.Utils.escapeExpression(value); }\n    return value;\n  },\n\n  render: function(buffer) {\n    buffer.push(this.valueForRender());\n  },\n\n  valueDidChange: function() {\n    if (this.morph.isRemoved()) { return; }\n    this.morph.html(this.valueForRender());\n  },\n\n  didInsertElement: function() {\n    this.valueDidChange();\n  },\n\n  init: function() {\n    this._super();\n    Ember.addObserver(this.context, this.property, this, 'valueDidChange');\n    this.get('propertyPaths').forEach(function(propName) {\n        Ember.addObserver(this.context, this.property + '.' + propName, this, 'valueDidChange');\n    }, this);\n  },\n\n  destroy: function() {\n    Ember.removeObserver(this.context, this.property, this, 'valueDidChange');\n    this.get('propertyPaths').forEach(function(propName) {\n        this.context.removeObserver(this.property + '.' + propName, this, 'valueDidChange');\n    }, this);\n    this._super();\n  }\n\n});\n\nEmber.registerBoundHelper = function(name, func) {\n  var propertyPaths = Array.prototype.slice.call(arguments, 2);\n  Ember.Handlebars.registerHelper(name, function(property, options) {\n    var data = options.data,\n        view = data.view,\n        ctx  = this;\n\n    var bindView = view.createChildView(BoundHelperView, {\n      property: property,\n      propertyPaths: propertyPaths,\n      context: ctx,\n      options: options.hash,\n      value: func\n    });\n\n    view.appendChild(bindView);\n  });\n};\n\n\n})();\n//@ sourceURL=ext/ember/bound_helper");minispade.register('ext/ember/namespace', "(function() {Em.Namespace.reopen = Em.Namespace.reopenClass\n\n\n\n})();\n//@ sourceURL=ext/ember/namespace");

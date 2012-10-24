@@ -32,3 +32,25 @@ require 'models'
 
   ajax: ->
     Travis.ajax.ajax.apply(this, arguments)
+
+@Travis.RestAdapter.map 'Travis.Branch',
+  repoId: { key: 'repository_id' }
+
+@Travis.RestAdapter.map 'Travis.Build',
+  repoId:    { key: 'repository_id' }
+  _duration: { key: 'duration'      }
+  repo:      { key: 'repository_id' }
+  jobs:      { key: 'job_ids'       }
+
+@Travis.RestAdapter.map 'Travis.Commit',
+  build: { key: 'buildId' }
+
+@Travis.RestAdapter.map 'Travis.Event',
+  repoId: { key: 'repository_id' }
+  sourceId: { key: 'source_id' }
+  sourceType: { key: 'source_type' }
+
+@Travis.RestAdapter.map 'Travis.Job',
+  repoId:    { key: 'repository_id' }
+  _duration: { key: 'duration'      }
+  repo:      { key: 'repository_id' }

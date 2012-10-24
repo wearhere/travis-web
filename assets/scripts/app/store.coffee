@@ -5,8 +5,8 @@ DATA_PROXY =
     @savedData[name]
 
 Travis.Store = DS.Store.extend
-  revision: 4
-  adapter: Travis.RestAdapter.create()
+  revision: 6
+  adapter: 'Travis.RestAdapter'
 
   init: ->
     @_super.apply this, arguments
@@ -31,38 +31,37 @@ Travis.Store = DS.Store.extend
   merge: (type, id, hash) ->
     if hash == undefined
       hash = id
-      primaryKey = type.proto().primaryKey
-      Ember.assert("A data hash was loaded for a record of type " + type.toString() + " but no primary key '" + primaryKey + "' was provided.", hash[primaryKey])
-      id = hash[primaryKey]
+      adapter = Ember.get(this, '_adapter')
+      id = adapter.extractId(type, hash)
+
+    id = id + ''
 
     typeMap     = @typeMapFor(type)
-    dataCache   = typeMap.cidToHash
+    cidToHash   = @clientIdToHash
     clientId    = typeMap.idToCid[id]
-    recordCache = @get('recordCache')
 
     if clientId != undefined
-      if data = dataCache[clientId]
+      if data = cidToHash[clientId]
         # trying to set id here fails, TODO: talk with ember core team to create merge-like function
         delete hash.id
         $.extend(data, hash)
       else
-        dataCache[clientId] = hash
+        cidToHash[clientId] = hash
 
-      if record = recordCache[clientId]
-        record.send('didChangeData')
+      if record = @recordCache[clientId]
+        record.loadedData();
     else
       clientId = @pushHash(hash, id, type)
 
     if clientId
-      DATA_PROXY.savedData = hash
-      @updateRecordArrays(type, clientId, DATA_PROXY)
+      @updateRecordArrays(type, clientId);
 
-      { id: id, clientId: clientId }
+      { id: id, clientId: clientId };
 
   receive: (event, data) ->
     [name, type] = event.split(':')
 
-    mappings = @adapter.get('mappings')
+    mappings = @get('_adapter.mappings')
     type = mappings[name]
 
     if event == 'job:log'
@@ -111,22 +110,9 @@ Travis.Store = DS.Store.extend
       unless record.get('complete')
         record.loadedAsIncomplete()
 
-      @_updateAssociations(type, type.singularName(), hash)
-
       record
 
   _loadMany: (store, type, json) ->
     root = type.pluralName()
     @adapter.sideload(store, type, json, root)
     @loadMany(type, json[root])
-
-  _updateAssociations: (type, name, data) ->
-    Em.get(type, 'associationsByName').forEach (key, meta) =>
-      if meta.kind == 'belongsTo'
-        id = data["#{key}_id"]
-        if clientId = @typeMapFor(meta.type).idToCid[id]
-          if parent = this.findByClientId(meta.type, clientId, id)
-            dataProxy = parent.get('data')
-            if ids = dataProxy.get("#{name}_ids")
-              ids.pushObject(data.id) unless data.id in ids
-              parent.send('didChangeData');

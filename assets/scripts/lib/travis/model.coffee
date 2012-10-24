@@ -1,6 +1,5 @@
 @Travis.Model = DS.Model.extend
   primaryKey: 'id'
-  id: DS.attr('number')
 
   init: ->
     @loadedAttributes = []
@@ -24,7 +23,7 @@
 
   isAttributeLoaded: (name) ->
     if meta = Ember.get(this.constructor, 'attributes').get(name)
-      name = meta.key(this.constructor)
+      name = DS.RESTSerializer._keyForAttributeName(this.constructor, name)
       @get('store').isDataLoadedFor(this.constructor, @get('clientId'), name)
 
   isComplete: (->
