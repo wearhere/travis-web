@@ -1,11 +1,9 @@
 @Travis.Auth = Ember.Object.extend
-  iframe: $('<iframe id="auth-frame" />').hide()
   timeout: 10000
   state: 'signed-out'
   receivingEnd: "#{location.protocol}//#{location.host}"
 
   init: ->
-    @iframe.appendTo('body')
     window.addEventListener('message', (e) => @receiveMessage(e))
 
   accessToken: (->
@@ -37,7 +35,7 @@
 
   trySignIn: ->
     console.log 'trySignIn', "#{@endpoint}/auth/post_message?origin=#{@receivingEnd}"
-    @iframe.attr('src', "#{@endpoint}/auth/post_message?origin=#{@receivingEnd}")
+    window.open("#{@endpoint}/auth/post_message?origin=#{@receivingEnd}", "Signing in...", "height=150,width=500")
 
   checkSignIn: ->
     @forceSignIn() if @get('state') == 'signing-in'
