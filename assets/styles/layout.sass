@@ -4,10 +4,12 @@ $left-width: 250px
 
 @mixin display-flex
   display: -webkit-flex
+  display: -ms-flex
   display: flex
 
 @mixin flex($grow, $shrink, $size)
   -webkit-flex: $grow $shrink $size
+  -ms-flex:     $grow $shrink $size
   flex:         $grow $shrink $size
 
 html, body
@@ -20,6 +22,7 @@ html, body
   display: -webkit-box
   @include display-flex
   display: -moz-box
+  display: -ms-box
 
 #top
   position: absolute
@@ -53,6 +56,7 @@ html, body
   @include flex(1, 1, 70%)
   -moz-box-flex: 4
   -webkit-box-flex: 4
+  -ms-box-flex: 4
   position: relative
   min-width: 630px
   padding: 20px 40px 80px 30px
