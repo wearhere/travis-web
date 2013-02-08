@@ -1,14 +1,4 @@
 Travis.reopen
-  SidebarController: Em.ArrayController.extend
-    init: ->
-      @tickables = []
-      Travis.Ticker.create(target: this, interval: Travis.INTERVALS.sponsors)
-
-    tick: ->
-      tickable.tick() for tickable in @tickables
-
-  QueuesController: Em.ArrayController.extend()
-
   WorkersController: Em.ArrayController.extend
     groups: (->
       if content = @get 'arrangedContent'
@@ -24,6 +14,28 @@ Travis.reopen
 
         $.values(groups)
     ).property('length')
+
+Travis.reopen
+  SidebarController: Em.ArrayController.extend
+    workersController: Travis.WorkersController.create()
+    jobsController: Travis.JobsController.create()
+
+    init: ->
+      @tickables = []
+      Travis.Ticker.create(target: this, interval: Travis.INTERVALS.sponsors)
+      @connectTab('workers')
+
+    connectTab: (tab) ->
+      viewClass = Travis["#{$.camelize(tab)}View"]
+      controller = @["#{tab}Controller"]
+
+      @set('tab', tab)
+      @connectOutlet(outletName: 'pane', controller: controller, viewClass: viewClass)
+
+    tick: ->
+      tickable.tick() for tickable in @tickables
+
+  QueuesController: Em.ArrayController.extend()
 
   SponsorsController: Em.ArrayController.extend
     page: 0

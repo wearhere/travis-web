@@ -28,7 +28,7 @@
 
     WorkersView: Em.View.extend
       templateName: 'workers/list'
-      controller: Travis.WorkersController.create()
+      # controller: Travis.WorkersController.create()
 
       didInsertElement: ->
         @set 'controller.content', Travis.Worker.find()
@@ -51,10 +51,10 @@
         @set 'controller.content', queues
         @_super.apply this, arguments
 
-    RunningJobsView: Em.View.extend
+    JobsView: Em.View.extend
       templateName: 'jobs/running'
       elementId: 'running-jobs'
-      controller: Travis.RunningJobsController.create()
+      # controller: Travis.JobsController.create()
 
       groupsBinding: 'controller.sortedGroups'
 
