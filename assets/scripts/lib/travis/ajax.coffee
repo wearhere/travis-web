@@ -28,7 +28,7 @@ Travis.ajax = Em.Object.create
     endpoint = Travis.config.api_endpoint || ''
     options = options || {}
 
-    token = Travis.sessionStorage.getItem('travis.token')
+    token = Travis.__container__.lookup('controller:currentUser').get('token')
     if token && Travis.ajax.needsAuth(method, url)
       options.headers ||= {}
       options.headers['Authorization'] ||= "token #{token}"
