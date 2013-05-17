@@ -1,4 +1,4 @@
-source 'http://rubygems.org'
+source 'https://rubygems.org'
 ruby '1.9.3'
 
 gem 'puma'
@@ -84,6 +84,7 @@ module ::Bundler
         raise Bundler::InstallError, msg
       end
     rescue Exception => e
+      puts e.backtrace.join("\n")
       # install hook failed
       raise e if e.is_a?(Bundler::InstallHookError) || e.is_a?(Bundler::SecurityError)
 
