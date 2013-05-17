@@ -48,40 +48,42 @@ module ::Bundler
 
     def install_gem_from_spec(spec, standalone = false)
       retries = 1
-      # Download the gem to get the spec, because some specs that are returned
-      # by rubygems.org are broken and wrong.
-      Bundler::Fetcher.fetch(spec) if spec.source.is_a?(Bundler::Source::Rubygems)
+      begin
+        # Download the gem to get the spec, because some specs that are returned
+        # by rubygems.org are broken and wrong.
+        Bundler::Fetcher.fetch(spec) if spec.source.is_a?(Bundler::Source::Rubygems)
 
-      # Fetch the build settings, if there are any
-      settings = Bundler.settings["build.#{spec.name}"]
-      Bundler.rubygems.with_build_args [settings] do
-        spec.source.install(spec)
-        Bundler.ui.debug "from #{spec.loaded_from} "
-      end
+        # Fetch the build settings, if there are any
+        settings = Bundler.settings["build.#{spec.name}"]
+        Bundler.rubygems.with_build_args [settings] do
+          spec.source.install(spec)
+          Bundler.ui.debug "from #{spec.loaded_from} "
+        end
 
-      # newline comes after installing, some gems say "with native extensions"
-      Bundler.ui.info ""
-      if Bundler.settings[:bin] && standalone
-        generate_standalone_bundler_executable_stubs(spec)
-      elsif Bundler.settings[:bin]
-        generate_bundler_executable_stubs(spec, :force => true)
-      end
+        # newline comes after installing, some gems say "with native extensions"
+        Bundler.ui.info ""
+        if Bundler.settings[:bin] && standalone
+          generate_standalone_bundler_executable_stubs(spec)
+        elsif Bundler.settings[:bin]
+          generate_bundler_executable_stubs(spec, :force => true)
+        end
 
-      FileUtils.rm_rf(Bundler.tmp)
-    rescue Gem::RemoteFetcher::FetchError => e
-      if retries <= MAX_RETRIES
-        Bundler.ui.warn "#{e.class}: #{e.message}"
-        Bundler.ui.warn "Installing #{spec.name} (#{spec.version}) failed."
-        Bundler.ui.warn "Retrying (#{retries}/#{MAX_RETRIES})"
-        retries += 1
-        sleep retries
-        retry
-      else
-        Bundler.ui.warn "Installing #{spec.name} (#{spec.version}) failed after #{retries} retries: #{e.message}."
-        Bundler.ui.warn "Giving up"
-        msg = "An error, most likely because of network issues, has occurred trying to install #{spec.name} (#{spec.version}), "
-        msg << "and Bundler cannot continue."
-        raise Bundler::InstallError, msg
+        FileUtils.rm_rf(Bundler.tmp)
+      rescue Gem::RemoteFetcher::FetchError => e
+        if retries <= MAX_RETRIES
+          Bundler.ui.warn "#{e.class}: #{e.message}"
+          Bundler.ui.warn "Installing #{spec.name} (#{spec.version}) failed."
+          Bundler.ui.warn "Retrying (#{retries}/#{MAX_RETRIES})"
+          retries += 1
+          sleep retries
+          retry
+        else
+          Bundler.ui.warn "Installing #{spec.name} (#{spec.version}) failed after #{retries} retries: #{e.message}."
+          Bundler.ui.warn "Giving up"
+          msg = "An error, most likely because of network issues, has occurred trying to install #{spec.name} (#{spec.version}), "
+          msg << "and Bundler cannot continue."
+          raise Bundler::InstallError, msg
+        end
       end
     rescue Exception => e
       puts e.backtrace.join("\n")
