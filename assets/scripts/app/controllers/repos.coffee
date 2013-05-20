@@ -1,8 +1,6 @@
 require 'travis/limited_array'
 
 Travis.ReposController = Ember.ArrayController.extend
-  sortProperties: ['sortOrder']
-
   defaultTab: ( ->
     if @get('currentUser.id')
       'owned'
