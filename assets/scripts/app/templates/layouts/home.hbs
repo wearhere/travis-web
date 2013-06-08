@@ -1,12 +1,18 @@
 <div id="top">
-  {{outlet top}}
-</div>
-
-<div id="left">
-  {{outlet left}}
+  <div class="wrapper">
+    {{outlet top}}
+  </div>
 </div>
 
 <div id="main">
-  {{outlet flash}}
-  {{outlet main}}
+  <div class="wrapper">
+    {{outlet flash}}
+    {{outlet main}}
+  </div>
+</div>
+
+<div id="footer">
+  <div class="wrapper">
+    {{outlet footer}}
+  </div>
 </div>
