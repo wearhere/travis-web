@@ -104,6 +104,7 @@ Travis.Router.map ->
       @resource 'branches', path: '/branches'
 
   @route 'explore'
+  @route 'dashboard'
   @route 'stats', path: '/stats'
   @route 'auth', path: '/auth'
   @route 'notFound', path: '/not-found'
@@ -119,6 +120,26 @@ Travis.ApplicationRoute = Ember.Route.extend Travis.LineNumberParser,
     @_super.apply this, arguments
 
     this.controllerFor('repo').set('lineNumber', @fetchLineNumber())
+
+Travis.LandingPageRoute = Ember.Route.extend
+  setupController: ->
+    $('body').attr('id', 'home')
+    @controllerFor('application').connectLayout('home')
+    @_super.apply(this, arguments)
+
+  renderTemplate: ->
+    @render 'top', outlet: 'top'
+    @_super.apply(this, arguments)
+
+Travis.DashboardRoute = Ember.Route.extend
+  setupController: ->
+    $('body').attr('id', 'home')
+    @controllerFor('application').connectLayout('home')
+    @_super.apply(this, arguments)
+
+  renderTemplate: ->
+    @render 'top', outlet: 'top'
+    @_super.apply(this, arguments)
 
 Travis.ExploreRoute = Ember.Route.extend
   setupController: ->
