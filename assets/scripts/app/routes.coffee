@@ -103,6 +103,7 @@ Travis.Router.map ->
       @resource 'pullRequests', path: '/pull_requests'
       @resource 'branches', path: '/branches'
 
+  @route 'explore'
   @route 'stats', path: '/stats'
   @route 'auth', path: '/auth'
   @route 'notFound', path: '/not-found'
@@ -118,6 +119,16 @@ Travis.ApplicationRoute = Ember.Route.extend Travis.LineNumberParser,
     @_super.apply this, arguments
 
     this.controllerFor('repo').set('lineNumber', @fetchLineNumber())
+
+Travis.ExploreRoute = Ember.Route.extend
+  setupController: ->
+    $('body').attr('id', 'home')
+    @controllerFor('application').connectLayout('home')
+    @_super.apply(this, arguments)
+
+  renderTemplate: ->
+    @render 'top', outlet: 'top'
+    @_super.apply(this, arguments)
 
 Travis.SetupLastBuild = Ember.Mixin.create
   setupController: ->
@@ -141,6 +152,10 @@ Travis.SetupLastBuild = Ember.Mixin.create
     @controllerFor('build').set('build', build)
 
 Travis.IndexCurrentRoute = Ember.Route.extend Travis.DontSetupModelForControllerMixin, Travis.SetupLastBuild,
+  redirect: ->
+    unless @signedIn()
+      @transitionTo('explore')
+
   renderTemplate: ->
     @render 'repo'
     @render 'build', outlet: 'pane', into: 'repo'
