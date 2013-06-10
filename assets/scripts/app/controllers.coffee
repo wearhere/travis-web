@@ -26,6 +26,7 @@ Travis.AccountProfileController = Em.Controller.extend
 require 'controllers/accounts'
 require 'controllers/build'
 require 'controllers/builds'
+require 'controllers/explore'
 require 'controllers/flash'
 require 'controllers/home'
 require 'controllers/job'
