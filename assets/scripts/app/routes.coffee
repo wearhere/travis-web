@@ -145,10 +145,12 @@ Travis.ExploreRoute = Ember.Route.extend
   setupController: ->
     $('body').attr('id', 'home')
     @controllerFor('application').connectLayout('home')
+    @controllerFor('explore').activate()
     @_super.apply(this, arguments)
 
   renderTemplate: ->
     @render 'top', outlet: 'top'
+    @render 'explore'
     @_super.apply(this, arguments)
 
 Travis.SetupLastBuild = Ember.Mixin.create

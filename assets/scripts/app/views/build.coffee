@@ -53,3 +53,20 @@ Travis.reopen
     color: (->
       Travis.Helpers.colorForState(@get('controller.build.state'))
     ).property('controller.build.state')
+
+  BuildsListView: Em.CollectionView.extend
+    elementId: 'repos'
+    tagName: 'ul'
+
+    emptyView: Ember.View.extend
+      template: Ember.Handlebars.compile('<div class="loading"><span>Loading</span></div>')
+
+    itemViewClass: Travis.View.extend
+      buildBinding: 'content'
+      classNames: ['repo']
+      classNameBindings: ['color']
+
+      color: (->
+        Travis.Helpers.colorForState(@get('build.state'))
+      ).property('build.state')
+
