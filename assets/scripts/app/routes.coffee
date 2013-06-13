@@ -141,7 +141,8 @@ Travis.SetupLastBuild = Ember.Mixin.create
     # TODO: it would be nicer to do it with promises
     repo = @controllerFor('repo').get('repo')
     if repo && repo.get('isLoaded') && !repo.get('lastBuild')
-      @render('builds/not_found', outlet: 'pane', into: 'repo')
+      Ember.run.next =>
+        @render('builds/not_found', outlet: 'pane', into: 'repo')
 
   lastBuildDidChange: ->
     build = @controllerFor('repo').get('repo.lastBuild')
@@ -279,7 +280,8 @@ Travis.RepoRoute = Ember.Route.extend Travis.DontSetupModelForControllerMixin,
         proxy.set 'isLoading', false
 
         if repos.get('length') == 0
-          self.render('repos/not_found', outlet: 'main')
+          Ember.run.next ->
+            self.render('repos/not_found', outlet: 'main')
         else
           proxy.set 'content', repos.objectAt(0)
 
