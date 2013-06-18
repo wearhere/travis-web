@@ -15,6 +15,12 @@ Travis.ReposController = Ember.ArrayController.extend
       @activate('recent')
   ).observes('currentUser.id')
 
+  tabOrIsLoadedDidChange: (->
+    if @get('tab') == 'owned' && @get('isLoaded') && @get('length') == 0
+
+      @container.lookup('router:main').send('renderNoOwnedRepos')
+  ).observes('isLoaded', 'tab')
+
   isLoadedBinding: 'content.isLoaded'
   needs: ['currentUser', 'repo']
   currentUserBinding: 'controllers.currentUser'
@@ -43,6 +49,10 @@ Travis.ReposController = Ember.ArrayController.extend
   updateTimes: ->
     if content = @get('content')
       content.forEach (r) -> r.updateTimes()
+
+  transitionToRoot: ->
+    @container.lookup('router:main').send('renderDefaultTemplate')
+    @container.lookup('router:main').transitionTo('index.current')
 
   activate: (tab, params) ->
     @set('sortProperties', ['sortOrder'])

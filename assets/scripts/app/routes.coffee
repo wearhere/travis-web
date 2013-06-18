@@ -52,6 +52,12 @@ Ember.Router.reopen
 #       a better way (like "parent" resource for everything inside map)
 Ember.Route.reopen
   events:
+    renderDefaultTemplate: ->
+      @renderDefaultTemplate() if @renderDefaultTemplate
+
+    renderNoOwnedRepos: ->
+      @render('no_owned_repos', outlet: 'main')
+
     afterSignIn: (path) ->
       @afterSignIn(path)
 
@@ -105,6 +111,7 @@ Travis.Router.map ->
 
   @route 'explore'
   @route 'dashboard'
+  @route 'getting_started'
   @route 'stats', path: '/stats'
   @route 'auth', path: '/auth'
   @route 'notFound', path: '/not-found'
@@ -173,6 +180,18 @@ Travis.SetupLastBuild = Ember.Mixin.create
   lastBuildDidChange: ->
     build = @controllerFor('repo').get('repo.lastBuild')
     @controllerFor('build').set('build', build)
+
+Travis.GettingStartedRoute = Ember.Route.extend
+  setupController: ->
+    $('body').attr('id', 'home')
+    @container.lookup('controller:repos').activate()
+    @container.lookup('controller:application').connectLayout 'home'
+    @_super.apply(this, arguments)
+
+  renderTemplate: ->
+    @render 'top', outlet: 'top'
+    @render 'repos',   outlet: 'left'
+    @_super.apply(this, arguments)
 
 Travis.IndexCurrentRoute = Ember.Route.extend Travis.DontSetupModelForControllerMixin, Travis.SetupLastBuild,
   redirect: ->
