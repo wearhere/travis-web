@@ -15,7 +15,8 @@ require 'travis/model'
   build: DS.belongsTo('Travis.Build')
 
   shortSha: (->
-    @get('sha')[0...6]
+    if sha = @get('sha')
+      sha[0...6]
   ).property('sha')
 
   isPullRequest: (->
