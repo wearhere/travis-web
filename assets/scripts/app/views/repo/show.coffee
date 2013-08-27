@@ -112,6 +112,17 @@ Travis.reopen
       view.appendTo($('body'))
       event.stopPropagation()
 
+    encryptConfig: ->
+      @set('active', true)
+      @closeMenu()
+      @popupCloseAll()
+      view = Travis.EncryptConfigView.create(toolsView: this)
+      # TODO: create a general mechanism for managing current popup
+      #       and move all popups to use it
+      Travis.View.currentPopupView = view
+      view.appendTo($('body'))
+      event.stopPropagation()
+
     regenerateKeyPopup: ->
       if @get('canRegenerateKey')
         @set('active', true)

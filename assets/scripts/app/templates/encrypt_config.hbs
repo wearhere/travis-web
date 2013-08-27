@@ -1,0 +1,8 @@
+<a href="#" class="close" {{action "close" target="view"}}></a>
+<p>
+  <label>Value:</label>
+  {{controller}}
+  <form {{action "doSomething" on="submit"}}>
+    {{input value=something}}
+  </form>
+</p>

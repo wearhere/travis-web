@@ -27,6 +27,7 @@ Travis.GettingStartedView = Travis.View.extend
 require 'views/accounts'
 require 'views/application'
 require 'views/build'
+require 'views/encrypt_config'
 require 'views/events'
 require 'views/flash'
 require 'views/job'
