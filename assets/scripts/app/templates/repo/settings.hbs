@@ -5,6 +5,14 @@
     {{#travis-tab "general" "General Settings"}}
       {{#settings-form}}
         <p>
+          <a {{action "toggle" hook}} class="switch">
+            {{#if hook.active}}
+              ON
+            {{else}}
+              OFF
+            {{/if}}
+          </a>
+
           {{settings-input checked=builds_only_with_travis_yml type="checkbox" id="builds-only-with-travis-yml"}}
             <label for="builds-only-with-travis-yml">Build only commits with .travis.yml file</label>
         </p>
