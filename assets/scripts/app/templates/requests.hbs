@@ -1,0 +1,32 @@
+<table id="requests" class="list">
+  <thead>
+    <tr>
+      <th>Commit</th>
+      <th>Commit message</th>
+      <th>Type</th>
+      <th>Result</th>
+      <th>Message</th>
+    </tr>
+  </thead>
+
+  <tbody>
+    {{#each request in model}}
+      <tr>
+        <td>{{#link-to "request" request}}{{request.id}}{{/link-to}}</td>
+        <td>{{formatSha request.commit.sha}}</td>
+        <td>{{{formatMessage request.commit.message short="true" repoBinding=build.repo}}}</td>
+        <td>{{request.event_type}}</td>
+        <td>{{request.result}}</td>
+        <td>{{request.message}}</td>
+      </tr>
+    {{/each}}
+  </tbody>
+</table>
+{{#if displayShowMoreButton}}
+  <p>
+    {{view view.ShowMoreButton}}
+    {{#if isLoading}}
+      <span class="loading"></span>
+    {{/if}}
+  </p>
+{{/if}}

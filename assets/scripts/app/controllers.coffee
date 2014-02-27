@@ -37,6 +37,7 @@ Travis.MainController = Em.Controller.extend()
 Travis.StatsLayoutController = Em.Controller.extend()
 Travis.ProfileLayoutController = Em.Controller.extend()
 Travis.AuthLayoutController = Em.Controller.extend()
+Travis.RequestController = Em.ObjectController.extend()
 
 Travis.AccountProfileController = Em.Controller.extend
   needs: ['currentUser', 'repos']
